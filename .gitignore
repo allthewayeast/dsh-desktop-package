@@ -1,0 +1,13 @@
+# 构建日志与状态
+logs/
+.build-state.json
+
+# 本地备忘（含本机路径 / 敏感信息，不随仓库发布）
+fork-sync-notes.md
+
+# 依赖与构建产物
+# （dsh-desktop 是子模块，其内部文件由 dsh-desktop 自己的 .gitignore 管理，
+#   这里仅兜底，防止父仓库误收录）
+node_modules/
+dist/
+*.log

@@ -1,0 +1,33 @@
+diff --git a/dsh-plugin-desktop/README.zh.md b/dsh-plugin-desktop/README.zh.md
+index 5936904fd8..0afb4ef37c 100644
+--- a/dsh-plugin-desktop/README.zh.md
++++ b/dsh-plugin-desktop/README.zh.md
+@@ -164,6 +164,28 @@ npx dsh-plugin-desktop
+ 
+ 第三方 Host 插件只需提供普通 `dsh.bundle` patch。包含浏览器 UI 的插件还要发布普通 `dsh.client` 元数据，将 `platform` 设为 `"web"`，并导出 `./client` 产物。上游 Web 客户端模块图会在所有模式下发现它；Electron 不要求单独的客户端构建，也不引入 desktop 专用注册 API。增强模式 contribution 必须面向该显式组合中存在的 service 与 slot，不能假设官方 layout 或 sidebar occupant 拥有它们。
+ 
++## 启动配置文件
++
++Launcher 会读取可执行文件同目录下的可选用户自有 JSON 文件 `startup.json`；若设置了 `DSH_STARTUP_CONFIG` 环境变量，则改用它指向的绝对路径。该文件在 Launcher 解析 DSH home 或 Safe Mode 状态之前设置环境变量，并在应用 ready 之前追加 Electron/Chromium 开关。
++
++```json
++{
++  "version": 1,
++  "env": {
++    "DSH_HOME": "E:\\AppData\\YMZ\\.dsh-desktop",
++    "DSH_TELEMETRY_DISABLED": "1"
++  },
++  "electron": {
++    "switches": [
++      { "name": "disable-gpu", "value": null },
++      { "name": "proxy-server", "value": "http://127.0.0.1:7890" }
++    ]
++  }
++}
++```
++
++`env` 条目只在继承环境中不存在同名变量时才生效，因此临时导出的值仍然优先于文件。`DSH_HOME` 与 `DSH_TELEMETRY_DISABLED` 被放行；其余 `DSH_*` 名称以及所有 bootstrap-only 名称（`PATH`、`NODE_OPTIONS`、`SHELL`、代理与 CA 变量等）一律拒绝，因为它们决定进程如何启动、代码与指令从哪里加载、或如何访问网络。开关名称必须是小写 `[a-z0-9-]`。文件不存在表示没有配置；文件存在但不可读、不是普通文件、超过 64 KiB、不是合法 UTF-8、或不是受支持的 version-1 结构，都会大声失败并进入恢复页面，而不会被静默跳过。
++
+ ## 桌面操作
+ 
+ 当 Desktop 窗口没有焦点时，直接用户发起的回合到达 `completed` 会显示原生完成通知；以 `error` 或 `max-tokens` 结束时则显示需要处理的通知。后台任务完成或失败也使用同一条原生注意力路径。取消、阻塞、中断、被终止的任务、插件发起、仅 continuation、turn 不匹配及 subagent 活动都保持静默。点击通知会显示并聚焦窗口。macOS 与 Linux 会递增应用角标，Windows 会闪烁任务栏按钮；显示、聚焦或释放窗口时会清除这些提示。实时生效的 `dsh-desktop-notifications` settings namespace 提供相互独立的 `notifyOnTurnCompletion`、`notifyOnTurnFailure`、`notifyOnJobCompletion` 与 `notifyOnJobFailure` 开关，默认全部开启。通知文案刻意保持通用，不会包含提示词、回复、错误、任务标签、命令、路径、会话 ID、模型或 provider 名称、工具数据及输出。

@@ -1,0 +1,34 @@
+diff --git a/dsh-plugin-desktop/src/main.ts b/dsh-plugin-desktop/src/main.ts
+index 0eb8c9ba6b..0c93cc2c6e 100644
+--- a/dsh-plugin-desktop/src/main.ts
++++ b/dsh-plugin-desktop/src/main.ts
+@@ -205,6 +205,10 @@ import {
+   DESKTOP_RELEASE_CHANNEL,
+ } from './product-identity.ts'
+ import { desktopRecoveryCopy } from './recovery-copy.ts'
++import {
++  applyDesktopStartupConfig,
++  resolveStartupConfigPath,
++} from './startup-config.ts'
+ 
+ const BIN_NAME = DESKTOP_PACKAGE_NAME
+ const PRODUCT_NAME = DESKTOP_PRODUCT_NAME
+@@ -381,6 +385,18 @@ async function mirrorDesktopProfilePreferences(
+ 
+ /** Start one Electron process and leave lifetime to the mounted desktop plugin. */
+ async function start(): Promise<void> {
++  // Apply the user-owned startup configuration before anything resolves the
++  // Harness home or reads Safe Mode state: env entries must reach
++  // resolveDshHome and DSH_HOME bookkeeping below, and Electron switches must
++  // be appended before the app becomes ready.
++  const startupConfig = applyDesktopStartupConfig({
++    configPath: resolveStartupConfigPath(dirname(process.execPath), process.env),
++    environment: process.env,
++  })
++  for (const [name, value] of startupConfig.envUpdates) process.env[name] = value
++  for (const entry of startupConfig.switches) {
++    app.commandLine.appendSwitch(entry.name, entry.value ?? undefined)
++  }
+   if (!app.requestSingleInstanceLock()) {
+     app.quit()
+     return

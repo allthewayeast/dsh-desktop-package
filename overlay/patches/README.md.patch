@@ -1,0 +1,33 @@
+diff --git a/dsh-plugin-desktop/README.md b/dsh-plugin-desktop/README.md
+index 5077a2bba5..453e8398ca 100644
+--- a/dsh-plugin-desktop/README.md
++++ b/dsh-plugin-desktop/README.md
+@@ -164,6 +164,28 @@ Booting a profile that is composed with the desktop shell under an ordinary `dsh
+ 
+ A third-party Host plugin only needs its normal `dsh.bundle` patch. A plugin with browser UI also publishes the normal `dsh.client` metadata with `platform: "web"` and an exported `./client` artifact. The upstream Web client module graph discovers it in every mode; Electron does not require a separate client build or a desktop-specific registration API. Enhanced-mode contributions must target services and slots that exist in that explicit composition rather than assuming the official layout or sidebar occupant owns them.
+ 
++## Startup configuration
++
++The launcher reads an optional user-owned JSON file, `startup.json`, from the directory containing the executable, or from an absolute path named by the `DSH_STARTUP_CONFIG` environment variable when it is set. The file sets environment variables before the launcher resolves the DSH home or Safe Mode state, and appends Electron/Chromium switches before the app becomes ready.
++
++```json
++{
++  "version": 1,
++  "env": {
++    "DSH_HOME": "E:\\AppData\\YMZ\\.dsh-desktop",
++    "DSH_TELEMETRY_DISABLED": "1"
++  },
++  "electron": {
++    "switches": [
++      { "name": "disable-gpu", "value": null },
++      { "name": "proxy-server", "value": "http://127.0.0.1:7890" }
++    ]
++  }
++}
++```
++
++`env` entries are applied only when the variable is not already present in the inherited environment, so a temporarily exported value still wins over the file. `DSH_HOME` and `DSH_TELEMETRY_DISABLED` are allowed; every other `DSH_*` name and every bootstrap-only name (`PATH`, `NODE_OPTIONS`, `SHELL`, proxy and CA variables, and the like) is refused, because those decide how the process starts, where its code and instructions load from, or how it reaches the network. Switch names must be lowercase `[a-z0-9-]`. A missing file means no configuration; a present file that is unreadable, not a regular file, larger than 64 KiB, not valid UTF-8, or not the supported version-one shape fails loud into the Recovery page instead of being silently skipped.
++
+ ## Desktop operations
+ 
+ When the Desktop window is unfocused, a direct user turn that reaches `completed` raises a native completion notification; `error` and `max-tokens` endings raise a needs-attention notification. Completed and failed background jobs use the same native attention path. Aborted, blocked, interrupted, killed, plugin-initiated, continuation-only, mismatched, and subagent activity stays silent. Clicking a notification reveals and focuses the window. macOS and Linux increment the application badge, while Windows flashes the taskbar button; showing, focusing, or releasing the window clears that attention. The live `dsh-desktop-notifications` settings namespace provides independent `notifyOnTurnCompletion`, `notifyOnTurnFailure`, `notifyOnJobCompletion`, and `notifyOnJobFailure` switches, all enabled by default. Notification text is deliberately generic and never includes prompts, responses, errors, job labels, commands, paths, session IDs, model or provider names, tool data, or output.
