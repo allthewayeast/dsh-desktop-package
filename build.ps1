@@ -136,6 +136,12 @@ $script:GithubVersion = $null
 $script:Channel = 'stable'
 $script:ChannelWsName = 'dsh-plugin-desktop'
 $script:ElectronOverride = '44.3.0'   # 本地覆盖层：electron 固定版本
+# deepseek-harness（dsh 运行时）版本固定：本地把 stable 通道从上游的 0.1.5-rc.1
+# 升到 0.1.5-rc.2（上游 master 尚未合并 rc.2，pull 会把依赖重置回 rc.1，所以每次
+# 构建后由 Set-RuntimeVersionPinned 重新固定）。改版本 = 改这两个值 + 重新生成
+# vendor/dsh-runtime/<版本>/（yarn upstream:prepare-runtime && sync-vendored-runtime）。
+$script:RuntimeVersion = '0.1.5-rc.2'
+$script:HarnessCommit  = 'fb2c4b9e698e30edb738bca4cf0618587db7d203'  # dsh-v0.1.5-rc.2 tag
 # 排除 beta 通道：不再安装 dsh-plugin-desktop-beta 的依赖、不参与任何编译，
 # 其 manifest 也不再被 AA 准备脚本读取/改写。设为 $false 可临时恢复 beta。
 $script:DisableBeta = $true
@@ -652,14 +658,16 @@ function Reset-OverlayTrackedFiles {
     # 注意：不要加入 vendor/agents-anywhere/provenance.json —— 其 commit 必须与
     # AA main 解析结果一致，prepare 脚本才会走 “Reusing verified AA artifact”
     # 快路径；重置为上游旧值会触发全量重建，撞上 “Existing artifact differs” 守卫。
-    $exact = @('.yarnrc.yml', 'yarn.lock') + @(
+    $exact = @('.yarnrc.yml', 'yarn.lock', 'package.json', 'upstream.json') + @(
       'package.json',
       'dsh-plugin-desktop/package.json',
       'dsh-plugin-desktop-beta/package.json',
+      'dsh-community-market/package.json',
       'dsh-plugin-desktop/scripts/package-dir.mjs',
       'dsh-plugin-desktop/scripts/generate-windows-app-icon.mjs',
       'dsh-plugin-desktop/build/app-icon.ico',
-      'scripts/prepare-agents-anywhere-release.mjs'
+      'scripts/prepare-agents-anywhere-release.mjs',
+      'vendor/agents-anywhere/provenance.json'
     ) + $script:SrcPatchFiles
     $targets = @()
     foreach ($line in @(git status --porcelain)) {
@@ -866,6 +874,128 @@ function Disable-BetaWorkspace {
 #   这里按 provenance 把相关工作区的依赖行对齐（幂等）。
 #   默认只对齐 stable；仅当 AA 脚本补丁未生效（上游改过格式、仍会校验 beta）时才继续
 #   对齐 beta，保证复用校验不失败。
+# 运行时版本固定：把 stable 通道固定到 $script:RuntimeVersion（deepseek-harness 子模块
+# commit / upstream.json / dsh-plugin-desktop 依赖 / 根 package.json resolutions）。
+# pull 会把这些文件重置回上游（目前仍是 rc.1），每次构建后调用本函数恢复本地固定值，
+# 幂等。vendor/dsh-runtime/<版本>/ 由上游 sync 流程生成（yarn upstream:prepare-runtime
+# + node scripts/sync-vendored-runtime.mjs --write --channel stable）。
+function Set-RuntimeVersionPinned {
+  $v = $script:RuntimeVersion
+  $vendorRelative = "vendor/dsh-runtime/$v"
+  $manifestPath = Join-Path $script:Src ($vendorRelative -replace '/', [IO.Path]::DirectorySeparatorChar)
+  $manifestPath = Join-Path $manifestPath 'manifest.json'
+  if (-not (Test-Path -LiteralPath $manifestPath)) {
+    throw "运行时版本 $v 的 vendor manifest 缺失：$manifestPath。请先运行 yarn upstream:prepare-runtime 与 node scripts/sync-vendored-runtime.mjs --write --channel stable 生成。"
+  }
+  $manifest = Get-JsonObject $manifestPath
+  $entryByName = @{}
+  foreach ($p in @($manifest.packages)) { $entryByName[$p.name] = $p.filename }
+  if ($entryByName.Count -eq 0) { throw "运行时 manifest 为空：$manifestPath" }
+
+  # 1) upstream.json：stable 通道的 commit / 版本 / runtimeSource 固定
+  $upPath = Join-Path $script:Src 'upstream.json'
+  $up = Get-JsonObject $upPath
+  $stable = $up.channels.stable
+  $stable.commit = $script:HarnessCommit
+  $stable.sourceVersion = $v
+  $stable.runtimePackageVersion = $v
+  $stable.runtimeSource = "$vendorRelative/manifest.json"
+  Set-Content -LiteralPath $upPath -Value (ConvertTo-Json $up -Depth 10) -Encoding utf8 -NoNewline
+
+  # 2) dsh-plugin-desktop + dsh-community-market 的 @deepseek-ai/dsh* 依赖 → $v
+  #    （上游 stable 两包同版本；market 若仍声明 rc.1 会让 Yarn 嵌套安装 rc.1 副本，
+  #    与 rc.2 的类型定义冲突 → TS2717/TS2344。）
+  $pkgPaths = @(
+    (Get-ChannelWsPath 'package.json'),
+    (Join-Path $script:Src 'dsh-community-market\package.json')
+  )
+  foreach ($pkgPath in $pkgPaths) {
+    if (-not (Test-Path -LiteralPath $pkgPath)) { continue }
+    $pkg = Get-JsonObject $pkgPath
+    $changed = $false
+    foreach ($field in @('dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies')) {
+      $prop = $pkg.PSObject.Properties[$field]
+      if (-not $prop -or $null -eq $prop.Value) { continue }
+      $dep = $prop.Value
+      foreach ($name in @($dep.PSObject.Properties.Name)) {
+        $isDsh = $name -eq '@deepseek-ai/dsh' -or $name.StartsWith('@deepseek-ai/dsh-')
+        if ($isDsh -and $entryByName.ContainsKey($name) -and $dep.$name -ne $v) {
+          $dep.$name = $v
+          $changed = $true
+        }
+      }
+    }
+    if ($changed) {
+      Set-Content -LiteralPath $pkgPath -Value (ConvertTo-Json $pkg -Depth 100) -Encoding utf8 -NoNewline
+      Write-WarnLine "运行时版本固定：$([IO.Path]::GetFileNameWithoutExtension($pkgPath)) 的 @deepseek-ai/dsh* 依赖 → $v"
+    }
+  }
+
+  # 3) 根 package.json resolutions：删掉旧 stable 通道的 dsh 条目（@npm:$v / @npm:^$v，
+  #    保留其他版本如 beta 的 rc.1），再从 manifest 重建指向 vendor/$v 的条目。
+  $rootPkgPath = Join-Path $script:Src 'package.json'
+  $rootPkg = Get-JsonObject $rootPkgPath
+  $newRes = [ordered]@{}
+  foreach ($sel in @($rootPkg.resolutions.PSObject.Properties.Name)) {
+    $isStableDsh = ($sel -eq '@deepseek-ai/dsh' -or $sel.StartsWith('@deepseek-ai/dsh@') -or $sel.StartsWith('@deepseek-ai/dsh-')) `
+      -and ($sel.EndsWith("@npm:$v") -or $sel.EndsWith("@npm:^$v"))
+    if ($isStableDsh) { continue }
+    $newRes[$sel] = $rootPkg.resolutions.$sel
+  }
+  foreach ($p in @($manifest.packages)) {
+    $src = "file:$vendorRelative/$($p.filename)"
+    $unscoped = $p.name.Substring('@deepseek-ai/'.Length)
+    $patchRel = "patches/$unscoped@$v.patch"
+    $patchPath = Join-Path $script:Src ($patchRel -replace '/', [IO.Path]::DirectorySeparatorChar)
+    # 补丁版本迁移（自愈）：升级运行时版本时（如 rc.1→rc.2），旧版本补丁文件
+    # （patches\<pkg>@<旧版本>.patch）不会自动适配新版本文件名。若这里检测不到
+    # 新版本补丁，resolutions 会静默回退成无补丁的 file: 形式 → 桌面关键补丁
+    # （agent-presets / app-boot 等）全部丢失 → Agent 预设 24 行插件无法解析。
+    # 因此自动从同包"最新旧版本"补丁复制一份为新版本：pnpm install 会校验补丁与
+    # 新版本 tarball 是否匹配，不匹配会显式失败（比静默丢补丁好，此时需人工按
+    # 上游代码差异更新补丁内容）。
+    if (-not (Test-Path -LiteralPath $patchPath)) {
+      $oldPatch = Get-ChildItem -LiteralPath (Split-Path -Parent $patchPath) -Filter "$unscoped@*.patch" -File |
+        Where-Object { $_.BaseName -ne "$unscoped@$v" } |
+        Sort-Object Name -Descending | Select-Object -First 1
+      if ($null -ne $oldPatch) {
+        Copy-Item -LiteralPath $oldPatch.FullName -Destination $patchPath
+        Write-WarnLine "补丁迁移：$($oldPatch.Name) → $(Split-Path -Leaf $patchPath)（pnpm install 将校验匹配性，不匹配需人工更新）"
+      }
+    }
+    $val = if (Test-Path -LiteralPath $patchPath) { "patch:$($p.name)@$($src -replace ':', '%3A')#./$patchRel" } else { $src }
+    $newRes["$($p.name)@npm:$v"] = $val
+    $newRes["$($p.name)@npm:^$v"] = $val
+  }
+  $rootPkg.resolutions = $newRes
+  Set-Content -LiteralPath $rootPkgPath -Value (ConvertTo-Json $rootPkg -Depth 100) -Encoding utf8 -NoNewline
+
+  # 4) AA provenance 同步：runtimePeers 是 AA prepare 复用检查的关键条件（读 plugin
+  #    的 dsh peer 依赖版本对比）。升级运行时版本后若不更新，AA prepare 会放弃复用
+  #    已验证产物、进入全量重建，而重建在临时目录从 registry 拉包（rc.2 已发布 →
+  #    混装 rc.1/rc.2）→ typecheck TS2717/TS2344 失败。commit 也固定为 AA 源
+  #    （避免 pull 重置后回落）。
+  $provPath = Join-Path $script:Src 'vendor\agents-anywhere\provenance.json'
+  if (Test-Path -LiteralPath $provPath) {
+    $prov = Get-JsonObject $provPath
+    $provChanged = $false
+    if ($prov.commit -ne $script:AaSourceRef) { $prov.commit = $script:AaSourceRef; $provChanged = $true }
+    foreach ($peer in @('@deepseek-ai/dsh-typert-protocol', '@deepseek-ai/dsh-llm', '@deepseek-ai/dsh-session')) {
+      $peerProp = $prov.runtimePeers.PSObject.Properties[$peer]
+      if ($peerProp -and $peerProp.Value -ne $v) {
+        $prov.runtimePeers.$peer = $v
+        $provChanged = $true
+      }
+    }
+    if ($provChanged) {
+      Set-Content -LiteralPath $provPath -Value (ConvertTo-Json $prov -Depth 10) -Encoding utf8 -NoNewline
+      Write-WarnLine "AA provenance 已同步（commit $($script:AaSourceRef.Substring(0,10))，runtimePeers → $v）"
+    }
+  }
+
+  Write-Ok "运行时版本已固定：dsh $v（commit $($script:HarnessCommit.Substring(0,10))，$($entryByName.Count) 个包）"
+}
+
 function Set-AAVendorDependency {
   $provPath = Join-Path $script:Src 'vendor\agents-anywhere\provenance.json'
   if (-not (Test-Path -LiteralPath $provPath)) { return }
@@ -895,7 +1025,11 @@ function Invoke-RequiredWinFixes {
   Set-PackageDirRebuildDisabled -WorkspaceName $script:ChannelWsName
   Set-AllArtifactVerifyDisabled -WorkspaceName $script:ChannelWsName
   Set-AAVendorDependency
-  Write-Ok 'Windows 打包必需修复已应用（beta 排除 / npmRebuild=false / 移除 PR #829 事后校验钩子 / AA 依赖对齐）'
+  # 覆盖层/修复步骤会重写 package.json，且覆盖层里的 Reset-OverlayTrackedFiles
+  # 会把 upstream.json / 根 package.json / 依赖版本还原回上游（目前仍是 rc.1）。
+  # 必须在安装依赖之前把 stable 通道固定回本地版本，否则装出来的是旧运行时。
+  Set-RuntimeVersionPinned
+  Write-Ok 'Windows 打包必需修复已应用（beta 排除 / npmRebuild=false / 移除 PR #829 事后校验钩子 / AA 依赖对齐 / 运行时版本固定）'
 }
 
 function Copy-TrayIconAssets {
@@ -1370,6 +1504,7 @@ try {
 
   Initialize-Log
   Invoke-Step '获取 / 更新 dsh-desktop 源码' { Ensure-Source }
+  Invoke-Step "固定运行时版本（deepseek-harness $($script:RuntimeVersion)）" { Set-RuntimeVersionPinned }
   $script:GithubVersion = Get-GithubVersion
   Invoke-VersionGuard
   Show-Environment
