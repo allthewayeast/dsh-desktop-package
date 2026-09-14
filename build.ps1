@@ -1219,6 +1219,17 @@ function Apply-SrcOverlay {
         # 直接抛原生异常，先临时关闭，才能给出友好的冲突提示。
         $prevNative = $PSNativeCommandUseErrorActionPreference
         $PSNativeCommandUseErrorActionPreference = $false
+        # 行尾规范化：patch 若为 CRLF（如 PowerShell 重定向导出所致），git apply 会把 \r
+        # 当作行内容的一部分而匹配失败（"上游没变但补丁打不上"）。统一转 LF，幂等。
+        $patchText = [System.IO.File]::ReadAllText($patch)
+        $patchLf = $patchText -replace "`r`n", "`n"
+        if ($patchLf -cne $patchText) {
+          [System.IO.File]::WriteAllText(
+            $patch,
+            $patchLf,
+            (New-Object System.Text.UTF8Encoding($false)))
+          Write-WarnLine "覆盖层：$([IO.Path]::GetFileName($patch)) 行尾 CRLF→LF 已规范化"
+        }
         $checkCode = -1
         $applyCode = -1
         try {

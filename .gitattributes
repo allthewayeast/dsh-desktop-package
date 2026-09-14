@@ -1,0 +1,9 @@
+# 补丁文件必须保持 LF：git apply 把 CR 当作行内容的一部分，CRLF 补丁会导致
+# "上游没变但补丁打不上"（覆盖 build.ps1 的 core.autocrlf 转换）。
+*.patch text eol=lf
+
+# 脚本统一行尾（PowerShell 脚本 LF 更利于 diff）
+*.ps1 text eol=lf
+
+# Windows 批处理保持 CRLF（cmd 兼容性最佳）
+*.bat text eol=crlf
