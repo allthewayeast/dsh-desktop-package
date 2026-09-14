@@ -115,16 +115,11 @@ $PSNativeCommandUseErrorActionPreference = $true
 
 $script:Root = $PSScriptRoot
 $script:Src = Join-Path $script:Root 'dsh-desktop'
-# dsh-desktop 是否作为本仓库的 git 子模块注册：决定 Ensure-Source 采用
-# submodule 工作流（对齐 pinned commit）还是回退到手动放置源码。
-$script:SrcRegisteredAsSubmodule = $false
-$script:GitmodulesPath = Join-Path $script:Root '.gitmodules'
-if (Test-Path -LiteralPath $script:GitmodulesPath) {
-  $script:GitmodulesText = Get-Content -LiteralPath $script:GitmodulesPath -Raw -ErrorAction SilentlyContinue
-  if ($script:GitmodulesText -match '(?m)^\s*path\s*=\s*dsh-desktop\s*$') {
-    $script:SrcRegisteredAsSubmodule = $true
-  }
-}
+# dsh-desktop 是独立 Git 仓库（不再作为本仓库的子模块）：由 Ensure-Source 直接
+# 克隆（不存在时）或 fetch + 重置到上游 $SrcBranch 最新（已存在时），不再依赖
+# 父仓库的 gitlink / .gitmodules —— 拉取总是拿到上游最新，不会停在旧版本。
+$script:SrcRepository = 'https://github.com/anywhere-labs/dsh-desktop.git'
+$script:SrcBranch = 'master'
 $script:StartedAt = Get-Date
 $script:StepIndex = 0
 $script:Failed = 0
@@ -135,11 +130,15 @@ $script:GithubVersion = $null
 # 产品线固定为 stable：只构建 dsh-plugin-desktop（beta 通道已移除）
 $script:Channel = 'stable'
 $script:ChannelWsName = 'dsh-plugin-desktop'
-$script:ElectronOverride = '44.3.0'   # 本地覆盖层：electron 固定版本
-# deepseek-harness（dsh 运行时）版本固定：本地把 stable 通道从上游的 0.1.5-rc.1
-# 升到 0.1.5-rc.2（上游 master 尚未合并 rc.2，pull 会把依赖重置回 rc.1，所以每次
-# 构建后由 Set-RuntimeVersionPinned 重新固定）。改版本 = 改这两个值 + 重新生成
-# vendor/dsh-runtime/<版本>/（yarn upstream:prepare-runtime && sync-vendored-runtime）。
+# 本地覆盖层：electron 固定版本。默认跟随官方声明值（当前 43.3.0）：当官方声明
+# 与脚本值一致时 Set-ElectronOverride 自动跳过覆盖（构建上游原样）；仅在需要强制
+# 指定其他版本时才改此值（例如官方尚未跟进、本地确需更新的版本）。
+$script:ElectronOverride = '43.3.0'
+# deepseek-harness（dsh 运行时）版本固定：把 stable 通道固定到本地指定版本。当
+# upstream.json 已与这两个值一致（上游官方化后）时 Set-RuntimeVersionPinned 自动
+# 跳过（构建上游原样）；不一致时才固定（本地领先上游或需强制回落）。改版本 =
+# 改这两个值 + 重新生成 vendor/dsh-runtime/<版本>/（yarn upstream:prepare-runtime
+# && sync-vendored-runtime）。
 $script:RuntimeVersion = '0.1.5-rc.2'
 $script:HarnessCommit  = 'fb2c4b9e698e30edb738bca4cf0618587db7d203'  # dsh-v0.1.5-rc.2 tag
 # 排除 beta 通道：不再安装 dsh-plugin-desktop-beta 的依赖、不参与任何编译，
@@ -482,7 +481,7 @@ function Assert-Prerequisites {
 function Initialize-Submodule {
   $gitDir = Join-Path $script:Src '.git'
   if (-not (Test-Path -LiteralPath $gitDir)) {
-    throw "dsh-desktop 不是 Git 仓库（缺少 .git）。子模块只能在 Git checkout 中初始化。"
+    throw "dsh-desktop 不是 Git 仓库（缺少 .git）。请先运行一次不带 -SkipPull 的构建以克隆 / 更新源码。"
   }
 
   $upstream = Get-JsonObject (Join-Path $script:Src 'upstream.json')
@@ -711,6 +710,8 @@ function Reset-OverlayTrackedFiles {
 
 function Set-ElectronOverride {
   # <channel>/package.json 的 devDependencies.electron → $script:ElectronOverride
+  # 官方声明已与 $script:ElectronOverride 一致时跳过（覆盖值 = 官方值则无需改写，
+  # 构建上游原样；仅在本地强制指定其他版本时才实际覆盖）。
   $pkgPath = Get-ChannelWsPath 'package.json'
   if (-not (Test-Path -LiteralPath $pkgPath)) {
     throw "通道 $script:Channel 的工作区不存在：$pkgPath。请先同步到最新 master（双通道目录结构）。"
@@ -718,12 +719,14 @@ function Set-ElectronOverride {
   $text = Get-Content -LiteralPath $pkgPath -Raw -Encoding utf8
   if ($text -match '("electron"\s*:\s*")([^"]+)(")') {
     $current = $Matches[2]
-    if ($current -ne $script:ElectronOverride) {
-      $fixed = [regex]::Replace($text, '("electron"\s*:\s*")([^"]+)(")', "`${1}$($script:ElectronOverride)`${3}", 1)
-      Set-Content -LiteralPath $pkgPath -Value $fixed -Encoding utf8 -NoNewline
-      Write-WarnLine "覆盖层：$script:ChannelWsName electron $current → $($script:ElectronOverride)"
-      return $true
+    if ($current -eq $script:ElectronOverride) {
+      Write-Info "electron 官方声明已与覆盖目标一致（$current），跳过版本覆盖。"
+      return $false
     }
+    $fixed = [regex]::Replace($text, '("electron"\s*:\s*")([^"]+)(")', "`${1}$($script:ElectronOverride)`${3}", 1)
+    Set-Content -LiteralPath $pkgPath -Value $fixed -Encoding utf8 -NoNewline
+    Write-WarnLine "覆盖层：$script:ChannelWsName electron $current → $($script:ElectronOverride)"
+    return $true
   } else {
     Write-WarnLine "覆盖层：$pkgPath 中未找到 electron 声明，跳过。"
   }
@@ -876,8 +879,9 @@ function Disable-BetaWorkspace {
 #   对齐 beta，保证复用校验不失败。
 # 运行时版本固定：把 stable 通道固定到 $script:RuntimeVersion（deepseek-harness 子模块
 # commit / upstream.json / dsh-plugin-desktop 依赖 / 根 package.json resolutions）。
-# pull 会把这些文件重置回上游（目前仍是 rc.1），每次构建后调用本函数恢复本地固定值，
-# 幂等。vendor/dsh-runtime/<版本>/ 由上游 sync 流程生成（yarn upstream:prepare-runtime
+# 当 upstream.json 已与 $script:RuntimeVersion / $script:HarnessCommit 一致（上游官方化）
+# 时自动跳过，构建上游原样；不一致时（本地领先上游或需强制回落）才固定。幂等。
+# vendor/dsh-runtime/<版本>/ 由上游 sync 流程生成（yarn upstream:prepare-runtime
 # + node scripts/sync-vendored-runtime.mjs --write --channel stable）。
 function Set-RuntimeVersionPinned {
   $v = $script:RuntimeVersion
@@ -892,8 +896,20 @@ function Set-RuntimeVersionPinned {
   foreach ($p in @($manifest.packages)) { $entryByName[$p.name] = $p.filename }
   if ($entryByName.Count -eq 0) { throw "运行时 manifest 为空：$manifestPath" }
 
-  # 1) upstream.json：stable 通道的 commit / 版本 / runtimeSource 固定
+  # 0) 官方一致 → 跳过：upstream.json stable 已指向脚本固定的 commit + 版本
+  #    （runtimeSource 也随版本一致），无需改写任何文件（resolutions / AA provenance
+  #    保持上游官方状态）。
   $upPath = Join-Path $script:Src 'upstream.json'
+  if (Test-Path -LiteralPath $upPath) {
+    $upNow = Get-JsonObject $upPath
+    $stableNow = $upNow.channels.stable
+    if ($stableNow.commit -eq $script:HarnessCommit -and $stableNow.sourceVersion -eq $v) {
+      Write-Info "运行时版本已与官方一致（dsh $v @ $($script:HarnessCommit.Substring(0,10))），跳过本地固定。"
+      return
+    }
+  }
+
+  # 1) upstream.json：stable 通道的 commit / 版本 / runtimeSource 固定
   $up = Get-JsonObject $upPath
   $stable = $up.channels.stable
   $stable.commit = $script:HarnessCommit
@@ -1244,54 +1260,73 @@ function Invoke-ChannelOverlayPostInstall {
   Set-PnpmDistPatch
 }
 
-function Invoke-SubmoduleUpdate {
-  # dsh-desktop 是本仓库的 git 子模块：构建前用 `git submodule update` 对齐到
-  # 父仓库记录的 pinned commit（gitlink）。--force 会丢弃上次构建注入的覆盖层
-  # 改动，确保每次从干净快照开始、构建产物可复现。--init --recursive 同时处理
-  # 嵌套子模块 deepseek-harness。
-  $prevEap = $ErrorActionPreference
-  $prevNative = $PSNativeCommandUseErrorActionPreference
-  $ErrorActionPreference = 'Continue'
-  $PSNativeCommandUseErrorActionPreference = $false
-  try {
-    $output = @(& git -C $script:Root submodule update --init --recursive --force 2>&1)
-    $code = $LASTEXITCODE
+function Update-SourceRepository {
+  # dsh-desktop 为独立仓库：不存在时克隆（--recursive 连带嵌套 deepseek-harness），
+  # 已存在时 fetch + 强制重置本地分支到上游 master 最新。--force 会丢弃上次构建
+  # 注入的覆盖层改动，确保每次从干净快照开始、构建产物可复现。嵌套子模块
+  # deepseek-harness 随 checkout 一起对齐（具体 pinned commit 由 Initialize-Submodule
+  # 按 upstream.json 再校准）。
+  $gitDir = Join-Path $script:Src '.git'
+  if (Test-Path -LiteralPath $gitDir) {
+    $prevEap = $ErrorActionPreference
+    $prevNative = $PSNativeCommandUseErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $PSNativeCommandUseErrorActionPreference = $false
+    try {
+      Write-Info "dsh-desktop 已存在，正在拉取上游 $($script:SrcBranch) 最新并重置本地分支 ..."
+      $output = @(& git -C $script:Src fetch origin 2>&1)
+      foreach ($line in $output) {
+        $text = if ($null -eq $line) { '' } else { [string]$line }
+        Write-Host $text
+        Write-Log $text
+      }
+      if ($LASTEXITCODE -ne 0) {
+        throw "git fetch origin 失败 (exit $LASTEXITCODE)。请检查网络 / 代理（-NoProxy 可禁用代理）与 Git 凭据。"
+      }
 
-    foreach ($line in $output) {
-      $text = if ($null -eq $line) { '' } else { [string]$line }
-      Write-Host $text
-      Write-Log $text
-    }
+      $output = @(& git -C $script:Src checkout -B $script:SrcBranch "origin/$script:SrcBranch" --force 2>&1)
+      foreach ($line in $output) {
+        $text = if ($null -eq $line) { '' } else { [string]$line }
+        Write-Host $text
+        Write-Log $text
+      }
+      if ($LASTEXITCODE -ne 0) {
+        throw "git checkout -B $($script:SrcBranch) origin/$($script:SrcBranch) --force 失败 (exit $LASTEXITCODE)。"
+      }
 
-    if ($code -eq 0) {
-      Write-Ok '子模块已对齐到 pinned commit。'
-      return
+      $output = @(& git -C $script:Src submodule update --init --recursive --force 2>&1)
+      foreach ($line in $output) {
+        $text = if ($null -eq $line) { '' } else { [string]$line }
+        Write-Host $text
+        Write-Log $text
+      }
+      if ($LASTEXITCODE -ne 0) {
+        throw "嵌套子模块 deepseek-harness 更新失败 (exit $LASTEXITCODE)。请检查网络 / 代理与 Git 凭据。"
+      }
+
+      $head = (git -C $script:Src rev-parse --short HEAD).Trim()
+      Write-Ok "已更新到上游 $($script:SrcBranch) 最新（HEAD=$head）。"
+    } finally {
+      $ErrorActionPreference = $prevEap
+      $PSNativeCommandUseErrorActionPreference = $prevNative
     }
-    Write-WarnLine '子模块拉取 / 对齐失败。请检查网络 / 代理（-NoProxy 可禁用代理）与 Git 凭据。'
-    throw "git submodule update --init --recursive --force 失败 (exit $code)。"
-  } finally {
-    $ErrorActionPreference = $prevEap
-    $PSNativeCommandUseErrorActionPreference = $prevNative
+  } elseif (Test-Path -LiteralPath $script:Src) {
+    throw "目录 $($script:Src) 已存在但不是 Git 仓库（缺少 .git）。请手动处理该目录后再运行本脚本。"
+  } else {
+    Write-Info "未找到 $($script:Src)，正在克隆 $script:SrcRepository（--recursive 含嵌套 deepseek-harness）..."
+    Invoke-External git @('clone', '--recursive', $script:SrcRepository, $script:Src)
   }
 }
 
 function Ensure-Source {
-  $gitDir = Join-Path $script:Src '.git'
-  if (Test-Path -LiteralPath $gitDir) {
-    if ($SkipPull) {
-      Write-WarnLine '已跳过子模块对齐（-SkipPull），使用现有代码。'
-    } else {
-      Write-Info "dsh-desktop 是本仓库子模块，正在对齐到 pinned commit ..."
-      Invoke-SubmoduleUpdate
+  if ($SkipPull) {
+    $gitDir = Join-Path $script:Src '.git'
+    if (-not (Test-Path -LiteralPath $gitDir)) {
+      throw "未找到 $($script:Src)（或缺少 .git）。-SkipPull 模式下不会自动克隆 / 更新，请先运行一次不带 -SkipPull 的构建。"
     }
-  } elseif (Test-Path -LiteralPath $script:Src) {
-    throw "目录 $($script:Src) 已存在但不是 Git 仓库（缺少 .git）。请手动处理该目录后再运行本脚本。"
-  } elseif ($script:SrcRegisteredAsSubmodule) {
-    Write-Info "未找到 $($script:Src)，正在初始化子模块（git submodule update --init --recursive）..."
-    Invoke-SubmoduleUpdate
+    Write-WarnLine '已跳过源码拉取（-SkipPull），使用现有代码。'
   } else {
-    throw "未找到 $($script:Src)，且本仓库未注册 dsh-desktop 子模块。" +
-          '请先执行 git submodule update --init --recursive，或手动放置源码到该目录。'
+    Update-SourceRepository
   }
   Write-Ok "代码已就绪: $script:Src"
 }
@@ -1304,7 +1339,7 @@ function Install-Workspace {
     if ($yarnVersion -ne '4.18.0') {
       throw "期望 Yarn 4.18.0，实际为 $yarnVersion。请在 dsh-desktop 目录通过 corepack yarn 运行。"
     }
-    # 覆盖层会改动 package.json（electron 44.3.0），锁文件需随之刷新，故用可变 install
+    # 覆盖层可能改动 package.json（electron 版本固定等），锁文件需随之刷新，故用可变 install
     Invoke-Yarn @('install')
   } finally {
     Pop-Location

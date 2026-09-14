@@ -109,13 +109,45 @@ describe('applyDesktopStartupConfig', () => {
     const root = fixture()
     writeFileSync(join(root, DESKTOP_STARTUP_CONFIG_FILENAME), JSON.stringify({
       version: 1,
-      env: { PATH: 'C:\\Windows' },
+      env: { NODE_OPTIONS: '--max-old-space-size=4096' },
     }))
 
     expect(() => applyDesktopStartupConfig({
       configPath: join(root, DESKTOP_STARTUP_CONFIG_FILENAME),
       environment: {},
     })).toThrow(DesktopStartupConfigError)
+  })
+
+  it('applies PATH even when present, expanding a %PATH% reference', () => {
+    const root = fixture()
+    writeFileSync(join(root, DESKTOP_STARTUP_CONFIG_FILENAME), JSON.stringify({
+      version: 1,
+      env: { PATH: 'E:\\AppData\\YMZ\\.dsh-desktop;%PATH%' },
+    }))
+
+    const result = applyDesktopStartupConfig({
+      configPath: join(root, DESKTOP_STARTUP_CONFIG_FILENAME),
+      environment: { PATH: 'C:\\Windows;C:\\Program Files' },
+    })
+
+    expect(result.envUpdates).toEqual([
+      ['PATH', 'E:\\AppData\\YMZ\\.dsh-desktop;C:\\Windows;C:\\Program Files'],
+    ])
+  })
+
+  it('expands %NAME% references against the environment', () => {
+    const root = fixture()
+    writeFileSync(join(root, DESKTOP_STARTUP_CONFIG_FILENAME), JSON.stringify({
+      version: 1,
+      env: { MY_JOINED: 'a;%MY_EXTRA%', EXISTING: 'x' },
+    }))
+
+    const result = applyDesktopStartupConfig({
+      configPath: join(root, DESKTOP_STARTUP_CONFIG_FILENAME),
+      environment: { MY_EXTRA: 'b', EXISTING: 'kept' },
+    })
+
+    expect(result.envUpdates).toEqual([['MY_JOINED', 'a;b']])
   })
 
   it('rejects other DSH_* names beyond the Home and telemetry allowlist', () => {

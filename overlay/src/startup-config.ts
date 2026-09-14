@@ -52,9 +52,13 @@ export class DesktopStartupConfigError extends Error {
   }
 }
 
-/** Names no startup config may set: they decide how the process, runtime, VCS, or network bootstrap. */
+/**
+ * Names no startup config may set: they decide how the process, runtime,
+ * VCS, or network bootstrap. `PATH` is the deliberate exception — see
+ * `applyDesktopStartupConfig` — so a user can prepend directories with a
+ * `%PATH%` reference without replacing the inherited search path.
+ */
 const BOOTSTRAP_NAMES = new Set([
-  'PATH',
   'HOME',
   'USERPROFILE',
   'SHELL',
@@ -256,11 +260,25 @@ export function resolveStartupConfigPath(
 }
 
 /**
+ * Expand Windows-style `%NAME%` references against the current environment.
+ * A missing variable expands to an empty string, matching `cmd.exe` semantics,
+ * so values like `E:\tools;%PATH%` can append to (or preserve) existing
+ * variables. Lookup is case-insensitive, as on Windows.
+ */
+function expandEnvironmentReferences(value: string, environment: NodeJS.ProcessEnv): string {
+  return value.replace(/%([A-Za-z_][A-Za-z0-9_]*)%/gu, (_match, name: string) => {
+    return environment[name] ?? environment[name.toUpperCase()] ?? environment[name.toLowerCase()] ?? ''
+  })
+}
+
+/**
  * Load and apply the user-owned startup configuration. A missing file means
  * "no configuration"; a present file that cannot be read, parsed, or applied is
  * a misconfiguration and throws. Env entries already present in the
  * environment are left untouched, so a temporarily exported variable still
- * wins over the file.
+ * wins over the file — except `PATH`, which is always applied (after `%NAME%`
+ * expansion) so a startup config can prepend directories to the inherited
+ * search path.
  * @param options - resolved config path and the environment to consult.
  * @returns env entries to materialize and Electron switches to append.
  */
@@ -268,6 +286,8 @@ export function applyDesktopStartupConfig(options: DesktopStartupConfigOptions):
   const info = existingFileInfo(options.configPath)
   if (info === undefined) return { envUpdates: [], switches: [] }
   const parsed = parseStartupConfig(readBoundedUtf8(options.configPath))
-  const envUpdates = parsed.envUpdates.filter(([name]) => options.environment[name] === undefined)
+  const envUpdates = parsed.envUpdates
+    .map(([name, value]) => [name, expandEnvironmentReferences(value, options.environment)] as const)
+    .filter(([name]) => name.toUpperCase() === 'PATH' || options.environment[name] === undefined)
   return { envUpdates, switches: parsed.switches }
 }
