@@ -896,9 +896,33 @@ function Set-RuntimeVersionPinned {
   foreach ($p in @($manifest.packages)) { $entryByName[$p.name] = $p.filename }
   if ($entryByName.Count -eq 0) { throw "运行时 manifest 为空：$manifestPath" }
 
-  # 0) 官方一致 → 跳过：upstream.json stable 已指向脚本固定的 commit + 版本
-  #    （runtimeSource 也随版本一致），无需改写任何文件（resolutions / AA provenance
-  #    保持上游官方状态）。
+  # 0) AA provenance 同步（始终执行，不受下方“官方一致跳过”影响）：
+  #    runtimePeers 是 AA prepare 复用检查的关键条件（读 plugin 的 dsh peer 依赖版本
+  #    对比）。上游官方状态可能不自洽（dsh 依赖已升 rc.2 而 AA provenance 仍是 rc.1
+  #    peers）——若这里跳过，AA prepare 会放弃复用已验证产物、进入全量重建，而重建
+  #    在临时目录从 registry 拉包（rc.2 已发布 → 混装 rc.1/rc.2）→ typecheck
+  #    TS2717/TS2344 失败。commit 也固定为 AA 源（避免 pull 重置后回落）。
+  $provPath = Join-Path $script:Src 'vendor\agents-anywhere\provenance.json'
+  if (Test-Path -LiteralPath $provPath) {
+    $prov = Get-JsonObject $provPath
+    $provChanged = $false
+    if ($prov.commit -ne $script:AaSourceRef) { $prov.commit = $script:AaSourceRef; $provChanged = $true }
+    foreach ($peer in @('@deepseek-ai/dsh-typert-protocol', '@deepseek-ai/dsh-llm', '@deepseek-ai/dsh-session')) {
+      $peerProp = $prov.runtimePeers.PSObject.Properties[$peer]
+      if ($peerProp -and $peerProp.Value -ne $v) {
+        $prov.runtimePeers.$peer = $v
+        $provChanged = $true
+      }
+    }
+    if ($provChanged) {
+      Set-Content -LiteralPath $provPath -Value (ConvertTo-Json $prov -Depth 10) -Encoding utf8 -NoNewline
+      Write-WarnLine "AA provenance 已同步（commit $($script:AaSourceRef.Substring(0,10))，runtimePeers → $v）"
+    }
+  }
+
+  # 0b) 官方一致 → 跳过：upstream.json stable 已指向脚本固定的 commit + 版本
+  #     （runtimeSource 也随版本一致），无需改写 upstream.json / dsh 依赖 / resolutions
+  #     （AA provenance 已在 0) 同步完成，不在此跳过范围）。
   $upPath = Join-Path $script:Src 'upstream.json'
   if (Test-Path -LiteralPath $upPath) {
     $upNow = Get-JsonObject $upPath
@@ -985,29 +1009,6 @@ function Set-RuntimeVersionPinned {
   }
   $rootPkg.resolutions = $newRes
   Set-Content -LiteralPath $rootPkgPath -Value (ConvertTo-Json $rootPkg -Depth 100) -Encoding utf8 -NoNewline
-
-  # 4) AA provenance 同步：runtimePeers 是 AA prepare 复用检查的关键条件（读 plugin
-  #    的 dsh peer 依赖版本对比）。升级运行时版本后若不更新，AA prepare 会放弃复用
-  #    已验证产物、进入全量重建，而重建在临时目录从 registry 拉包（rc.2 已发布 →
-  #    混装 rc.1/rc.2）→ typecheck TS2717/TS2344 失败。commit 也固定为 AA 源
-  #    （避免 pull 重置后回落）。
-  $provPath = Join-Path $script:Src 'vendor\agents-anywhere\provenance.json'
-  if (Test-Path -LiteralPath $provPath) {
-    $prov = Get-JsonObject $provPath
-    $provChanged = $false
-    if ($prov.commit -ne $script:AaSourceRef) { $prov.commit = $script:AaSourceRef; $provChanged = $true }
-    foreach ($peer in @('@deepseek-ai/dsh-typert-protocol', '@deepseek-ai/dsh-llm', '@deepseek-ai/dsh-session')) {
-      $peerProp = $prov.runtimePeers.PSObject.Properties[$peer]
-      if ($peerProp -and $peerProp.Value -ne $v) {
-        $prov.runtimePeers.$peer = $v
-        $provChanged = $true
-      }
-    }
-    if ($provChanged) {
-      Set-Content -LiteralPath $provPath -Value (ConvertTo-Json $prov -Depth 10) -Encoding utf8 -NoNewline
-      Write-WarnLine "AA provenance 已同步（commit $($script:AaSourceRef.Substring(0,10))，runtimePeers → $v）"
-    }
-  }
 
   Write-Ok "运行时版本已固定：dsh $v（commit $($script:HarnessCommit.Substring(0,10))，$($entryByName.Count) 个包）"
 }
