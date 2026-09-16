@@ -18,6 +18,7 @@ del /f /q "%distDir%\LICENSE.electron.txt"
 rename "%distDir%\locales\en-US.pak.bak" "en-US.pak"
 rename "%distDir%\locales\zh-CN.pak.bak" "zh-CN.pak"
 
+copy /y "%cd%\overlay\startup.json" "%distDir%"
 robocopy "%distDir%" "X:\App\DSH-Desktop" /mir /xf "startup.json"
 
 echo The dist\win-unpacked directory will now be deleted.

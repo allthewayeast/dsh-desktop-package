@@ -18,51 +18,33 @@ function fixture(): string {
   return root
 }
 
+function configPath(): string {
+  return join(fixture(), DESKTOP_STARTUP_CONFIG_FILENAME)
+}
+
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
 describe('resolveStartupConfigPath', () => {
-  it('defaults to startup.json beside the executable', () => {
-    expect(resolveStartupConfigPath('C:\\Program Files\\DSH Desktop', {})).toBe(
-      join('C:\\Program Files\\DSH Desktop', DESKTOP_STARTUP_CONFIG_FILENAME),
-    )
-  })
-
-  it('uses an absolute DSH_STARTUP_CONFIG override', () => {
-    expect(resolveStartupConfigPath('C:\\Program Files\\DSH Desktop', {
-      DSH_STARTUP_CONFIG: 'E:\\AppData\\startup.json',
-    })).toBe('E:\\AppData\\startup.json')
-  })
-
-  it('ignores a blank DSH_STARTUP_CONFIG override', () => {
-    expect(resolveStartupConfigPath('C:\\Program Files\\DSH Desktop', {
-      DSH_STARTUP_CONFIG: '   ',
-    })).toBe(join('C:\\Program Files\\DSH Desktop', DESKTOP_STARTUP_CONFIG_FILENAME))
-  })
-
-  it('rejects a relative DSH_STARTUP_CONFIG override', () => {
-    expect(() => resolveStartupConfigPath('C:\\Program Files\\DSH Desktop', {
-      DSH_STARTUP_CONFIG: 'configs\\startup.json',
-    })).toThrow(DesktopStartupConfigError)
+  it('points at startup.json beside the executable', () => {
+    const root = fixture()
+    expect(resolveStartupConfigPath(root)).toBe(join(root, DESKTOP_STARTUP_CONFIG_FILENAME))
   })
 })
 
 describe('applyDesktopStartupConfig', () => {
   it('returns an empty result when no config file exists', () => {
-    const result = applyDesktopStartupConfig({
-      configPath: join(fixture(), DESKTOP_STARTUP_CONFIG_FILENAME),
-      environment: {},
-    })
+    const result = applyDesktopStartupConfig({ configPath: configPath(), environment: {} })
     expect(result).toEqual({ envUpdates: [], switches: [] })
   })
 
   it('applies DSH_HOME, the telemetry opt-out, and ordinary env entries', () => {
-    const root = fixture()
-    writeFileSync(join(root, DESKTOP_STARTUP_CONFIG_FILENAME), JSON.stringify({
+    const path = configPath()
+    writeFileSync(path, JSON.stringify({
       version: 1,
       env: {
-        DSH_HOME: 'E:\\AppData\\YMZ\\.dsh-desktop',
+        DSH_HOME: 'custom-home',
         DSH_TELEMETRY_DISABLED: '1',
         MY_CUSTOM_VALUE: 'hello',
       },
@@ -74,13 +56,10 @@ describe('applyDesktopStartupConfig', () => {
       },
     }))
 
-    const result = applyDesktopStartupConfig({
-      configPath: join(root, DESKTOP_STARTUP_CONFIG_FILENAME),
-      environment: {},
-    })
+    const result = applyDesktopStartupConfig({ configPath: path, environment: {} })
 
     expect(result.envUpdates).toEqual([
-      ['DSH_HOME', 'E:\\AppData\\YMZ\\.dsh-desktop'],
+      ['DSH_HOME', 'custom-home'],
       ['DSH_TELEMETRY_DISABLED', '1'],
       ['MY_CUSTOM_VALUE', 'hello'],
     ])
@@ -91,59 +70,54 @@ describe('applyDesktopStartupConfig', () => {
   })
 
   it('omits env entries already present in the environment', () => {
-    const root = fixture()
-    writeFileSync(join(root, DESKTOP_STARTUP_CONFIG_FILENAME), JSON.stringify({
+    const path = configPath()
+    writeFileSync(path, JSON.stringify({
       version: 1,
-      env: { DSH_HOME: 'E:\\custom\\home', DSH_TELEMETRY_DISABLED: '1' },
+      env: { DSH_HOME: 'custom-home', DSH_TELEMETRY_DISABLED: '1' },
     }))
 
     const result = applyDesktopStartupConfig({
-      configPath: join(root, DESKTOP_STARTUP_CONFIG_FILENAME),
-      environment: { DSH_HOME: 'E:\\inherited\\home' },
+      configPath: path,
+      environment: { DSH_HOME: 'inherited-home' },
     })
 
     expect(result.envUpdates).toEqual([['DSH_TELEMETRY_DISABLED', '1']])
   })
 
   it('rejects bootstrap-only names that decide how the process starts', () => {
-    const root = fixture()
-    writeFileSync(join(root, DESKTOP_STARTUP_CONFIG_FILENAME), JSON.stringify({
+    const path = configPath()
+    writeFileSync(path, JSON.stringify({
       version: 1,
       env: { NODE_OPTIONS: '--max-old-space-size=4096' },
     }))
 
-    expect(() => applyDesktopStartupConfig({
-      configPath: join(root, DESKTOP_STARTUP_CONFIG_FILENAME),
-      environment: {},
-    })).toThrow(DesktopStartupConfigError)
+    expect(() => applyDesktopStartupConfig({ configPath: path, environment: {} })).toThrow(DesktopStartupConfigError)
   })
 
   it('applies PATH even when present, expanding a %PATH% reference', () => {
-    const root = fixture()
-    writeFileSync(join(root, DESKTOP_STARTUP_CONFIG_FILENAME), JSON.stringify({
+    const path = configPath()
+    writeFileSync(path, JSON.stringify({
       version: 1,
-      env: { PATH: 'E:\\AppData\\YMZ\\.dsh-desktop;%PATH%' },
+      env: { PATH: 'prepended;%PATH%' },
     }))
 
     const result = applyDesktopStartupConfig({
-      configPath: join(root, DESKTOP_STARTUP_CONFIG_FILENAME),
-      environment: { PATH: 'C:\\Windows;C:\\Program Files' },
+      configPath: path,
+      environment: { PATH: 'inherited' },
     })
 
-    expect(result.envUpdates).toEqual([
-      ['PATH', 'E:\\AppData\\YMZ\\.dsh-desktop;C:\\Windows;C:\\Program Files'],
-    ])
+    expect(result.envUpdates).toEqual([['PATH', 'prepended;inherited']])
   })
 
   it('expands %NAME% references against the environment', () => {
-    const root = fixture()
-    writeFileSync(join(root, DESKTOP_STARTUP_CONFIG_FILENAME), JSON.stringify({
+    const path = configPath()
+    writeFileSync(path, JSON.stringify({
       version: 1,
       env: { MY_JOINED: 'a;%MY_EXTRA%', EXISTING: 'x' },
     }))
 
     const result = applyDesktopStartupConfig({
-      configPath: join(root, DESKTOP_STARTUP_CONFIG_FILENAME),
+      configPath: path,
       environment: { MY_EXTRA: 'b', EXISTING: 'kept' },
     })
 
@@ -151,84 +125,60 @@ describe('applyDesktopStartupConfig', () => {
   })
 
   it('rejects other DSH_* names beyond the Home and telemetry allowlist', () => {
-    const root = fixture()
-    writeFileSync(join(root, DESKTOP_STARTUP_CONFIG_FILENAME), JSON.stringify({
+    const path = configPath()
+    writeFileSync(path, JSON.stringify({
       version: 1,
       env: { DSH_SNAPSHOT: 'replay' },
     }))
 
-    expect(() => applyDesktopStartupConfig({
-      configPath: join(root, DESKTOP_STARTUP_CONFIG_FILENAME),
-      environment: {},
-    })).toThrow(DesktopStartupConfigError)
+    expect(() => applyDesktopStartupConfig({ configPath: path, environment: {} })).toThrow(DesktopStartupConfigError)
   })
 
   it('rejects invalid JSON', () => {
-    const root = fixture()
-    writeFileSync(join(root, DESKTOP_STARTUP_CONFIG_FILENAME), 'not json {')
-    expect(() => applyDesktopStartupConfig({
-      configPath: join(root, DESKTOP_STARTUP_CONFIG_FILENAME),
-      environment: {},
-    })).toThrow(DesktopStartupConfigError)
+    const path = configPath()
+    writeFileSync(path, 'not json {')
+    expect(() => applyDesktopStartupConfig({ configPath: path, environment: {} })).toThrow(DesktopStartupConfigError)
   })
 
   it('rejects a document without the supported version', () => {
-    const root = fixture()
-    writeFileSync(join(root, DESKTOP_STARTUP_CONFIG_FILENAME), JSON.stringify({ version: 2 }))
-    expect(() => applyDesktopStartupConfig({
-      configPath: join(root, DESKTOP_STARTUP_CONFIG_FILENAME),
-      environment: {},
-    })).toThrow(DesktopStartupConfigError)
+    const path = configPath()
+    writeFileSync(path, JSON.stringify({ version: 2 }))
+    expect(() => applyDesktopStartupConfig({ configPath: path, environment: {} })).toThrow(DesktopStartupConfigError)
   })
 
   it('rejects a non-string env value', () => {
-    const root = fixture()
-    writeFileSync(join(root, DESKTOP_STARTUP_CONFIG_FILENAME), JSON.stringify({
+    const path = configPath()
+    writeFileSync(path, JSON.stringify({
       version: 1,
       env: { DSH_HOME: 42 },
     }))
-    expect(() => applyDesktopStartupConfig({
-      configPath: join(root, DESKTOP_STARTUP_CONFIG_FILENAME),
-      environment: {},
-    })).toThrow(DesktopStartupConfigError)
+    expect(() => applyDesktopStartupConfig({ configPath: path, environment: {} })).toThrow(DesktopStartupConfigError)
   })
 
   it('rejects a malformed switch name', () => {
-    const root = fixture()
-    writeFileSync(join(root, DESKTOP_STARTUP_CONFIG_FILENAME), JSON.stringify({
+    const path = configPath()
+    writeFileSync(path, JSON.stringify({
       version: 1,
       electron: { switches: [{ name: 'Disable_GPU' }] },
     }))
-    expect(() => applyDesktopStartupConfig({
-      configPath: join(root, DESKTOP_STARTUP_CONFIG_FILENAME),
-      environment: {},
-    })).toThrow(DesktopStartupConfigError)
+    expect(() => applyDesktopStartupConfig({ configPath: path, environment: {} })).toThrow(DesktopStartupConfigError)
   })
 
   it('rejects a startup.json that is not a regular file', () => {
-    const root = fixture()
-    mkdirSync(join(root, DESKTOP_STARTUP_CONFIG_FILENAME))
-    expect(() => applyDesktopStartupConfig({
-      configPath: join(root, DESKTOP_STARTUP_CONFIG_FILENAME),
-      environment: {},
-    })).toThrow(DesktopStartupConfigError)
+    const path = configPath()
+    mkdirSync(path)
+    expect(() => applyDesktopStartupConfig({ configPath: path, environment: {} })).toThrow(DesktopStartupConfigError)
   })
 
   it('rejects an oversized startup config', () => {
-    const root = fixture()
-    writeFileSync(join(root, DESKTOP_STARTUP_CONFIG_FILENAME), 'x'.repeat(DESKTOP_STARTUP_CONFIG_MAX_BYTES + 1))
-    expect(() => applyDesktopStartupConfig({
-      configPath: join(root, DESKTOP_STARTUP_CONFIG_FILENAME),
-      environment: {},
-    })).toThrow(DesktopStartupConfigError)
+    const path = configPath()
+    writeFileSync(path, 'x'.repeat(DESKTOP_STARTUP_CONFIG_MAX_BYTES + 1))
+    expect(() => applyDesktopStartupConfig({ configPath: path, environment: {} })).toThrow(DesktopStartupConfigError)
   })
 
   it('rejects non-UTF-8 content', () => {
-    const root = fixture()
-    writeFileSync(join(root, DESKTOP_STARTUP_CONFIG_FILENAME), Buffer.from([0x7b, 0xff, 0x7d]))
-    expect(() => applyDesktopStartupConfig({
-      configPath: join(root, DESKTOP_STARTUP_CONFIG_FILENAME),
-      environment: {},
-    })).toThrow(DesktopStartupConfigError)
+    const path = configPath()
+    writeFileSync(path, Buffer.from([0x7b, 0xff, 0x7d]))
+    expect(() => applyDesktopStartupConfig({ configPath: path, environment: {} })).toThrow(DesktopStartupConfigError)
   })
 })

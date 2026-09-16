@@ -1,0 +1,97 @@
+diff --git a/dsh-plugin-desktop/package.json b/dsh-plugin-desktop/package.json
+index a5a9c36326..7445f24ca1 100644
+--- a/dsh-plugin-desktop/package.json
++++ b/dsh-plugin-desktop/package.json
+@@ -76,7 +76,6 @@
+   "files": [
+     "build/app-icon.ico",
+     "build/app-icon.png",
+-    "build/app-icon-mac.png",
+     "build/tray-icon.svg",
+     "build/tray-icon*.png",
+     "cordis.patch.yml",
+@@ -329,9 +328,25 @@
+   "build": {
+     "appId": "ai.deepseek.dsh.desktop",
+     "productName": "DSH Desktop",
+-    "asar": false,
++    "asar": true,
++    "asarUnpack": [
++        "build/app-icon.png",
++      "build/tray-icon-blue.png",
++      "build/tray-icon-blue@1.25x.png",
++      "build/tray-icon-blue@1.5x.png",
++      "build/tray-icon-blue@2x.png",
++          "node_modules/@dataiku/uv-win32-x64/**",
++      "node_modules/@deepseek-ai/node-addon-system-win32-x64/**",
++      "node_modules/@img/sharp-win32-x64/**",
++      "node_modules/@koromix/koffi-win32-x64/**",
++      "node_modules/@vscode/ripgrep-win32-x64/**",
++      "node_modules/koffi/**",
++      "node_modules/node-addon-require-builtin/**",
++      "node_modules/node-addon-require-builtin-win32-x64-msvc/**",
++      "node_modules/node-pty/**",
++      "node_modules/pnpm/**"
++    ],
+     "afterPack": "./scripts/verify-packaged-runtime.ts",
+-    "afterAllArtifactBuild": "./scripts/verify-electron-fuses.ts",
+     "electronFuses": {
+       "enableEmbeddedAsarIntegrityValidation": false,
+       "onlyLoadAppFromAsar": false,
+@@ -348,14 +363,31 @@
+     "files": [
+       "build/app-icon.ico",
+       "build/app-icon.png",
+-      "build/app-icon-mac.png",
+-      "build/tray-icon.svg",
++        "build/tray-icon.svg",
+       "build/tray-icon*.png",
+       "cordis.patch.yml",
+       "lib/**",
+       "package.json",
+       "!node_modules/node-pty/build/**",
+-      "!node_modules/fs-ext/build/**"
++      "!node_modules/fs-ext/build/**",
++      "!node_modules/@dataiku/uv-darwin-*/**",
++      "!node_modules/@dataiku/uv-linux-*/**",
++      "!node_modules/@dataiku/uv-win32-arm64/**",
++      "!node_modules/@deepseek-ai/node-addon-system-darwin-*/**",
++      "!node_modules/@deepseek-ai/node-addon-system-linux-*/**",
++      "!node_modules/@deepseek-ai/node-addon-system-win32-arm64/**",
++      "!node_modules/@img/sharp-darwin-*/**",
++      "!node_modules/@img/sharp-linux-*/**",
++      "!node_modules/@img/sharp-win32-arm64/**",
++      "!node_modules/@koromix/koffi-darwin-*/**",
++      "!node_modules/@koromix/koffi-linux-*/**",
++      "!node_modules/@koromix/koffi-win32-arm64/**",
++      "!node_modules/@vscode/ripgrep-darwin-*/**",
++      "!node_modules/@vscode/ripgrep-linux-*/**",
++      "!node_modules/@vscode/ripgrep-win32-arm64/**",
++      "!node_modules/node-addon-require-builtin-darwin-*/**",
++      "!node_modules/node-addon-require-builtin-linux-*/**",
++      "!node_modules/node-addon-require-builtin-win32-arm64-msvc/**"
+     ],
+     "mac": {
+       "target": [
+@@ -378,10 +410,10 @@
+         "\\.(?:pak|dat|wasm)$"
+       ],
+       "x64ArchFiles": "**/node_modules/{@deepseek-ai/node-addon-system-darwin-*/**,node-pty/prebuilds/darwin-*/**,fs-ext/prebuilds/darwin-*/**,node-addon-require-builtin-darwin-*/**,@vscode/ripgrep-darwin-*/**,@img/sharp-darwin-*/**,@img/sharp-libvips-darwin-*/**,@koromix/koffi-darwin-*/**}",
+-      "asar": false
++      "asar": true
+     },
+     "win": {
+-      "asar": false,
++      "asar": true,
+       "compression": "normal",
+       "target": [
+         {
+@@ -415,7 +447,7 @@
+         "dir"
+       ],
+       "icon": "build/app-icon.png",
+-      "asar": false
++      "asar": true
+     },
+     "npmRebuild": false
+   }

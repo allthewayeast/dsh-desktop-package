@@ -1,5 +1,5 @@
 diff --git a/dsh-plugin-desktop/src/main.ts b/dsh-plugin-desktop/src/main.ts
-index 0eb8c9ba6b..0c93cc2c6e 100644
+index 0eb8c9ba6b..d045505061 100644
 --- a/dsh-plugin-desktop/src/main.ts
 +++ b/dsh-plugin-desktop/src/main.ts
 @@ -205,6 +205,10 @@ import {
@@ -22,7 +22,7 @@ index 0eb8c9ba6b..0c93cc2c6e 100644
 +  // resolveDshHome and DSH_HOME bookkeeping below, and Electron switches must
 +  // be appended before the app becomes ready.
 +  const startupConfig = applyDesktopStartupConfig({
-+    configPath: resolveStartupConfigPath(dirname(process.execPath), process.env),
++    configPath: resolveStartupConfigPath(dirname(process.execPath)),
 +    environment: process.env,
 +  })
 +  for (const [name, value] of startupConfig.envUpdates) process.env[name] = value

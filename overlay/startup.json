@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "env": {
+    "DSH_HOME": "E:\\AppData\\YMZ\\.dsh-desktop",
+    "DSH_TELEMETRY_DISABLED": "1",
+    "PATH": "E:\\App\\CodeGraph\\bin;%PATH%"
+  },
+  "electron": {
+    "switches": [
+      { "name": "disable-direct-write", "value": null },
+      { "name": "disable-features", "value": "RendererCodeIntegrity" }
+    ]
+  }
+}

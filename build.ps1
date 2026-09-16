@@ -164,8 +164,8 @@ $script:SrcOverlayFiles = @(
 )
 $script:SrcPatchFiles = @(
   'dsh-plugin-desktop/src/main.ts'                     # 已跟踪文件的修改
-  'dsh-plugin-desktop/README.md'                       # 启动配置文件使用文档（构建时注入）
-  'dsh-plugin-desktop/README.zh.md'                    # 同上（中文版）
+  'dsh-plugin-desktop/package.json'                    # 选择性 ASAR 布局（asar:true + asarUnpack + 排除跨平台原生包）
+  'dsh-plugin-desktop/scripts/verify-packaged-runtime.ts'  # ASAR 布局校验白名单（@dataiku/uv- 平台前缀）
 )
 
 function Write-Banner {
@@ -1186,6 +1186,64 @@ function Set-WindowsAppIconKeepPatch {
   Write-WarnLine "app-icon 保留补丁已应用：$f"
 }
 
+# dsh-fs-local 本地补丁：Electron 43/44 的 asar 补丁对 asar 内路径的
+# stat/lstat({ bigint: true }) 支持不完整 —— asarStatsToFsStats 完全忽略 bigint
+# 选项，返回普通 Stats（mode 为 number，而非 BigInt）。dsh-fs-local 的 probe /
+# probeNoFollow 用 `info.mode & 511n`（BigInt 位运算）必然抛
+# "Cannot mix BigInt and other types"，导致 ASAR 布局下 afterPack 冒烟
+# （verifyBundledSkills 对 asar 内目录 listDir）失败、electron-builder 中止、
+# rcedit（exe 图标 + 版本信息编辑）从未执行。这里把 mode 先转 BigInt 再做位
+# 运算，number 与 bigint 两种输入等值兼容（真实文件系统返回 bigint，asar
+# 补丁返回 number）。
+$script:DshFsLocalBigintPristine = @(
+  '		mode: Number(info.mode & 511n),'
+)
+$script:DshFsLocalBigintFixed = @(
+  '		mode: Number(BigInt(info.mode) & 511n),'
+)
+
+function Set-DshFsLocalBigintPatch {
+  $targets = @(
+    (Get-ChannelWsPath 'node_modules\@deepseek-ai\dsh-fs-local\lib\index.js')
+  )
+  foreach ($f in $targets) {
+    if (-not (Test-Path -LiteralPath $f)) {
+      Write-WarnLine "dsh-fs-local 补丁：未找到 $f（依赖未安装？），跳过。"
+      continue
+    }
+    $raw = [System.IO.File]::ReadAllText($f)
+    $eol = if ($raw.Contains("`r`n")) { "`r`n" } else { "`n" }
+    if ($raw.Contains('BigInt(info.mode) & 511n')) {
+      Write-Info "dsh-fs-local 补丁已生效：$f"
+      continue
+    }
+    $lines = [System.IO.File]::ReadAllLines($f)
+    $out = New-Object System.Collections.Generic.List[string]
+    $patched = 0
+    $i = 0
+    while ($i -lt $lines.Length) {
+      $match = $true
+      for ($j = 0; $j -lt $script:DshFsLocalBigintPristine.Count; $j++) {
+        if ($i + $j -ge $lines.Length -or $lines[$i + $j] -ne $script:DshFsLocalBigintPristine[$j]) { $match = $false; break }
+      }
+      if ($match) {
+        foreach ($ln in $script:DshFsLocalBigintFixed) { $out.Add($ln) }
+        $i += $script:DshFsLocalBigintPristine.Count
+        $patched++
+      } else {
+        $out.Add($lines[$i])
+        $i++
+      }
+    }
+    if ($patched -eq 0) {
+      Write-WarnLine "dsh-fs-local 补丁：$f 中未找到原版 mode 位运算行（包版本可能已变），跳过。"
+      continue
+    }
+    [System.IO.File]::WriteAllText($f, ($out -join $eol) + $eol)
+    Write-WarnLine "dsh-fs-local 补丁已应用：$f（$patched 处）"
+  }
+}
+
 function Test-InstalledElectron {
   # 返回当前通道 node_modules 里已安装的 electron 版本（不存在返回 $null）
   $pkg = Get-ChannelWsPath 'node_modules\electron\package.json'
@@ -1270,6 +1328,8 @@ function Invoke-ChannelOverlayPreInstall {
 function Invoke-ChannelOverlayPostInstall {
   # 覆盖层（安装后）：pnpm.mjs 补丁（install 会还原为原版）
   Set-PnpmDistPatch
+  # dsh-fs-local bigint 兼容补丁（install 会还原为原版；ASAR 布局打包必需）
+  Set-DshFsLocalBigintPatch
 }
 
 function Update-SourceRepository {

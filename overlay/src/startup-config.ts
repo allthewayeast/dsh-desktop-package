@@ -9,14 +9,11 @@ import {
   readSync,
 } from 'node:fs'
 import type { Stats } from 'node:fs'
-import { isAbsolute, join } from 'node:path'
+import { join } from 'node:path'
 import { DESKTOP_PACKAGE_NAME } from './product-identity.ts'
 
-/** File name read from the executable directory unless `DSH_STARTUP_CONFIG` points elsewhere. */
+/** File name read from the executable directory. */
 export const DESKTOP_STARTUP_CONFIG_FILENAME = 'startup.json'
-
-/** Environment variable that overrides the default startup-config location. */
-export const DESKTOP_STARTUP_CONFIG_ENV = 'DSH_STARTUP_CONFIG'
 
 /** Bounded size accepted for the user-owned startup configuration. */
 export const DESKTOP_STARTUP_CONFIG_MAX_BYTES = 64 * 1024
@@ -239,23 +236,11 @@ function readBoundedUtf8(path: string): string {
 }
 
 /**
- * Resolve the startup-config path: `$DSH_STARTUP_CONFIG` when it holds an
- * absolute path, otherwise `startup.json` beside the executable.
+ * Resolve the startup-config path: `startup.json` beside the executable.
  * @param executableDir - directory of the launched executable (`dirname(process.execPath)`).
- * @param environment - environment mapping used to read `DSH_STARTUP_CONFIG`.
  * @returns the absolute config path.
  */
-export function resolveStartupConfigPath(
-  executableDir: string,
-  environment: NodeJS.ProcessEnv = process.env,
-): string {
-  const configured = environment[DESKTOP_STARTUP_CONFIG_ENV]
-  if (configured !== undefined && configured.trim().length > 0) {
-    if (!isAbsolute(configured)) {
-      throw new DesktopStartupConfigError('invalid', `${DESKTOP_STARTUP_CONFIG_ENV} must hold an absolute path`)
-    }
-    return configured
-  }
+export function resolveStartupConfigPath(executableDir: string): string {
   return join(executableDir, DESKTOP_STARTUP_CONFIG_FILENAME)
 }
 
