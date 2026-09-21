@@ -14,6 +14,7 @@ rename "%distDir%\locales\zh-CN.pak" "zh-CN.pak.bak"
 del /f /q "%distDir%\locales\*.pak"
 del /f /q "%distDir%\LICENSES.chromium.html"
 del /f /q "%distDir%\LICENSE.electron.txt"
+del /f /q "%distDir%\version"
 
 rename "%distDir%\locales\en-US.pak.bak" "en-US.pak"
 rename "%distDir%\locales\zh-CN.pak.bak" "zh-CN.pak"

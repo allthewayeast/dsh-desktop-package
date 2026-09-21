@@ -1,10 +1,10 @@
 diff --git a/dsh-plugin-desktop/src/main.ts b/dsh-plugin-desktop/src/main.ts
-index 0eb8c9ba6b..d045505061 100644
+index fd0904384b..10376ff9b6 100644
 --- a/dsh-plugin-desktop/src/main.ts
 +++ b/dsh-plugin-desktop/src/main.ts
-@@ -205,6 +205,10 @@ import {
-   DESKTOP_RELEASE_CHANNEL,
- } from './product-identity.ts'
+@@ -210,6 +210,10 @@ import {
+   resolveDesktopChannelHome,
+ } from './desktop-channel-home.ts'
  import { desktopRecoveryCopy } from './recovery-copy.ts'
 +import {
 +  applyDesktopStartupConfig,
@@ -13,7 +13,7 @@ index 0eb8c9ba6b..d045505061 100644
  
  const BIN_NAME = DESKTOP_PACKAGE_NAME
  const PRODUCT_NAME = DESKTOP_PRODUCT_NAME
-@@ -381,6 +385,18 @@ async function mirrorDesktopProfilePreferences(
+@@ -386,6 +390,18 @@ async function mirrorDesktopProfilePreferences(
  
  /** Start one Electron process and leave lifetime to the mounted desktop plugin. */
  async function start(): Promise<void> {

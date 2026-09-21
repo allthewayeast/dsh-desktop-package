@@ -1,8 +1,8 @@
 diff --git a/dsh-plugin-desktop/package.json b/dsh-plugin-desktop/package.json
-index a5a9c36326..7445f24ca1 100644
+index 21a6a8d85f..a7e7fe85ee 100644
 --- a/dsh-plugin-desktop/package.json
 +++ b/dsh-plugin-desktop/package.json
-@@ -76,7 +76,6 @@
+@@ -77,7 +77,6 @@
    "files": [
      "build/app-icon.ico",
      "build/app-icon.png",
@@ -10,7 +10,7 @@ index a5a9c36326..7445f24ca1 100644
      "build/tray-icon.svg",
      "build/tray-icon*.png",
      "cordis.patch.yml",
-@@ -329,9 +328,25 @@
+@@ -337,9 +336,25 @@
    "build": {
      "appId": "ai.deepseek.dsh.desktop",
      "productName": "DSH Desktop",
@@ -38,7 +38,7 @@ index a5a9c36326..7445f24ca1 100644
      "electronFuses": {
        "enableEmbeddedAsarIntegrityValidation": false,
        "onlyLoadAppFromAsar": false,
-@@ -348,14 +363,31 @@
+@@ -356,14 +371,31 @@
      "files": [
        "build/app-icon.ico",
        "build/app-icon.png",
@@ -73,10 +73,10 @@ index a5a9c36326..7445f24ca1 100644
      ],
      "mac": {
        "target": [
-@@ -378,10 +410,10 @@
+@@ -386,10 +418,10 @@
          "\\.(?:pak|dat|wasm)$"
        ],
-       "x64ArchFiles": "**/node_modules/{@deepseek-ai/node-addon-system-darwin-*/**,node-pty/prebuilds/darwin-*/**,fs-ext/prebuilds/darwin-*/**,node-addon-require-builtin-darwin-*/**,@vscode/ripgrep-darwin-*/**,@img/sharp-darwin-*/**,@img/sharp-libvips-darwin-*/**,@koromix/koffi-darwin-*/**}",
+       "x64ArchFiles": "**/node_modules/{@dataiku/uv-darwin-*/**,@deepseek-ai/node-addon-system-darwin-*/**,node-pty/prebuilds/darwin-*/**,fs-ext/prebuilds/darwin-*/**,node-addon-require-builtin-darwin-*/**,@vscode/ripgrep-darwin-*/**,@img/sharp-darwin-*/**,@img/sharp-libvips-darwin-*/**,@koromix/koffi-darwin-*/**}",
 -      "asar": false
 +      "asar": true
      },
@@ -86,12 +86,12 @@ index a5a9c36326..7445f24ca1 100644
        "compression": "normal",
        "target": [
          {
-@@ -415,7 +447,7 @@
-         "dir"
-       ],
-       "icon": "build/app-icon.png",
+@@ -440,7 +472,7 @@
+       "maintainer": "DeepSeek <dsh-desktop@deepseek.com>",
+       "executableName": "dsh-desktop",
+       "syncDesktopName": true,
 -      "asar": false
 +      "asar": true
      },
-     "npmRebuild": false
-   }
+     "deb": {
+       "packageName": "dsh-desktop",

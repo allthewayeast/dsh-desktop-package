@@ -61,6 +61,13 @@
   pnpm.mjs 补丁。不带此参数时构建上游原样代码（仍会应用 Windows 打包必需修复）。
   quick-build-overlay.bat 携带 -Overlay。
 
+.PARAMETER ElectronVersion
+  覆盖层使用的 Electron 版本（默认 44.4.3，即脚本原始版本）。仅在 -Overlay 时生效：
+  会把 <通道>/package.json 的 devDependencies.electron 改写为该版本，已装版本与之
+  不一致时自动补装依赖（含 Electron 头文件缓存与 dist 解包）。不指定时沿用默认版本；
+  需要临时换版本时在执行时指定，例如 -ElectronVersion 45.0.0。
+  当上游声明的版本与目标一致时自动跳过改写（构建上游原样）。
+
 .PARAMETER KeepTimestamps
   保留 Electron 官方 zip 的 1980-01-01 时间戳（可复现构建行为）。
   默认关闭：打包后会把 dist\win-unpacked 内文件时间戳规整为当前时间。
@@ -69,6 +76,7 @@
   .\build.ps1
   .\build.ps1 -Target package-dir              # 解包打包（无覆盖层）
   .\build.ps1 -Overlay -Target package-dir     # 应用本地覆盖层（quick-build-overlay 默认）
+  .\build.ps1 -Overlay -Target package-dir -ElectronVersion 45.0.0   # 临时换 Electron 版本
   .\build.ps1 -Target build                    # 编译
   .\build.ps1 -Target dist-win-portable
   .\build.ps1 -Target dist-win -Proxy http://127.0.0.1:7890
@@ -106,7 +114,12 @@ param(
   [switch]$Force,
   [switch]$NoZip,
   [switch]$Overlay,
-  [switch]$KeepTimestamps
+  [switch]$KeepTimestamps,
+
+  # 覆盖层 Electron 版本（仅在 -Overlay 时生效）。默认值 = 脚本原始版本：
+  # 不指定参数时行为与改造前完全一致；需要临时换版本时在执行时指定。
+  [ValidatePattern('^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?$')]
+  [string]$ElectronVersion = '44.4.3'
 )
 
 Set-StrictMode -Version Latest
@@ -130,10 +143,13 @@ $script:GithubVersion = $null
 # 产品线固定为 stable：只构建 dsh-plugin-desktop（beta 通道已移除）
 $script:Channel = 'stable'
 $script:ChannelWsName = 'dsh-plugin-desktop'
-# 本地覆盖层：electron 固定版本。默认跟随官方声明值（当前 43.3.0）：当官方声明
-# 与脚本值一致时 Set-ElectronOverride 自动跳过覆盖（构建上游原样）；仅在需要强制
-# 指定其他版本时才改此值（例如官方尚未跟进、本地确需更新的版本）。
-$script:ElectronOverride = '43.3.0'
+# 本地覆盖层：electron 目标版本。取值来源为 -ElectronVersion 参数（默认 '44.4.3'，
+# 即脚本原始版本）：不指定参数时构建行为与改造前一致；需要临时换版本时在执行时指定。
+# Set-ElectronOverride 在官方声明与目标一致时自动跳过覆盖（构建上游原样）；仅在需要
+# 强制指定其他版本时才实际改写（例如官方尚未跟进、本地确需更新的版本）。
+$script:ElectronOverride = $ElectronVersion
+# 是否由命令行显式指定（用于日志区分“脚本默认”与“参数指定”）。
+$script:ElectronVersionExplicit = $MyInvocation.BoundParameters.ContainsKey('ElectronVersion')
 # deepseek-harness（dsh 运行时）版本固定：把 stable 通道固定到本地指定版本。当
 # upstream.json 已与这两个值一致（上游官方化后）时 Set-RuntimeVersionPinned 自动
 # 跳过（构建上游原样）；不一致时才固定（本地领先上游或需强制回落）。改版本 =
@@ -144,11 +160,14 @@ $script:HarnessCommit  = 'fb2c4b9e698e30edb738bca4cf0618587db7d203'  # dsh-v0.1.
 # 排除 beta 通道：不再安装 dsh-plugin-desktop-beta 的依赖、不参与任何编译，
 # 其 manifest 也不再被 AA 准备脚本读取/改写。设为 $false 可临时恢复 beta。
 $script:DisableBeta = $true
-# AA（Agents-Anywhere）源固定：默认跟随 main，但 main 上游 10300fd5 的 typecheck
-# 是坏的（TS2717/TS2344 重复类型声明），全量重建必然失败。固定到最后一个成功
-# 构建过的 commit（00df092，产物 c00df092…tgz 已验证），prepare 脚本会走
-# “Reusing verified AA artifact” 快路径，不重建。上游修好后再改回 'main'。
-$script:AaSourceRef = '00df092c98b271098cba18b4f96d91f5008c2cd4'
+# AA（Agents-Anywhere）源固定：固定到上游官方 provenance 已验证的 commit
+# （a022d928，产物 agents-anywhere-dsh-bridge-next-…ca022d9286dd0….tgz，peer 与
+# 当前 0.1.5-rc.2 运行时兼容；上游 1f53e9bbcd “require latest Agents Anywhere”
+# 的官方状态）。此前固定 00df092c 是 rc.1 时代产物（peer=0.1.5-rc.1），与 rc.2
+# 不兼容；且 provenance 同步会把 commit 改到 00df092 而 artifact 仍是 ca022d，
+# 造成 provenance 不自洽 → 快路径复用失败 → 全量重建 → 临时目录混装 rc.1/rc.2
+# → 触发上游 typecheck TS2717/TS2344。上游修好后再改回 'main'。
+$script:AaSourceRef = 'a022d9286dd025bb4ae9f77b59cc2b7581f78b34'
 
 # ---- src 覆盖层（用户自定义源码改动，-Overlay 时自动生效）----
 # 覆盖层目录（包根 overlay\，不属于 dsh-desktop 仓库，pull 不受影响）：
@@ -214,6 +233,7 @@ function Initialize-Log {
     "root    : $script:Root"
     "src     : $script:Src"
     "target  : $Target"
+    "electron: $(if ($Overlay) { $script:ElectronOverride } else { 'upstream' })"
     "host    : $([System.Environment]::OSVersion.VersionString)"
     "arch    : $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
     ""
@@ -438,6 +458,10 @@ function Show-Environment {
   Write-Info "目标        : $Target"
   Write-Info "通道        : $script:Channel（$script:ChannelWsName）"
   Write-Info "覆盖层      : $(if ($Overlay) { '开（-Overlay）' } else { '关（上游原样）' })"
+  if ($Overlay) {
+    $elFrom = if ($script:ElectronVersionExplicit) { '参数指定' } else { '脚本默认' }
+    Write-Info "Electron    : $script:ElectronOverride（$elFrom）"
+  }
   Write-Info "仓库根      : $script:Src"
   Write-Info "操作系统    : $([System.Environment]::OSVersion.VersionString)"
   Write-Info "架构        : $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
@@ -867,6 +891,37 @@ function Disable-BetaWorkspace {
   } else {
     Write-Info 'beta 排除：AA 准备脚本已不含 beta 引用'
   }
+
+  # 3) AA 策略文件（agents-anywhere-release-policy.mjs）：beta 禁用后不再安装其依赖，
+  #    但 policy 的 assertPreparedAaRelease 仍会遍历 beta 的 node_modules
+  #    （ENOENT: …dsh-plugin-desktop-beta\node_modules\@agents-anywhere\…）。给 assert
+  #    引入 AA_WORKSPACES_CHECKED（仅 stable）：runtimePeerRanges 仍读 desktop+beta
+  #    （保证 provenance.runtimePeers 与已验证产物 peer 的联合范围一致），但安装校验
+  #    只检查 stable。每次构建 pull 重置后重新应用，幂等。
+  $policyPath = Join-Path $script:Src 'scripts\agents-anywhere-release-policy.mjs'
+  if (Test-Path -LiteralPath $policyPath) {
+    $policyText = [System.IO.File]::ReadAllText($policyPath)
+    if ($policyText.Contains('AA_WORKSPACES_CHECKED')) {
+      Write-Info 'beta 排除：AA 策略文件已含 AA_WORKSPACES_CHECKED'
+    } else {
+      $checkDecl = "export const AA_WORKSPACES_CHECKED = ['dsh-plugin-desktop']"
+      $anchor = "export const AA_WORKSPACES = ['dsh-plugin-desktop', 'dsh-plugin-desktop-beta']"
+      if ($policyText.Contains($anchor) -and -not $policyText.Contains($checkDecl)) {
+        $policyText = $policyText.Replace($anchor, "$anchor`n$checkDecl")
+        Write-WarnLine 'beta 排除：AA 策略文件已加入 AA_WORKSPACES_CHECKED（仅校验 stable 安装）'
+      } elseif (-not $policyText.Contains($checkDecl)) {
+        Write-WarnLine 'beta 排除：AA 策略文件 workspace 声明格式已变（无法补声明），跳过。'
+      }
+      $oldLoop = 'for (const workspace of AA_WORKSPACES) {'
+      if ($policyText.Contains($oldLoop)) {
+        $policyText = $policyText.Replace($oldLoop, 'for (const workspace of AA_WORKSPACES_CHECKED) {')
+        Write-WarnLine 'beta 排除：AA 策略文件 assert 校验已切换到 stable 列表'
+      } else {
+        Write-WarnLine 'beta 排除：AA 策略文件 assert 循环格式已变（无法打补丁），跳过。'
+      }
+      [System.IO.File]::WriteAllText($policyPath, $policyText)
+    }
+  }
 }
 
 # AA（Agents-Anywhere）桥接产物依赖对齐：
@@ -897,26 +952,42 @@ function Set-RuntimeVersionPinned {
   if ($entryByName.Count -eq 0) { throw "运行时 manifest 为空：$manifestPath" }
 
   # 0) AA provenance 同步（始终执行，不受下方“官方一致跳过”影响）：
-  #    runtimePeers 是 AA prepare 复用检查的关键条件（读 plugin 的 dsh peer 依赖版本
-  #    对比）。上游官方状态可能不自洽（dsh 依赖已升 rc.2 而 AA provenance 仍是 rc.1
-  #    peers）——若这里跳过，AA prepare 会放弃复用已验证产物、进入全量重建，而重建
-  #    在临时目录从 registry 拉包（rc.2 已发布 → 混装 rc.1/rc.2）→ typecheck
-  #    TS2717/TS2344 失败。commit 也固定为 AA 源（避免 pull 重置后回落）。
+  #    runtimePeers 是 AA prepare 复用检查的关键条件。必须与 AA policy 的
+  #    runtimePeerRanges() 一致（读 desktop + beta 两个 workspace 的 dsh peer 依赖、
+  #    去重合并），否则快路径复用失败 → 全量重建 → 临时目录从 registry 拉包混装
+  #    rc.1/rc.2 → typecheck TS2717/TS2344 失败。commit 固定为 AA 源（避免 pull
+  #    重置后回落）。注意：不要把 runtimePeers 硬编码成 $v —— 已验证产物的 peer
+  #    是联合范围（如 "0.1.5-rc.2 || 0.1.6-alpha.2"），硬编码会破坏 provenance 自洽。
   $provPath = Join-Path $script:Src 'vendor\agents-anywhere\provenance.json'
   if (Test-Path -LiteralPath $provPath) {
     $prov = Get-JsonObject $provPath
     $provChanged = $false
     if ($prov.commit -ne $script:AaSourceRef) { $prov.commit = $script:AaSourceRef; $provChanged = $true }
-    foreach ($peer in @('@deepseek-ai/dsh-typert-protocol', '@deepseek-ai/dsh-llm', '@deepseek-ai/dsh-session')) {
-      $peerProp = $prov.runtimePeers.PSObject.Properties[$peer]
-      if ($peerProp -and $peerProp.Value -ne $v) {
-        $prov.runtimePeers.$peer = $v
+    # 按 AA policy runtimePeerRanges() 的规则计算联合 peer 范围（键序：typert/llm/session）
+    $peerNames = @('@deepseek-ai/dsh-typert-protocol', '@deepseek-ai/dsh-llm', '@deepseek-ai/dsh-session')
+    $peerWs = @(
+      (Join-Path $script:Src 'dsh-plugin-desktop\package.json'),
+      (Join-Path $script:Src 'dsh-plugin-desktop-beta\package.json')
+    ) | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { Get-JsonObject $_ }
+    $peerRangesMap = [ordered]@{}
+    foreach ($peer in $peerNames) {
+      $ranges = @($peerWs | ForEach-Object { $_.dependencies.$peer } | Where-Object { $_ -is [string] -and $_ })
+      if ($ranges.Count -gt 0) { $peerRangesMap[$peer] = @($ranges | Sort-Object -Unique) -join ' || ' }
+    }
+    if ($peerRangesMap.Count -gt 0) {
+      $peersDiffer = $false
+      foreach ($peer in $peerNames) {
+        if ($peerRangesMap.Contains($peer) -and $prov.runtimePeers.$peer -ne $peerRangesMap[$peer]) { $peersDiffer = $true; break }
+      }
+      if ($peersDiffer) {
+        $prov.runtimePeers = [ordered]@{}
+        foreach ($peer in $peerNames) { if ($peerRangesMap.Contains($peer)) { $prov.runtimePeers[$peer] = $peerRangesMap[$peer] } }
         $provChanged = $true
       }
     }
     if ($provChanged) {
       Set-Content -LiteralPath $provPath -Value (ConvertTo-Json $prov -Depth 10) -Encoding utf8 -NoNewline
-      Write-WarnLine "AA provenance 已同步（commit $($script:AaSourceRef.Substring(0,10))，runtimePeers → $v）"
+      Write-WarnLine "AA provenance 已同步（commit $($script:AaSourceRef.Substring(0,10))，runtimePeers 与 AA policy 对齐）"
     }
   }
 

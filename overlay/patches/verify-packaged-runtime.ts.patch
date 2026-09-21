@@ -1,12 +1,38 @@
 diff --git a/dsh-plugin-desktop/scripts/verify-packaged-runtime.ts b/dsh-plugin-desktop/scripts/verify-packaged-runtime.ts
-index fb1f430588..74ee286230 100644
+index a093dfe17c..7d6a8cdb2d 100644
 --- a/dsh-plugin-desktop/scripts/verify-packaged-runtime.ts
 +++ b/dsh-plugin-desktop/scripts/verify-packaged-runtime.ts
-@@ -88,6 +88,7 @@ export const ALLOWED_SMART_UNPACK_PACKAGE_ROOTS = [
+@@ -853,13 +853,30 @@ export function reportUnpackedRuntime(summary: UnpackedRuntimeSummary): void {
+   process.stdout.write(`dsh-plugin-desktop: packaged runtime inventory: ${formatUnpackedRuntimeSummary(summary)}\n`)
+ }
  
- /** Platform package families selected by native dependencies at package time. */
- export const ALLOWED_SMART_UNPACK_PACKAGE_PREFIXES = [
-+  'node_modules/@dataiku/uv-',
-   'node_modules/@deepseek-ai/node-addon-system-',
-   'node_modules/@img/sharp-',
-   'node_modules/@koromix/koffi-',
++/** ASAR 布局下优先从 app.asar 读取；含原生模块的包被 smart unpack 整体解出到
++ *  app.asar.unpacked 时回退到 unpacked 目录读取（本地 asar:true 定制后
++ *  @agents-anywhere/dsh-bridge-next 等包可能被解出 asar，需两处兼容）。 */
++function readPackagedCompat(context: PackagedRuntimeContext, path: string): Buffer {
++  if (!usesAsarLayout(context)) return readFileSync(join(resolvePackagedApplicationRoot(context), path))
++  try {
++    return extractFile(resolvePackagedAsarPath(context), path)
++  } catch {
++    // Windows 打包时 asar 内路径可能是反斜杠（electron-builder + @electron/asar
++    // 在 Windows 上的路径行为），或含原生模块的包被 smart unpack 整体解出到
++    // app.asar.unpacked。依次回退：先试反斜杠路径，再从 unpacked 目录读取。
++    try {
++      return extractFile(resolvePackagedAsarPath(context), path.replaceAll('/', '\\'))
++    } catch {
++      return readFileSync(join(resolvePackagedUnpackedRoot(context), path))
++    }
++  }
++}
++
+ /** Verify the AA version and built entry sealed into the actual installation payload. */
+ export function verifyPackagedAgentsAnywhere(
+   context: PackagedRuntimeContext,
+   readInstalled: (path: string) => Buffer = readFileSync,
+-  readPackaged: (path: string) => Buffer = path => usesAsarLayout(context)
+-    ? extractFile(resolvePackagedAsarPath(context), path)
+-    : readFileSync(join(resolvePackagedApplicationRoot(context), path)),
++  readPackaged: (path: string) => Buffer = path => readPackagedCompat(context, path),
+ ): void {
+   if (context.electronPlatformName === 'darwin') {
+     const root = usesAsarLayout(context) ? resolvePackagedUnpackedRoot(context) : resolvePackagedApplicationRoot(context)
