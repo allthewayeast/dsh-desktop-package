@@ -155,18 +155,23 @@ $script:ElectronVersionExplicit = $MyInvocation.BoundParameters.ContainsKey('Ele
 # 跳过（构建上游原样）；不一致时才固定（本地领先上游或需强制回落）。改版本 =
 # 改这两个值 + 重新生成 vendor/dsh-runtime/<版本>/（yarn upstream:prepare-runtime
 # && sync-vendored-runtime）。
-$script:RuntimeVersion = '0.1.5-rc.2'
-$script:HarnessCommit  = 'fb2c4b9e698e30edb738bca4cf0618587db7d203'  # dsh-v0.1.5-rc.2 tag
+$script:RuntimeVersion = '0.1.7-rc.2'
+$script:HarnessCommit  = '477b4f420553e8a52c2fbccc464d7561b239c443'  # dsh-v0.1.7-rc.2 tag
 # 排除 beta 通道：不再安装 dsh-plugin-desktop-beta 的依赖、不参与任何编译，
 # 其 manifest 也不再被 AA 准备脚本读取/改写。设为 $false 可临时恢复 beta。
 $script:DisableBeta = $true
-# AA（Agents-Anywhere）源固定：固定到上游官方 provenance 已验证的 commit
-# （a022d928，产物 agents-anywhere-dsh-bridge-next-…ca022d9286dd0….tgz，peer 与
-# 当前 0.1.5-rc.2 运行时兼容；上游 1f53e9bbcd “require latest Agents Anywhere”
-# 的官方状态）。此前固定 00df092c 是 rc.1 时代产物（peer=0.1.5-rc.1），与 rc.2
-# 不兼容；且 provenance 同步会把 commit 改到 00df092 而 artifact 仍是 ca022d，
-# 造成 provenance 不自洽 → 快路径复用失败 → 全量重建 → 临时目录混装 rc.1/rc.2
-# → 触发上游 typecheck TS2717/TS2344。上游修好后再改回 'main'。
+# 排除实验性 Next 桌面（上游 dsh-desktop-next，独立 Electron 应用 “DSH NEXT”）：与
+# beta 同等处理 —— 从根 package.json 的 workspaces 移除 → yarn install 不再安装它的
+# 依赖（含它自带的 electron），它也不参与任何编译 / 类型检查 / 打包。本脚本只构建
+# stable 通道（dsh-plugin-desktop），上游的 package:dir / dist:win 均不涉及 next。
+# 设为 $false 可临时恢复（恢复后 yarn install 会重新安装它的依赖）。
+$script:DisableNext = $true
+# AA（Agents-Anywhere）源兜底固定：$script:AaSourceRef 只在 vendored provenance
+# 自身不自洽时使用（见 Set-RuntimeVersionPinned / 主流程的 DSH_AA_SOURCE_REF 逻辑）。
+# 上游 v2.0.14 起 provenance.json 已自带自洽的 commit ↔ 产物对应关系，并被
+# aa:prepare-release 的 “artifact version identifies the selected commit” 校验强制；
+# 再像旧版本那样无条件把它改写成历史提交 a022d928（0.1.5-rc.2 时代的产物）会让校验
+# 直接失败。保留该值仅供自洽性检查失败时回落使用。
 $script:AaSourceRef = 'a022d9286dd025bb4ae9f77b59cc2b7581f78b34'
 
 # ---- src 覆盖层（用户自定义源码改动，-Overlay 时自动生效）----
@@ -183,8 +188,16 @@ $script:SrcOverlayFiles = @(
 )
 $script:SrcPatchFiles = @(
   'dsh-plugin-desktop/src/main.ts'                     # 已跟踪文件的修改
-  'dsh-plugin-desktop/package.json'                    # 选择性 ASAR 布局（asar:true + asarUnpack + 排除跨平台原生包）
-  'dsh-plugin-desktop/scripts/verify-packaged-runtime.ts'  # ASAR 布局校验白名单（@dataiku/uv- 平台前缀）
+  # 重新启用 ASAR：上游 83cc4f821c/09070dd72e 把桌面打包整体切成 asar:false
+  # （产物 resources\app\，文件数巨大）。本覆盖层补丁改回 asar:{smartUnpack:true}
+  # 并恢复两个 ASAR 相关 fuse + 三平台 asarUnpack（图标与 bundled-connector 必须
+  # 物理解出，spawn 无法进入 asar 归档）。补丁**只含 ASAR 相关改动**：electron
+  # 版本与 afterAllArtifactBuild 钩子由 Set-ElectronOverride /
+  # Set-AllArtifactVerifyDisabled 单独管理，不能写进补丁（否则会互相打架）。
+  # 历史坑：上一版该补丁退化成纯版本串改写（把 0.1.7-rc.2 依赖降级回 0.1.5-rc.2），
+  # 备份仍在 logs\backups\package.json.patch.bak-stale-0.1.5-*.patch。
+  'dsh-plugin-desktop/package.json'                    # 重新启用 ASAR（smartUnpack + fuses + asarUnpack）
+  'dsh-plugin-desktop/scripts/verify-packaged-runtime.ts'  # 产物运行时校验白名单（@dataiku/uv- 平台前缀）
 )
 
 function Write-Banner {
@@ -458,6 +471,10 @@ function Show-Environment {
   Write-Info "目标        : $Target"
   Write-Info "通道        : $script:Channel（$script:ChannelWsName）"
   Write-Info "覆盖层      : $(if ($Overlay) { '开（-Overlay）' } else { '关（上游原样）' })"
+  $excludedWs = Get-ExcludedWorkspaceNames
+  if ($excludedWs.Count -gt 0) {
+    Write-Info "排除工作区  : $($excludedWs -join '、')（不安装依赖 / 不参与编译）"
+  }
   if ($Overlay) {
     $elFrom = if ($script:ElectronVersionExplicit) { '参数指定' } else { '脚本默认' }
     Write-Info "Electron    : $script:ElectronOverride（$elFrom）"
@@ -675,8 +692,8 @@ function Reset-OverlayTrackedFiles {
     # 先导出/备份 src 覆盖层改动（仅 -Overlay 时，见 Export-SrcOverlay），
     # 否则下面的 checkout 会把这些改动直接丢掉。
     Export-SrcOverlay
-    # 说明：除覆盖层文件外，还包括“构建过程会改写”的受跟踪文件（AA 依赖对齐 /
-    # 本地定制 app-icon.ico）。它们每次构建都会被重新生成或重新拷贝，pull 前丢弃
+    # 说明：除覆盖层文件外，还包括“构建过程会改写”的受跟踪文件（AA 依赖对齐）。
+    # 它们每次构建都会被重新生成，pull 前丢弃
     # 本地改动不会丢东西；不丢弃则上游一改这些文件 pull 就会失败。
     # 注意：不要加入 vendor/agents-anywhere/provenance.json —— 其 commit 必须与
     # AA main 解析结果一致，prepare 脚本才会走 “Reusing verified AA artifact”
@@ -687,8 +704,6 @@ function Reset-OverlayTrackedFiles {
       'dsh-plugin-desktop-beta/package.json',
       'dsh-community-market/package.json',
       'dsh-plugin-desktop/scripts/package-dir.mjs',
-      'dsh-plugin-desktop/scripts/generate-windows-app-icon.mjs',
-      'dsh-plugin-desktop/build/app-icon.ico',
       'scripts/prepare-agents-anywhere-release.mjs',
       'vendor/agents-anywhere/provenance.json'
     ) + $script:SrcPatchFiles
@@ -835,45 +850,90 @@ function Set-AllArtifactVerifyDisabled {
   Write-WarnLine "修复：已从 $pkgPath 移除 build.afterAllArtifactBuild（禁用 PR #829 事后校验钩子）"
 }
 
-# 排除 beta 通道（$script:DisableBeta = $true）：
-#   1) 根 package.json 的 workspaces 移除 "dsh-plugin-desktop-beta" → yarn install 不再
-#      安装 beta 的依赖，beta 完全不参与编译；
-#   2) 给 scripts/prepare-agents-anywhere-release.mjs 打补丁：两处桌面 manifest 列表
-#      （读 peer ranges 处、复用校验/重建时改写处）改为仅 stable → beta 的
-#      package.json 不再被 AA 流程读取/改写。
-#   两个文件都在 pull 前重置清单里，pull 后重新应用，幂等。
-function Disable-BetaWorkspace {
+# 工作区排除（beta 通道 + 实验性 Next 桌面，见 $script:DisableBeta / $script:DisableNext）：
+#   1) 根 package.json 的 workspaces 移除这些工作区 → yarn install 不再安装它们的依赖，
+#      它们完全不参与编译 / 类型检查 / 打包（Next 与 beta 走的是同一条路径）；
+#   2) beta 专项（Disable-BetaAaPipeline）：AA 准备脚本 / AA 策略文件里的 beta 引用改写。
+#   根 package.json 在 pull 前重置清单里，所以每次 pull 后都要重新应用 —— 均为幂等操作。
+function Get-ExcludedWorkspaceNames {
+  # 需要从根 workspaces 排除的工作区名（beta 与 Next 各由一个开关控制）
+  $names = @()
+  if ($script:DisableBeta) { $names += 'dsh-plugin-desktop-beta' }
+  if ($script:DisableNext) { $names += 'dsh-desktop-next' }
+  return $names
+}
+
+# 从根 package.json 的 workspaces 数组移除一个工作区。只在数组内部操作（不会误删
+# scripts 里同名的 "yarn workspace <name> ..." 文案）；幂等；返回 $true 表示确实改写了文件。
+function Remove-RootWorkspace {
+  param([Parameter(Mandatory)][string]$Name)
+  $pkgPath = Join-Path $script:Src 'package.json'
+  if (-not (Test-Path -LiteralPath $pkgPath)) { return $false }
+  $text = [System.IO.File]::ReadAllText($pkgPath)
+  $quoted = '"' + $Name + '"'
+  $m = [regex]::Match($text, '(?s)("workspaces"\s*:\s*\[)(.*?)(\])')
+  if (-not $m.Success) {
+    Write-WarnLine "$Name 排除：根 package.json 未找到 workspaces 数组（格式变化？），跳过。"
+    return $false
+  }
+  $body = $m.Groups[2].Value
+  if ($body.IndexOf($quoted, [StringComparison]::Ordinal) -lt 0) {
+    Write-Info "$Name 排除：根 workspaces 已不含该工作区"
+    return $false
+  }
+  # 三档兜底：整行带尾逗号 → 逗号单独成行（条目是数组最后一个）→ 单行数组 / 行尾无逗号
+  $newBody = [regex]::Replace($body, "(?m)^[ \t]*$quoted,[ \t]*\r?\n", '')
+  if ($newBody -eq $body) {
+    $newBody = [regex]::Replace($body, "(?m)^[ \t]*,[ \t]*\r?\n[ \t]*$quoted[ \t]*\r?\n", '')
+  }
+  if ($newBody -eq $body) {
+    $newBody = [regex]::Replace($body, "[ \t]*$quoted[ \t]*,?", '')
+  }
+  if ($newBody -eq $body) {
+    Write-WarnLine "$Name 排除：未能从根 workspaces 移除（格式变化？），跳过。"
+    return $false
+  }
+  $fixed = $text.Substring(0, $m.Groups[2].Index) + $newBody + $text.Substring($m.Groups[2].Index + $m.Groups[2].Length)
+  try {
+    $null = $fixed | ConvertFrom-Json
+  } catch {
+    # 移除的是数组最后一个条目时，前一行会残留尾逗号 → 修掉再校验一次。
+    $repaired = [regex]::Replace($fixed, ',[ \t]*(\r?\n[ \t]*\])', '$1')
+    try {
+      $null = $repaired | ConvertFrom-Json
+      $fixed = $repaired
+    } catch {
+      Write-WarnLine "$Name 排除：移除后 JSON 解析失败，已放弃修改（$($_.Exception.Message)）"
+      return $false
+    }
+  }
+  [System.IO.File]::WriteAllText($pkgPath, $fixed)
+  return $true
+}
+
+function Disable-ExcludedWorkspaces {
+  $excluded = Get-ExcludedWorkspaceNames
+  if ($excluded.Count -eq 0) { return }
+  $removed = @()
+  foreach ($name in $excluded) {
+    if (Remove-RootWorkspace -Name $name) { $removed += $name }
+  }
+  if ($removed.Count -gt 0) {
+    Write-WarnLine "工作区排除：根 workspaces 已移除 $($removed -join '、')（不再安装依赖 / 不参与编译）"
+  }
+}
+
+# beta 专项排除：AA 准备脚本 + AA 策略文件里的 beta 引用改写。
+#   上游 prepare-agents-anywhere-release.mjs 的桌面 manifest 列表、以及
+#   agents-anywhere-release-policy.mjs 的 workspace 声明与安装校验里都还会读 beta 的
+#   package.json；beta 已从 workspaces 移除（不再安装其依赖）后必须同步改写，否则
+#   assertPreparedAaRelease 遍历 beta 的 node_modules 会报 ENOENT。
+function Disable-BetaAaPipeline {
   if (-not $script:DisableBeta) { return }
 
-  # 1) 根 workspaces
-  $pkgPath = Join-Path $script:Src 'package.json'
-  if (-not (Test-Path -LiteralPath $pkgPath)) { return }
-  $text = [System.IO.File]::ReadAllText($pkgPath)
-  if ($text -notmatch '"dsh-plugin-desktop-beta"') {
-    Write-Info 'beta 排除：根 workspaces 已不含 dsh-plugin-desktop-beta'
-  } else {
-    $fixed = [regex]::Replace($text, '(?m)^[ \t]*"dsh-plugin-desktop-beta",[ \t]*\r?\n', '')
-    if ($fixed -eq $text) {
-      # 兜底 1：条目可能是数组最后一个（无尾逗号）
-      $fixed = [regex]::Replace($text, '(?m)^[ \t]*,[ \t]*\r?\n[ \t]*"dsh-plugin-desktop-beta"[ \t]*\r?\n', '')
-    }
-    if ($fixed -eq $text) {
-      # 兜底 2：单行格式
-      $fixed = [regex]::Replace($text, '"dsh-plugin-desktop-beta",?\s*', '')
-    }
-    if ($fixed -eq $text) {
-      Write-WarnLine 'beta 排除：未能从根 workspaces 移除 dsh-plugin-desktop-beta（格式变化？）'
-      return
-    }
-    try {
-      $null = $fixed | ConvertFrom-Json
-    } catch {
-      Write-WarnLine "beta 排除：移除后 JSON 解析失败，已放弃修改（$($_.Exception.Message)）"
-      return
-    }
-    [System.IO.File]::WriteAllText($pkgPath, $fixed)
-    Write-WarnLine 'beta 排除：根 workspaces 已移除 dsh-plugin-desktop-beta（不再安装/编译 beta 依赖）'
-  }
+  # 本次构建实际排除的工作区（beta 由开关控制；Next 恒随 DisableNext）
+  $excludedNames = @('dsh-plugin-desktop-beta')
+  if ($script:DisableNext) { $excludedNames += 'dsh-desktop-next' }
 
   # 2) AA 准备脚本
   $aaPath = Join-Path $script:Src 'scripts\prepare-agents-anywhere-release.mjs'
@@ -898,30 +958,90 @@ function Disable-BetaWorkspace {
   #    引入 AA_WORKSPACES_CHECKED（仅 stable）：runtimePeerRanges 仍读 desktop+beta
   #    （保证 provenance.runtimePeers 与已验证产物 peer 的联合范围一致），但安装校验
   #    只检查 stable。每次构建 pull 重置后重新应用，幂等。
+  #
+  #    注意（2026-09 修复）：旧实现用硬编码锚点
+  #    "export const AA_WORKSPACES = ['dsh-plugin-desktop', 'dsh-plugin-desktop-beta']"
+  #    来插入声明，但上游后来把 next 也加进了该数组（变成三个元素），锚点失配 →
+  #    声明没插进去，而 assert 循环却已经被替换成 AA_WORKSPACES_CHECKED →
+  #    运行期直接崩 “AA_WORKSPACES_CHECKED is not defined”。
+  #    现在改为：用正则解析实际的工作区数组（不管有几个元素）来生成声明；并且只有在
+  #    声明确实存在时才改写 assert 循环，避免再次出现“半打补丁”的破坏状态。
   $policyPath = Join-Path $script:Src 'scripts\agents-anywhere-release-policy.mjs'
   if (Test-Path -LiteralPath $policyPath) {
     $policyText = [System.IO.File]::ReadAllText($policyPath)
     if ($policyText.Contains('AA_WORKSPACES_CHECKED')) {
       Write-Info 'beta 排除：AA 策略文件已含 AA_WORKSPACES_CHECKED'
     } else {
-      $checkDecl = "export const AA_WORKSPACES_CHECKED = ['dsh-plugin-desktop']"
-      $anchor = "export const AA_WORKSPACES = ['dsh-plugin-desktop', 'dsh-plugin-desktop-beta']"
-      if ($policyText.Contains($anchor) -and -not $policyText.Contains($checkDecl)) {
-        $policyText = $policyText.Replace($anchor, "$anchor`n$checkDecl")
-        Write-WarnLine 'beta 排除：AA 策略文件已加入 AA_WORKSPACES_CHECKED（仅校验 stable 安装）'
-      } elseif (-not $policyText.Contains($checkDecl)) {
-        Write-WarnLine 'beta 排除：AA 策略文件 workspace 声明格式已变（无法补声明），跳过。'
+      # 解析实际的 AA_WORKSPACES 声明（容忍任意元素个数与空白）
+      $wsMatch = [regex]::Match($policyText, "export const AA_WORKSPACES\s*=\s*\[(?<items>[^\]]*)\]")
+      $declared = @()
+      if ($wsMatch.Success) {
+        $declared = @([regex]::Matches($wsMatch.Groups['items'].Value, "'([^']+)'") | ForEach-Object { $_.Groups[1].Value })
       }
-      $oldLoop = 'for (const workspace of AA_WORKSPACES) {'
-      if ($policyText.Contains($oldLoop)) {
-        $policyText = $policyText.Replace($oldLoop, 'for (const workspace of AA_WORKSPACES_CHECKED) {')
-        Write-WarnLine 'beta 排除：AA 策略文件 assert 校验已切换到 stable 列表'
+      # 只保留实际参与构建的工作区（排除 beta / Next）
+      $keep = @($declared | Where-Object { $excludedNames -notcontains $_ })
+      if (-not $wsMatch.Success -or $keep.Count -eq 0) {
+        Write-WarnLine 'beta 排除：AA 策略文件 workspace 声明格式已变（无法解析），跳过（不改写 assert 循环，避免半打补丁）。'
       } else {
-        Write-WarnLine 'beta 排除：AA 策略文件 assert 循环格式已变（无法打补丁），跳过。'
+        $keepList = ($keep | ForEach-Object { "'$_'" }) -join ', '
+        $checkDecl = "export const AA_WORKSPACES_CHECKED = [$keepList]"
+        $insertAt = $wsMatch.Index + $wsMatch.Length
+        $policyText = $policyText.Insert($insertAt, "`n$checkDecl")
+        Write-WarnLine "beta 排除：AA 策略文件已加入 AA_WORKSPACES_CHECKED = [$keepList]（仅校验参与构建的工作区）"
+        $oldLoop = 'for (const workspace of AA_WORKSPACES) {'
+        if ($policyText.Contains($oldLoop)) {
+          $policyText = $policyText.Replace($oldLoop, 'for (const workspace of AA_WORKSPACES_CHECKED) {')
+          Write-WarnLine 'beta 排除：AA 策略文件 assert 校验已切换到实际工作区列表'
+        } else {
+          Write-WarnLine 'beta 排除：AA 策略文件 assert 循环格式已变（未改写，声明仍可用）'
+        }
+        [System.IO.File]::WriteAllText($policyPath, $policyText)
       }
-      [System.IO.File]::WriteAllText($policyPath, $policyText)
     }
   }
+}
+
+# beta / Next 专项排除：上游 dshmarket 校验脚本（scripts/prepare-dsh-market.mjs）。
+#   上游 package:dir / build / dev 等入口都会先跑 `yarn market:prepare`，而该脚本把
+#   MARKET_WORKSPACES 硬编码为三个工作区（desktop + beta + next），并在 runInstall 之后
+#   逐个断言 “installedVersion(...) === version”。本脚本用 $DisableBeta/$DisableNext
+#   把 beta 与 next 从根 workspaces 移除后，它们根本不会被安装依赖，于是断言必然抛
+#   “dsh-plugin-desktop-beta did not install dshmarket <ver>” → package:dir 直接失败。
+#   这里把 MARKET_WORKSPACES 收缩为“实际参与构建的工作区”，与根 workspaces 保持一致。
+#   每次构建 pull 重置后重新应用，幂等；格式变化时跳过并告警（不静默破坏）。
+function Disable-MarketWorkspaceCheck {
+  $marketPath = Join-Path $script:Src 'scripts\prepare-dsh-market.mjs'
+  if (-not (Test-Path -LiteralPath $marketPath)) { return }
+  $excluded = @()
+  if ($script:DisableBeta) { $excluded += 'dsh-plugin-desktop-beta' }
+  if ($script:DisableNext) { $excluded += 'dsh-desktop-next' }
+  if ($excluded.Count -eq 0) { return }
+
+  $text = [System.IO.File]::ReadAllText($marketPath)
+  if (-not $text.Contains('MARKET_WORKSPACES')) {
+    Write-WarnLine 'beta/Next 排除：dshmarket 脚本已无 MARKET_WORKSPACES（上游重构？），跳过。'
+    return
+  }
+  if ($text.Contains('MARKET_WORKSPACES_EXCLUDED')) {
+    Write-Info 'beta/Next 排除：dshmarket 脚本已应用工作区收缩'
+    return
+  }
+
+  $anchor = "export const MARKET_WORKSPACES = ['dsh-plugin-desktop', 'dsh-plugin-desktop-beta', 'dsh-desktop-next']"
+  if (-not $text.Contains($anchor)) {
+    Write-WarnLine 'beta/Next 排除：dshmarket 脚本 MARKET_WORKSPACES 声明格式已变（无法打补丁），跳过。'
+    return
+  }
+  $decl = [string]::Join("', '", $excluded)
+  $replacement = @(
+    "export const MARKET_WORKSPACES_EXCLUDED = ['$decl']",
+    'export const MARKET_WORKSPACES = [' +
+      "'dsh-plugin-desktop', 'dsh-plugin-desktop-beta', 'dsh-desktop-next'" +
+      '].filter(name => !MARKET_WORKSPACES_EXCLUDED.includes(name))'
+  ) -join "`n"
+  $text = $text.Replace($anchor, $replacement)
+  [System.IO.File]::WriteAllText($marketPath, $text)
+  Write-WarnLine "beta/Next 排除：dshmarket 校验工作区已收缩（排除 $($excluded -join '、')）"
 }
 
 # AA（Agents-Anywhere）桥接产物依赖对齐：
@@ -961,33 +1081,55 @@ function Set-RuntimeVersionPinned {
   $provPath = Join-Path $script:Src 'vendor\agents-anywhere\provenance.json'
   if (Test-Path -LiteralPath $provPath) {
     $prov = Get-JsonObject $provPath
-    $provChanged = $false
-    if ($prov.commit -ne $script:AaSourceRef) { $prov.commit = $script:AaSourceRef; $provChanged = $true }
-    # 按 AA policy runtimePeerRanges() 的规则计算联合 peer 范围（键序：typert/llm/session）
-    $peerNames = @('@deepseek-ai/dsh-typert-protocol', '@deepseek-ai/dsh-llm', '@deepseek-ai/dsh-session')
-    $peerWs = @(
-      (Join-Path $script:Src 'dsh-plugin-desktop\package.json'),
-      (Join-Path $script:Src 'dsh-plugin-desktop-beta\package.json')
-    ) | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { Get-JsonObject $_ }
-    $peerRangesMap = [ordered]@{}
-    foreach ($peer in $peerNames) {
-      $ranges = @($peerWs | ForEach-Object { $_.dependencies.$peer } | Where-Object { $_ -is [string] -and $_ })
-      if ($ranges.Count -gt 0) { $peerRangesMap[$peer] = @($ranges | Sort-Object -Unique) -join ' || ' }
+    # 自洽优先：上游 provenance 的 commit 若已能与 desktopVersion 里的 c<commit12>
+    # 对上（即本产物确实由该 commit 构建），就完全不要改写 —— 上游 release 校验
+    # 现在会断言 “artifact version identifies the selected commit”，一旦我们把
+    # commit 改成别的值（旧实现固定 a022d928…），校验立刻失败：
+    #   AA release check failed: artifact version does not identify the selected commit.
+    # 只有在上游 provenance 自身不自洽（产物名与 commit 对不上）时，才回落到旧行为。
+    $artifactCommit12 = $null
+    if ($prov.desktopVersion -match '\.c([0-9a-f]{12})\.') { $artifactCommit12 = $Matches[1] }
+    $provSelfConsistent = ($null -ne $artifactCommit12) -and
+      ($prov.commit -is [string]) -and $prov.commit.StartsWith($artifactCommit12)
+    if ($provSelfConsistent) {
+      Write-Info "AA provenance 自洽（commit $($prov.commit.Substring(0,10)) ↔ 产物 c$artifactCommit12），不做本地改写。"
+    } else {
+      $provChanged = $false
+      if ($prov.commit -ne $script:AaSourceRef) { $prov.commit = $script:AaSourceRef; $provChanged = $true }
+      if ($provChanged) {
+        Set-Content -LiteralPath $provPath -Value (ConvertTo-Json $prov -Depth 10) -Encoding utf8 -NoNewline
+        Write-WarnLine "AA provenance 不自洽，已按 AaSourceRef 回写 commit $($script:AaSourceRef.Substring(0,10))"
+      }
     }
-    if ($peerRangesMap.Count -gt 0) {
-      $peersDiffer = $false
+    # 按 AA policy runtimePeerRanges() 的规则计算联合 peer 范围（键序：typert/llm/session）。
+    # 仅在 provenance 不自洽时才对齐（自洽时上游的 peer 范围已是产物真实构建条件，
+    # 任何改写都会让 provenance 与 artifact 脱钩）。
+    if (-not $provSelfConsistent) {
+      $peerNames = @('@deepseek-ai/dsh-typert-protocol', '@deepseek-ai/dsh-llm', '@deepseek-ai/dsh-session')
+      $peerWs = @(
+        (Join-Path $script:Src 'dsh-plugin-desktop\package.json'),
+        (Join-Path $script:Src 'dsh-plugin-desktop-beta\package.json')
+      ) | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { Get-JsonObject $_ }
+      $peerRangesMap = [ordered]@{}
       foreach ($peer in $peerNames) {
-        if ($peerRangesMap.Contains($peer) -and $prov.runtimePeers.$peer -ne $peerRangesMap[$peer]) { $peersDiffer = $true; break }
+        $ranges = @($peerWs | ForEach-Object { $_.dependencies.$peer } | Where-Object { $_ -is [string] -and $_ })
+        if ($ranges.Count -gt 0) { $peerRangesMap[$peer] = @($ranges | Sort-Object -Unique) -join ' || ' }
       }
-      if ($peersDiffer) {
-        $prov.runtimePeers = [ordered]@{}
-        foreach ($peer in $peerNames) { if ($peerRangesMap.Contains($peer)) { $prov.runtimePeers[$peer] = $peerRangesMap[$peer] } }
-        $provChanged = $true
+      if ($peerRangesMap.Count -gt 0) {
+        $peersDiffer = $false
+        foreach ($peer in $peerNames) {
+          if ($peerRangesMap.Contains($peer) -and $prov.runtimePeers.$peer -ne $peerRangesMap[$peer]) { $peersDiffer = $true; break }
+        }
+        if ($peersDiffer) {
+          $prov.runtimePeers = [ordered]@{}
+          foreach ($peer in $peerNames) { if ($peerRangesMap.Contains($peer)) { $prov.runtimePeers[$peer] = $peerRangesMap[$peer] } }
+          $provChanged = $true
+        }
       }
-    }
-    if ($provChanged) {
-      Set-Content -LiteralPath $provPath -Value (ConvertTo-Json $prov -Depth 10) -Encoding utf8 -NoNewline
-      Write-WarnLine "AA provenance 已同步（commit $($script:AaSourceRef.Substring(0,10))，runtimePeers 与 AA policy 对齐）"
+      if ($provChanged) {
+        Set-Content -LiteralPath $provPath -Value (ConvertTo-Json $prov -Depth 10) -Encoding utf8 -NoNewline
+        Write-WarnLine "AA provenance 已同步（commit $($script:AaSourceRef.Substring(0,10))，runtimePeers 与 AA policy 对齐）"
+      }
     }
   }
 
@@ -1062,16 +1204,53 @@ function Set-RuntimeVersionPinned {
     # （patches\<pkg>@<旧版本>.patch）不会自动适配新版本文件名。若这里检测不到
     # 新版本补丁，resolutions 会静默回退成无补丁的 file: 形式 → 桌面关键补丁
     # （agent-presets / app-boot 等）全部丢失 → Agent 预设 24 行插件无法解析。
-    # 因此自动从同包"最新旧版本"补丁复制一份为新版本：pnpm install 会校验补丁与
-    # 新版本 tarball 是否匹配，不匹配会显式失败（比静默丢补丁好，此时需人工按
-    # 上游代码差异更新补丁内容）。
+    #
+    # 注意（2026-09 修复）：旧实现在多个旧版本补丁里用 Sort-Object Name -Descending
+    # 取"字典序最大"的那个，会把 @0.1.7-rc.2 的补丁内容复制成 @0.1.5-rc.2 文件名
+    # （'7' > '5'），于是一个面向 0.1.7 源码的补丁被拿去打 0.1.5 的 tarball，必然
+    # 在 yarn install 阶段炸掉（ENOENT / patch does not apply）。这里改为：
+    #   1) 先按语义版本从新到旧排序候选；
+    #   2) 逐个用 git apply --check 校验是否真能打到本次固定版本的 tarball 上；
+    #   3) 只有校验通过的才复制，否则明确警告并放弃（宁可丢掉该补丁也不要塞一个
+    #      内容错版本的文件进去 —— 错版本补丁会以难以定位的 ENOENT 形式失败）。
     if (-not (Test-Path -LiteralPath $patchPath)) {
-      $oldPatch = Get-ChildItem -LiteralPath (Split-Path -Parent $patchPath) -Filter "$unscoped@*.patch" -File |
-        Where-Object { $_.BaseName -ne "$unscoped@$v" } |
-        Sort-Object Name -Descending | Select-Object -First 1
-      if ($null -ne $oldPatch) {
-        Copy-Item -LiteralPath $oldPatch.FullName -Destination $patchPath
-        Write-WarnLine "补丁迁移：$($oldPatch.Name) → $(Split-Path -Leaf $patchPath)（pnpm install 将校验匹配性，不匹配需人工更新）"
+      $candidates = Get-ChildItem -LiteralPath (Split-Path -Parent $patchPath) -Filter "$unscoped@*.patch" -File |
+        Where-Object { $_.BaseName -ne "$unscoped@$v" }
+      $tarball = Join-Path $script:Src (($vendorRelative -replace '/', [IO.Path]::DirectorySeparatorChar))
+      $tarball = Join-Path $tarball $p.filename
+      $migrated = $false
+      if ($candidates.Count -gt 0 -and (Test-Path -LiteralPath $tarball) -and (Get-Command git -ErrorAction SilentlyContinue)) {
+        # 语义版本降序：解析 <pkg>@<ver> 的 <ver>，按 [version] 比较（rc/alpha 前缀转可比较形式）
+        $sorted = $candidates | Sort-Object -Property @{ Expression = {
+              $raw = $_.BaseName.Substring($unscoped.Length + 1)
+              if ($raw -match '^(\d+)\.(\d+)\.(\d+)(?:-([a-zA-Z]+)\.?(\d+))?') {
+                [version]('{0}.{1}.{2}' -f $Matches[1], $Matches[2], $Matches[3])
+              } else { [version]'0.0.0' }
+            } } -Descending
+        $probe = Join-Path ([IO.Path]::GetTempPath()) ("dsh-patchprobe-" + [guid]::NewGuid().ToString('N'))
+        foreach ($cand in $sorted) {
+          try {
+            New-Item -ItemType Directory -Force -Path $probe | Out-Null
+            & tar -xzf $tarball -C $probe --strip-components=1 2>$null
+            if ($LASTEXITCODE -ne 0) { break }
+            Copy-Item -LiteralPath $cand.FullName -Destination (Join-Path $probe 'probe.patch') -Force
+            Push-Location $probe
+            try { & git apply --check -p1 (Join-Path $probe 'probe.patch') 2>$null; $probeCode = $LASTEXITCODE }
+            finally { Pop-Location }
+            if ($probeCode -eq 0) {
+              Copy-Item -LiteralPath $cand.FullName -Destination $patchPath
+              Write-WarnLine "补丁迁移：$($cand.Name) → $(Split-Path -Leaf $patchPath)（已校验可应用到 $v tarball）"
+              $migrated = $true
+              break
+            }
+          } finally {
+            if (Test-Path -LiteralPath $probe) { Remove-Item -Recurse -Force $probe -ErrorAction SilentlyContinue }
+          }
+        }
+      }
+      if (-not $migrated) {
+        Write-WarnLine "补丁缺失且无可用的兼容旧版本：$unscoped@$v 将不带补丁（resolutions 回退为 file:）。" +
+          "若该包确需补丁，请人工按 $v 源码更新 patches\$unscoped@$v.patch。"
       }
     }
     $val = if (Test-Path -LiteralPath $patchPath) { "patch:$($p.name)@$($src -replace ':', '%3A')#./$patchRel" } else { $src }
@@ -1109,7 +1288,10 @@ function Set-AAVendorDependency {
 # Windows 打包必需修复（不依赖 -Overlay）：
 # 没有它们本机 win --dir 打包必然失败（原生重编译 / PR #829 钩子缺陷 / AA 复用校验）。
 function Invoke-RequiredWinFixes {
-  Disable-BetaWorkspace
+  # 排除不需要的工作区（beta 通道 / 实验性 Next 桌面）：不装依赖、不参与编译
+  Disable-ExcludedWorkspaces
+  Disable-BetaAaPipeline
+  Disable-MarketWorkspaceCheck
   Set-PackageDirRebuildDisabled -WorkspaceName $script:ChannelWsName
   Set-AllArtifactVerifyDisabled -WorkspaceName $script:ChannelWsName
   Set-AAVendorDependency
@@ -1117,7 +1299,7 @@ function Invoke-RequiredWinFixes {
   # 会把 upstream.json / 根 package.json / 依赖版本还原回上游（目前仍是 rc.1）。
   # 必须在安装依赖之前把 stable 通道固定回本地版本，否则装出来的是旧运行时。
   Set-RuntimeVersionPinned
-  Write-Ok 'Windows 打包必需修复已应用（beta 排除 / npmRebuild=false / 移除 PR #829 事后校验钩子 / AA 依赖对齐 / 运行时版本固定）'
+  Write-Ok 'Windows 打包必需修复已应用（beta/Next 工作区排除 / npmRebuild=false / 移除 PR #829 事后校验钩子 / AA 依赖对齐 / 运行时版本固定）'
 }
 
 function Copy-TrayIconAssets {
@@ -1152,9 +1334,6 @@ function Copy-TrayIconAssets {
   }
   if ($copied -gt 0) {
     Write-WarnLine "覆盖层：已复制 $copied 个本地资源（$srcDir → $dstDir）"
-  }
-  if (Test-Path -LiteralPath (Join-Path $dstDir 'app-icon.ico')) {
-    Set-WindowsAppIconKeepPatch
   }
 }
 
@@ -1213,48 +1392,6 @@ function Set-PnpmDistPatch {
     [System.IO.File]::WriteAllText($f, ($out -join $eol) + $eol)
     Write-WarnLine "pnpm 补丁已重应用：$f"
   }
-}
-
-# generate-windows-app-icon.mjs 本地补丁：保留仓库里自带的 build/app-icon.ico。
-# 上游打包前会用 tray-icon.svg 重新生成并覆盖该文件，本地定制图标会被冲掉；
-# 打了补丁后只要目标 ICO 已存在且 DSH_KEEP_APP_ICON=1 就直接返回。
-$script:AppIconAnchor = 'export async function generateWindowsAppIcon(source = sourcePath, output = outputPath) {'
-$script:AppIconKeepBlock = @(
-  '  if (process.env.DSH_KEEP_APP_ICON === ''1'') {'
-  '    const { access } = await import(''node:fs/promises'')'
-  '    const present = await access(output).then(() => true).catch(() => false)'
-  '    if (present) {'
-  '      console.log(`[overlay] 保留已有应用图标: ${output}`)'
-  '      return'
-  '    }'
-  '  }'
-)
-
-function Set-WindowsAppIconKeepPatch {
-  $f = Get-ChannelWsPath 'scripts\generate-windows-app-icon.mjs'
-  if (-not (Test-Path -LiteralPath $f)) { return }
-  $env:DSH_KEEP_APP_ICON = '1'
-  $raw = [System.IO.File]::ReadAllText($f)
-  if ($raw.Contains('DSH_KEEP_APP_ICON')) {
-    Write-Info "app-icon 保留补丁已生效：$f"
-    return
-  }
-  $eol = if ($raw.Contains("`r`n")) { "`r`n" } else { "`n" }
-  $lines = $raw -split "`r?`n"
-  $idx = -1
-  for ($i = 0; $i -lt $lines.Length; $i++) {
-    if ($lines[$i].Trim() -eq $script:AppIconAnchor) { $idx = $i; break }
-  }
-  if ($idx -lt 0) {
-    Write-WarnLine "app-icon 补丁：$f 中未找到 generateWindowsAppIcon 定义，跳过。"
-    return
-  }
-  $out = New-Object System.Collections.Generic.List[string]
-  for ($k = 0; $k -le $idx; $k++) { $out.Add($lines[$k]) }
-  foreach ($ln in $script:AppIconKeepBlock) { $out.Add($ln) }
-  for ($k = $idx + 1; $k -lt $lines.Length; $k++) { $out.Add($lines[$k]) }
-  [System.IO.File]::WriteAllText($f, ($out -join $eol))
-  Write-WarnLine "app-icon 保留补丁已应用：$f"
 }
 
 # dsh-fs-local 本地补丁：Electron 43/44 的 asar 补丁对 asar 内路径的
@@ -1401,6 +1538,174 @@ function Invoke-ChannelOverlayPostInstall {
   Set-PnpmDistPatch
   # dsh-fs-local bigint 兼容补丁（install 会还原为原版；ASAR 布局打包必需）
   Set-DshFsLocalBigintPatch
+}
+
+# ---- 覆盖层产物部署与核对（打包后执行）----
+# 打进去的 startup-config.ts 会在启动时读 dirname(process.execPath)\startup.json；
+# 文件缺失时 applyDesktopStartupConfig 静默返回“无配置”——app 照常启动但定制不生效。
+# 所以构建的最后一步主动把 overlay\startup.json 放到 exe 同级目录，并逐项核对覆盖层
+# 是否真的进了产物，避免“构建成功但没带上自定义”。
+
+function Get-PackagedExeDir {
+  # 本机 Windows 产物里 exe 所在目录（dist\win-unpacked）；不存在时返回 $null。
+  $unpacked = Join-Path (Get-ChannelWsPath 'dist') 'win-unpacked'
+  if (Test-Path -LiteralPath $unpacked) { return $unpacked }
+  return $null
+}
+
+function Publish-OverlayRuntimeAssets {
+  # overlay\startup.json → 产物 exe 同级目录（启动配置的唯一来源）
+  if (-not $script:SrcOverlayDir) { return }
+  $src = Join-Path $script:SrcOverlayDir 'startup.json'
+  if (-not (Test-Path -LiteralPath $src)) {
+    Write-WarnLine "覆盖层：未找到 $src，跳过 startup.json 部署（产物不会带启动配置）。"
+    return
+  }
+  $exeDir = Get-PackagedExeDir
+  if (-not $exeDir) {
+    Write-WarnLine '覆盖层：未找到 dist\win-unpacked，跳过 startup.json 部署。'
+    return
+  }
+  # 配置写错会让 app 直接启动失败（applyDesktopStartupConfig 抛错），构建期先拦一道。
+  # 这里只做结构自检；bootstrap 名单等语义校验仍在运行时（src\startup-config.ts）执行。
+  try {
+    $parsed = [System.IO.File]::ReadAllText($src) | ConvertFrom-Json
+  } catch {
+    throw "覆盖层：overlay\startup.json 不是合法 JSON：$($_.Exception.Message)"
+  }
+  if ($parsed.version -ne 1) {
+    throw "覆盖层：overlay\startup.json 的 version 必须为 1（实际为 $($parsed.version)）。"
+  }
+  $dst = Join-Path $exeDir 'startup.json'
+  Copy-Item -LiteralPath $src -Destination $dst -Force
+  try { [System.IO.File]::SetAttributes($dst, [System.IO.FileAttributes]::Normal) } catch {}
+  Write-Ok "覆盖层：startup.json 已部署到 $dst"
+}
+
+function Test-BinaryContainsAscii {
+  # 分块扫描二进制文件里的 ASCII 串（app.asar 达数百 MB，整份读入内存会顶到 500MB+）
+  param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$Needle,
+    [int]$ChunkBytes = 4MB
+  )
+  $overlap = $Needle.Length - 1
+  $buffer = [byte[]]::new($ChunkBytes + $overlap)
+  $stream = [System.IO.File]::OpenRead($Path)
+  try {
+    $carry = 0
+    while (($read = $stream.Read($buffer, $carry, $ChunkBytes)) -gt 0) {
+      $total = $carry + $read
+      $text = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $total)
+      if ($text.IndexOf($Needle, [System.StringComparison]::Ordinal) -ge 0) { return $true }
+      # 跨块匹配：把尾部不足一个 needle 的部分带到下一块开头
+      $carry = [Math]::Min($overlap, $total)
+      [Array]::Copy($buffer, $total - $carry, $buffer, 0, $carry)
+    }
+    return $false
+  } finally {
+    $stream.Dispose()
+  }
+}
+
+function Assert-OverlayArtifacts {
+  # 覆盖层是否真的进了产物。补丁打不上由 Apply-SrcOverlay 抛错兜住，但 asar 布局 /
+  # 部署环节的问题只有产物里才暴露，这里逐项核对，缺项直接失败。
+  $exeDir = Get-PackagedExeDir
+  if (-not $exeDir) {
+    Write-WarnLine '覆盖层核对：未找到 dist\win-unpacked，跳过产物核对。'
+    return
+  }
+  $rows = New-Object System.Collections.Generic.List[object]
+  $missing = New-Object System.Collections.Generic.List[string]
+
+  # 1) 主程序
+  $exe = @(Get-ChildItem -LiteralPath $exeDir -Filter '*.exe' -File -ErrorAction SilentlyContinue)
+  if ($exe.Count -gt 0) {
+    $rows.Add([pscustomobject]@{ 项目 = '主程序 exe'; 结果 = 'OK'; 说明 = "$($exe[0].Name) · $([int]($exe[0].Length / 1MB)) MB" })
+  } else {
+    $rows.Add([pscustomobject]@{ 项目 = '主程序 exe'; 结果 = '缺失'; 说明 = '目录下没有 .exe' })
+    $missing.Add('主程序 exe')
+  }
+
+  # 2) 启动配置：startup-config.ts 读的就是 exe 同级的 startup.json
+  $cfg = Join-Path $exeDir 'startup.json'
+  if (Test-Path -LiteralPath $cfg) {
+    $size = (Get-Item -LiteralPath $cfg).Length
+    $rows.Add([pscustomobject]@{ 项目 = 'startup.json'; 结果 = 'OK'; 说明 = "exe 同级 · $size 字节" })
+  } else {
+    $rows.Add([pscustomobject]@{ 项目 = 'startup.json'; 结果 = '缺失'; 说明 = '启动配置不会被读取' })
+    $missing.Add('startup.json')
+  }
+
+  # 3) 补丁代码：main.ts 补丁引入的符号必须出现在打包后的应用代码里。
+  #    上游 83cc4f821c/09070dd72e 起 Windows 打包主动禁用 ASAR（build.asar=false），
+  #    产物布局变成 resources\app\<lib|build|node_modules> 而不是 resources\app.asar。
+  #    两种布局都要认，否则会误报“覆盖层没进产物”（实际已进）。
+  $asar = Join-Path $exeDir 'resources\app.asar'
+  $unpackedApp = Join-Path $exeDir 'resources\app'
+  $needle = 'applyDesktopStartupConfig'
+  $patchFound = $null   # 命中的说明文字
+  if (Test-Path -LiteralPath $asar) {
+    if (Test-BinaryContainsAscii -Path $asar -Needle $needle) {
+      $patchFound = 'applyDesktopStartupConfig 已打包（app.asar）'
+    }
+  }
+  if (-not $patchFound -and (Test-Path -LiteralPath $unpackedApp)) {
+    $hit = @(Get-ChildItem -LiteralPath $unpackedApp -Recurse -File -Include '*.js', '*.mjs', '*.cjs' -ErrorAction SilentlyContinue |
+      Select-String -Pattern $needle -List -ErrorAction SilentlyContinue)
+    if ($hit.Count -gt 0) {
+      $patchFound = "applyDesktopStartupConfig 已打包（$($hit[0].Path.Substring($exeDir.Length).TrimStart('\'))）"
+    }
+  }
+  if ($patchFound) {
+    $rows.Add([pscustomobject]@{ 项目 = '补丁代码'; 结果 = 'OK'; 说明 = $patchFound })
+  } else {
+    $where = if (Test-Path -LiteralPath $asar) { 'app.asar' } elseif (Test-Path -LiteralPath $unpackedApp) { 'resources\app' } else { 'resources（既无 app.asar 也无 app\）' }
+    $rows.Add([pscustomobject]@{ 项目 = '补丁代码'; 结果 = '缺失'; 说明 = "$where 中未找到 startup-config 集成点" })
+    $missing.Add('补丁代码（startup-config 集成点）')
+  }
+
+  # 4) 图标资源：ASAR 启用时解包到 app.asar.unpacked\build；禁用 ASAR 时直接在
+  #    resources\app\build。两种位置都检查。
+  $wantIcons = @('app-icon.png', 'tray-icon-blue.png', 'tray-icon-blue@1.25x.png', 'tray-icon-blue@1.5x.png', 'tray-icon-blue@2x.png')
+  $iconDirs = @(
+    (Join-Path $exeDir 'resources\app.asar.unpacked\build'),
+    (Join-Path $exeDir 'resources\app\build')
+  ) | Where-Object { Test-Path -LiteralPath $_ }
+  $iconDir = $null
+  foreach ($d in $iconDirs) {
+    if (@($wantIcons | Where-Object { Test-Path -LiteralPath (Join-Path $d $_) }).Count -eq $wantIcons.Count) { $iconDir = $d; break }
+  }
+  if ($null -ne $iconDir) {
+    $rows.Add([pscustomobject]@{ 项目 = '图标资源'; 结果 = 'OK'; 说明 = "$($wantIcons.Count) 个已就位（$($iconDir.Substring($exeDir.Length).TrimStart('\'))）" })
+  } else {
+    $absent = @($wantIcons | Where-Object {
+        $found = $false
+        foreach ($d in $iconDirs) { if (Test-Path -LiteralPath (Join-Path $d $_)) { $found = $true; break } }
+        -not $found
+      })
+    if ($iconDirs.Count -eq 0) {
+      $rows.Add([pscustomobject]@{ 项目 = '图标资源'; 结果 = '缺失'; 说明 = '未找到 build 资源目录（app.asar.unpacked\build 或 resources\app\build）' })
+      $missing.Add('图标资源目录')
+    } else {
+      $rows.Add([pscustomobject]@{ 项目 = '图标资源'; 结果 = '缺失'; 说明 = "缺少：$($absent -join ', ')" })
+      $missing.Add("图标资源（$($absent -join '、')）")
+    }
+  }
+
+  Write-Host ''
+  Write-Host '覆盖层产物核对：' -ForegroundColor White
+  foreach ($row in $rows) {
+    $color = if ($row.结果 -eq 'OK') { 'Green' } else { 'Red' }
+    Write-Host ("  {0,-16} " -f $row.项目) -NoNewline
+    Write-Host ("{0,-6}" -f $row.结果) -NoNewline -ForegroundColor $color
+    Write-Host $row.说明
+  }
+  if ($missing.Count -gt 0) {
+    throw "覆盖层未完整进入产物：$($missing -join '、')。构建成功但没有带上自定义，请检查上面的核对结果。"
+  }
+  Write-Ok '覆盖层已确认进入产物（启动配置 + 补丁代码 + 图标资源）'
 }
 
 function Update-SourceRepository {
@@ -1745,10 +2050,28 @@ try {
     $env:ELECTRON_MIRROR = 'https://npmmirror.com/mirrors/electron/'
   }
 
-  # AA 源固定（见 $script:AaSourceRef 注释）：阻止 prepare 脚本跟踪已损坏的 AA main。
+  # AA 源固定：仅在 vendored provenance 自身不自洽时才强制 $script:AaSourceRef。
+  # 上游 release 校验会断言 “artifact version identifies the selected commit”
+  # （artifact 名含 .c<commit12>.），所以把 DSH_AA_SOURCE_REF 设成一个与已 vendored
+  # 产物不同的 commit，会让 aa:prepare-release 直接失败：
+  #   AA release check failed: artifact version does not identify the selected commit.
+  # provenance 自洽时沿用上游自己的 commit（与 artifact 同名一致），不再干预。
+  $aaProvPath = Join-Path $script:Src 'vendor\agents-anywhere\provenance.json'
+  $aaSelfConsistent = $false
+  $aaProvCommit12 = $null
+  if (Test-Path -LiteralPath $aaProvPath) {
+    $aaProv = Get-JsonObject $aaProvPath
+    if ($aaProv.desktopVersion -match '\.c([0-9a-f]{12})\.') { $aaProvCommit12 = $Matches[1] }
+    $aaSelfConsistent = ($null -ne $aaProvCommit12) -and ($aaProv.commit -is [string]) -and $aaProv.commit.StartsWith($aaProvCommit12)
+  }
   if (-not $env:DSH_AA_SOURCE_REF) {
-    $env:DSH_AA_SOURCE_REF = $script:AaSourceRef
-    Write-Info "AA 源固定为 $($script:AaSourceRef.Substring(0,12))（复用已验证产物；设 DSH_AA_SOURCE_REF 可覆盖）"
+    if ($aaSelfConsistent) {
+      $env:DSH_AA_SOURCE_REF = $aaProv.commit
+      Write-Info "AA 源沿用 vendored provenance 自洽 commit $($aaProv.commit.Substring(0,12))（与产物 c$aaProvCommit12 一致）"
+    } else {
+      $env:DSH_AA_SOURCE_REF = $script:AaSourceRef
+      Write-WarnLine "AA provenance 不自洽，回落到固定源 $($script:AaSourceRef.Substring(0,12))（可能触发 AA 全量重建）"
+    }
   }
 
   switch ($Target) {
@@ -1782,6 +2105,14 @@ try {
       Clear-ReadOnlyAssets
       Invoke-Step "执行 yarn $yarnScript" { Invoke-YarnScript $yarnScript }
     }
+  }
+
+  # 覆盖层部署 + 核对：产物必须自带 startup.json，且补丁代码 / 图标资源都在里面。
+  # 放在时间戳规整之前，让新拷入的 startup.json 也一起被规整。
+  if ($Overlay -and $script:Failed -eq 0 -and
+      $Target -in @('package-dir', 'dist-win', 'dist-win-portable', 'dist-mac', 'dist-mac-smoke')) {
+    Invoke-Step '部署覆盖层运行时资源（startup.json → 产物 exe 同级）' { Publish-OverlayRuntimeAssets }
+    Invoke-Step '核对覆盖层已进入产物' { Assert-OverlayArtifacts }
   }
 
   if (-not $KeepTimestamps -and $script:Failed -eq 0 -and

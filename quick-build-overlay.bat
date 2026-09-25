@@ -21,4 +21,4 @@ echo.
 rem echo Press Ctrl+C to cancel, or
 rem pause
 echo.
-pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0build.ps1" -Target package-dir -Overlay -SkipSubmodule %*
+pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0build.ps1" -Target package-dir -Overlay -SkipSubmodule -ElectronVersion 44.4.5

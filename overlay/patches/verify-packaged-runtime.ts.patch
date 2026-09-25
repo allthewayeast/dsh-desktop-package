@@ -1,8 +1,44 @@
 diff --git a/dsh-plugin-desktop/scripts/verify-packaged-runtime.ts b/dsh-plugin-desktop/scripts/verify-packaged-runtime.ts
-index a093dfe17c..7d6a8cdb2d 100644
+index 4b7b0764ec..6a49b53157 100644
 --- a/dsh-plugin-desktop/scripts/verify-packaged-runtime.ts
 +++ b/dsh-plugin-desktop/scripts/verify-packaged-runtime.ts
-@@ -853,13 +853,30 @@ export function reportUnpackedRuntime(summary: UnpackedRuntimeSummary): void {
+@@ -71,8 +71,18 @@ const PNPM_RUNTIME_VERSION = packageVersion(PNPM_PACKAGE_ROOT)
+ /** Maximum physical file count accepted beside ASAR after smart unpack. */
+ export const MAX_UNPACKED_RUNTIME_FILES = 1_500
+ 
+-/** Maximum physical payload accepted beside ASAR after smart unpack. */
+-export const MAX_UNPACKED_RUNTIME_BYTES = 128 * 1024 * 1024
++/**
++ * Maximum physical payload accepted beside ASAR after smart unpack.
++ *
++ * DSH Desktop: raised from 128 MiB. Re-enabling ASAR makes electron-builder
++ * smart-unpack every package that carries a native payload, and this edition
++ * ships several large ones that must stay physical because they are spawned or
++ * dlopen'd (ASAR cannot serve either): LibreOfficeKit (~191 MiB, an .exe),
++ * @dataiku/uv (~87 MiB, runs python), sharp (~36 MiB), sherpa-onnx (~23 MiB,
++ * a .node binding). The original 128 MiB ceiling was calibrated against
++ * upstream's much smaller dependency set and rejects this tree outright.
++ */
++export const MAX_UNPACKED_RUNTIME_BYTES = 512 * 1024 * 1024
+ 
+ /** Narrow ceiling for pnpm's smart-unpacked native-helper package root. */
+ export const MAX_PNPM_SMART_UNPACK_FILES = 32
+@@ -93,10 +103,14 @@ export const ALLOWED_SMART_UNPACK_PACKAGE_ROOTS = [
+ export const ALLOWED_SMART_UNPACK_PACKAGE_PREFIXES = [
+   'node_modules/@dataiku/uv-',
+   'node_modules/@deepseek-ai/node-addon-system-',
++  // DSH Desktop: Office conversion ships a native helper per platform/arch.
++  'node_modules/@deepseek-ai/libreoffice-kit-',
+   'node_modules/@img/sharp-',
+   'node_modules/@koromix/koffi-',
+   'node_modules/@vscode/ripgrep-',
+   'node_modules/node-addon-require-builtin-',
++  // DSH Desktop: offline speech-to-text ships ONNX Runtime DLLs per platform.
++  'node_modules/sherpa-onnx-',
+ ] as const
+ 
+ /** Every generated JavaScript file shipped by the installed DSH CLI package. */
+@@ -852,13 +866,30 @@ export function reportUnpackedRuntime(summary: UnpackedRuntimeSummary): void {
    process.stdout.write(`dsh-plugin-desktop: packaged runtime inventory: ${formatUnpackedRuntimeSummary(summary)}\n`)
  }
  

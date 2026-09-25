@@ -33,7 +33,8 @@ build.bat dist-win-portable     # 或 quick-build.bat（增量编译）
 
 - `overlay/src/*.ts` → 复制为 `dsh-desktop/dsh-plugin-desktop` 下的新文件（`startup-config.ts` 及其测试）
 - `overlay/patches/*.patch` → `git apply` 到 `dsh-desktop/dsh-plugin-desktop`（`main.ts` 接入启动配置、README 使用文档）
-- 附加覆盖层（由 build.ps1 自动处理）：electron 固定 `44.3.0`、`.yarnrc.yml` 年龄门禁、定制图标、beta 通道排除、`npmRebuild=false`
+- 附加覆盖层（由 build.ps1 自动处理）：electron 固定 `44.4.3`、`.yarnrc.yml` 年龄门禁、定制图标、`npmRebuild=false`
+- 工作区排除（由 build.ps1 自动处理，见 `$script:DisableBeta` / `$script:DisableNext`）：从根 `package.json` 的 `workspaces` 移除 `dsh-plugin-desktop-beta`（beta 通道）与 `dsh-desktop-next`（实验性 Next 桌面，独立 Electron 应用）——两者都不安装依赖、不参与编译 / 类型检查 / 打包，只有 stable 通道 `dsh-plugin-desktop` 会被构建。改 `$false` 可临时恢复。
 
 ## 启动配置文件（startup.json）
 
