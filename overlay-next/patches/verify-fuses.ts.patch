@@ -1,0 +1,21 @@
+diff --git a/dsh-desktop-next/scripts/verify-fuses.ts b/dsh-desktop-next/scripts/verify-fuses.ts
+index d17e7f6679..a68a281067 100644
+--- a/dsh-desktop-next/scripts/verify-fuses.ts
++++ b/dsh-desktop-next/scripts/verify-fuses.ts
+@@ -10,8 +10,14 @@ export default async function afterAllArtifactBuild(result: { outDir: string }):
+   const executables = paths.map(path => join(result.outDir, path)).filter(existsSync)
+   if (!executables.length) throw new Error('No packaged Next executable to verify')
+   for (const path of executables) {
+-    await verifyElectronExecutableFuses(path, undefined, false)
+-    const root = path.includes('.app/') ? join(dirname(path), '../Resources/app') : join(dirname(path), 'resources/app')
++    const resources = path.includes('.app/') ? join(dirname(path), '../Resources') : join(dirname(path), 'resources')
++    // Next ships with ASAR enabled, but this gate also runs against plain-directory
++    // builds. Electron's patched loader resolves JavaScript inside `app.asar`
++    // transparently, so either root can be imported directly.
++    const archive = join(resources, 'app.asar')
++    const root = existsSync(archive) ? archive : join(resources, 'app')
++    if (!existsSync(root)) throw new Error(`No packaged Next payload next to ${path}`)
++    await verifyElectronExecutableFuses(path, undefined, existsSync(archive))
+     const smoke = spawnSync(path, ['--input-type=module', '-e', `
+       import { createRequire } from 'node:module';
+       import { pathToFileURL } from 'node:url';

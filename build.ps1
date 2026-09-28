@@ -471,7 +471,7 @@ function Show-Environment {
   Write-Info "目标        : $Target"
   Write-Info "通道        : $script:Channel（$script:ChannelWsName）"
   Write-Info "覆盖层      : $(if ($Overlay) { '开（-Overlay）' } else { '关（上游原样）' })"
-  $excludedWs = Get-ExcludedWorkspaceNames
+  $excludedWs = @(Get-ExcludedWorkspaceNames)   # @() 必需：单元素时函数返回值会被解包成标量
   if ($excludedWs.Count -gt 0) {
     Write-Info "排除工作区  : $($excludedWs -join '、')（不安装依赖 / 不参与编译）"
   }
@@ -857,6 +857,8 @@ function Set-AllArtifactVerifyDisabled {
 #   根 package.json 在 pull 前重置清单里，所以每次 pull 后都要重新应用 —— 均为幂等操作。
 function Get-ExcludedWorkspaceNames {
   # 需要从根 workspaces 排除的工作区名（beta 与 Next 各由一个开关控制）
+  # 调用方务必用 @(...) 包裹：PowerShell 会把单元素返回值解包成标量，而标量在
+  # Set-StrictMode -Version Latest 下取 .Count 会抛 PropertyNotFoundException。
   $names = @()
   if ($script:DisableBeta) { $names += 'dsh-plugin-desktop-beta' }
   if ($script:DisableNext) { $names += 'dsh-desktop-next' }
@@ -912,7 +914,7 @@ function Remove-RootWorkspace {
 }
 
 function Disable-ExcludedWorkspaces {
-  $excluded = Get-ExcludedWorkspaceNames
+  $excluded = @(Get-ExcludedWorkspaceNames)   # @() 必需：单元素时函数返回值会被解包成标量
   if ($excluded.Count -eq 0) { return }
   $removed = @()
   foreach ($name in $excluded) {
@@ -1214,8 +1216,11 @@ function Set-RuntimeVersionPinned {
     #   3) 只有校验通过的才复制，否则明确警告并放弃（宁可丢掉该补丁也不要塞一个
     #      内容错版本的文件进去 —— 错版本补丁会以难以定位的 ENOENT 形式失败）。
     if (-not (Test-Path -LiteralPath $patchPath)) {
-      $candidates = Get-ChildItem -LiteralPath (Split-Path -Parent $patchPath) -Filter "$unscoped@*.patch" -File |
-        Where-Object { $_.BaseName -ne "$unscoped@$v" }
+      # 注意（2026-09-28 修复）：必须用 @() 包裹。Set-StrictMode -Version Latest 下，
+      # 对 $null / 单个对象 / 字符串取 .Count 会抛 PropertyNotFoundException；而
+      # Get-ChildItem | Where-Object 在 0 个匹配时返回 $null、1 个匹配时返回标量对象。
+      $candidates = @(Get-ChildItem -LiteralPath (Split-Path -Parent $patchPath) -Filter "$unscoped@*.patch" -File -ErrorAction SilentlyContinue |
+          Where-Object { $_.BaseName -ne "$unscoped@$v" })
       $tarball = Join-Path $script:Src (($vendorRelative -replace '/', [IO.Path]::DirectorySeparatorChar))
       $tarball = Join-Path $tarball $p.filename
       $migrated = $false
@@ -1229,6 +1234,11 @@ function Set-RuntimeVersionPinned {
             } } -Descending
         $probe = Join-Path ([IO.Path]::GetTempPath()) ("dsh-patchprobe-" + [guid]::NewGuid().ToString('N'))
         foreach ($cand in $sorted) {
+          # 脚本顶部 $PSNativeCommandUseErrorActionPreference=$true：tar / git apply 的非零
+          # 退出在这里是“预期结果”（旧补丁打不到新版本 → 试下一个候选或放弃），必须临时降级
+          # 成普通 $LASTEXITCODE 读数，否则整个 [02] 会以一个无名 git 错误终止（2026-09-28 修复）。
+          $nativePref = $PSNativeCommandUseErrorActionPreference
+          $PSNativeCommandUseErrorActionPreference = $false
           try {
             New-Item -ItemType Directory -Force -Path $probe | Out-Null
             & tar -xzf $tarball -C $probe --strip-components=1 2>$null
@@ -1244,11 +1254,14 @@ function Set-RuntimeVersionPinned {
               break
             }
           } finally {
+            $PSNativeCommandUseErrorActionPreference = $nativePref
             if (Test-Path -LiteralPath $probe) { Remove-Item -Recurse -Force $probe -ErrorAction SilentlyContinue }
           }
         }
       }
-      if (-not $migrated) {
+      # 只在“该包确实有过旧版本补丁、但都打不到本次固定版本”时才告警；从未有过补丁的包
+      # （manifest 里约 340 个包中的绝大多数）本就无需补丁，静默跳过，避免刷屏 300+ 行。
+      if ($candidates.Count -gt 0 -and -not $migrated) {
         Write-WarnLine "补丁缺失且无可用的兼容旧版本：$unscoped@$v 将不带补丁（resolutions 回退为 file:）。" +
           "若该包确需补丁，请人工按 $v 源码更新 patches\$unscoped@$v.patch。"
       }

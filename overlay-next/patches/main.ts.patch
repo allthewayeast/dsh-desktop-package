@@ -1,0 +1,51 @@
+diff --git a/dsh-desktop-next/src/main.ts b/dsh-desktop-next/src/main.ts
+index f1cc2c05bc..3932586cfd 100644
+--- a/dsh-desktop-next/src/main.ts
++++ b/dsh-desktop-next/src/main.ts
+@@ -23,6 +23,10 @@ import { createLanHttpsCertificate, lanHttpsCertificateDiagnostic } from './lan-
+ import { desktopTerminalStateDirectory, openDesktopTerminal } from './desktop-terminal.ts'
+ import { bundledPnpmEntry, createPackageRunner } from './extensions.ts'
+ import { applyDesktopPackageAgePolicy } from './pnpm-policy.ts'
++import {
++  applyDesktopStartupConfig,
++  resolveStartupConfigPath,
++} from './startup-config.ts'
+ import { auxiliaryWindowChromeOptions, auxiliaryWindowHasCustomFrame } from '../../dsh-plugin-desktop-beta/src/auxiliary-window-options.ts'
+ import { atomicJson, privateDirectory } from './private-files.ts'
+ import { windowMaterial } from './window-material.ts'
+@@ -39,11 +43,33 @@ import { updateLabel } from './update-state.ts'
+ // Inherit the package policy across the Host and every runtime child process.
+ applyDesktopPackageAgePolicy(process.env)
+ 
++// Apply the user-owned startup configuration before anything resolves the
++// Harness home or reads Safe Mode state: env entries must reach the home and
++// data-directory resolution below, and Electron switches must be appended
++// before the application becomes ready. Next resolves `home` at module scope,
++// so this has to run here rather than inside `main()`.
++const startupConfig = applyDesktopStartupConfig({
++  configPath: resolveStartupConfigPath(dirname(process.execPath)),
++  environment: process.env,
++})
++for (const [name, value] of startupConfig.envUpdates) process.env[name] = value
++for (const entry of startupConfig.switches) {
++  app.commandLine.appendSwitch(entry.name, entry.value ?? undefined)
++}
++
+ const root = dirname(NEXT_PACKAGE)
+-const defaultHome = resolve(process.env.DSH_DESKTOP_NEXT_HOME ?? defaultDataDirectory())
++// An explicit home comes from the Next-specific override first, then from the generic
++// `DSH_HOME` that every other DSH surface understands. Next used to read only the former,
++// so a `DSH_HOME` present in the launch environment (or supplied by the startup
++// configuration beside the executable) was silently ignored and the application always
++// landed on the shared `%UserProfile%\.dsh` default. Empty values count as unset, matching
++// how Stable treats an explicitly configured home.
++const explicitHome = [process.env.DSH_DESKTOP_NEXT_HOME, process.env.DSH_HOME]
++  .find(value => value !== undefined && value.trim().length > 0)
++const defaultHome = resolve(explicitHome ?? defaultDataDirectory())
+ // The location preference stays at its former Next-owned anchor so previously
+ // chosen custom directories survive a change to the default home.
+-const locationRoot = process.env.DSH_DESKTOP_NEXT_HOME ? defaultHome
++const locationRoot = explicitHome ? defaultHome
+   : app.isPackaged ? join(app.getPath('appData'), 'DSH NEXT', 'home') : join(root, '.desktop-next', 'home')
+ const locationFile = join(locationRoot, 'desktop-next-location.json')
+ const dataLocation = readDataDirectory(defaultHome, locationRoot)

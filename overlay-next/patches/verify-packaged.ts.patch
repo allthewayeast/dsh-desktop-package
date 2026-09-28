@@ -1,0 +1,186 @@
+diff --git a/dsh-desktop-next/scripts/verify-packaged.ts b/dsh-desktop-next/scripts/verify-packaged.ts
+index 63e4d9b694..f760e0f3d5 100644
+--- a/dsh-desktop-next/scripts/verify-packaged.ts
++++ b/dsh-desktop-next/scripts/verify-packaged.ts
+@@ -1,9 +1,110 @@
+ /** Check the actual unpacked payload, including runtime-only dependencies, without a GUI. */
+ import { existsSync, readFileSync, realpathSync } from 'node:fs'
+ import { dirname, join, relative } from 'node:path'
++import { extractFile, listPackage } from '@electron/asar'
+ 
+ interface PackContext { appOutDir: string; electronPlatformName: string }
+-export function verifyNextPayload(root: string): void {
++
++/**
++ * Filesystem view over the packaged application, for either layout.
++ *
++ * DSH NEXT ships with ASAR enabled (like Stable/Beta) but must stay verifiable
++ * in both shapes: the archive layout (`resources/app.asar`) and the plain
++ * directory layout (`resources/app`) that `asar: false` produced. Every payload
++ * probe goes through this interface so the two branches stay in one place.
++ */
++interface PackagedView {
++  /** Human-readable root, used in error messages. */
++  readonly label: string
++  /** Physical root, or the archive path when packed. */
++  readonly root: string
++  /** Whether a payload-relative path exists. */
++  exists(relativePath: string): boolean
++  /** Read a payload-relative text file. */
++  read(relativePath: string): string
++  /** Resolve a manifest while still inside the payload; undefined when it escapes. */
++  resolveManifest(packageName: string, fromDirectory: string): string | undefined
++  /** Directory part of a payload-relative path, as this view spells it. */
++  parentOf(relativePath: string): string
++}
++
++/** Directory-separator flavour the archive uses, matching what Electron accepts. */
++function normalizePackedPath(relativePath: string): string {
++  const trimmed = relativePath.replaceAll('\\', '/').replace(/^\/+/u, '')
++  return trimmed.includes('/') ? trimmed.replaceAll('/', '\\') : trimmed
++}
++
++function directoryView(root: string): PackagedView {
++  const parentOf = (relativePath: string): string => {
++    const joined = join(root, relativePath)
++    const parent = relative(root, dirname(joined))
++    return parent === '' ? '.' : parent
++  }
++  return {
++    label: `resources/app (relative to ${root})`,
++    root,
++    exists: relativePath => existsSync(join(root, relativePath)),
++    read: relativePath => readFileSync(join(root, relativePath), 'utf8'),
++    resolveManifest: (packageName, fromDirectory) => {
++      let parent = join(root, fromDirectory)
++      for (;;) {
++        const candidate = join(parent, 'node_modules', packageName, 'package.json')
++        if (existsSync(candidate)) {
++          const resolved = realpathSync(candidate)
++          return relative(root, resolved).startsWith('..') ? undefined : relative(root, resolved)
++        }
++        if (parent === root) return undefined
++        const next = dirname(parent)
++        if (next === parent || relative(root, next).startsWith('..')) return undefined
++        parent = next
++      }
++    },
++    parentOf,
++  }
++}
++
++function archiveView(archive: string): PackagedView {
++  // listPackage reports every entry (files and directories) with the archive's
++  // own separator; normalize once so membership tests are exact.
++  const entries = new Set(listPackage(archive, { isPack: false }).map(entry => entry.replaceAll('\\', '/').replace(/^\/+/u, '')))
++  const read = (relativePath: string): string => {
++    const normalized = normalizePackedPath(relativePath)
++    if (!entries.has(normalized.replaceAll('\\', '/'))) {
++      throw new Error(`Payload entry missing from the archive: ${relativePath}`)
++    }
++    return extractFile(archive, normalized).toString('utf8')
++  }
++  const parentOf = (relativePath: string): string => {
++    const normalized = relativePath.replaceAll('\\', '/').replace(/^\/+/u, '')
++    const slash = normalized.lastIndexOf('/')
++    return slash === -1 ? '.' : normalized.slice(0, slash)
++  }
++  return {
++    label: `resources/app.asar (${archive})`,
++    root: archive,
++    exists: relativePath => entries.has(relativePath.replaceAll('\\', '/').replace(/^\/+/u, '')),
++    read,
++    resolveManifest: (packageName, fromDirectory) => {
++      let parent = parentOf(fromDirectory)
++      for (;;) {
++        const candidate = parent === '.' ? `node_modules/${packageName}/package.json` : `${parent}/node_modules/${packageName}/package.json`
++        if (entries.has(candidate)) return candidate
++        if (parent === '.') return undefined
++        const next = parentOf(parent)
++        if (next === parent) return undefined
++        parent = next
++      }
++    },
++    parentOf: relativePath => parentOf(relativePath),
++  }
++}
++
++/**
++ * Verify every payload entry Next reads at runtime, plus the transitive
++ * dependency closure, through the given layout view.
++ * @param view - filesystem view over the packaged application.
++ */
++export function verifyNextPayloadView(view: PackagedView): void {
+   // `host.cordis.patch.yml` and `scripts/node-bin` are read from the packaged application by the
+   // Host: the overlay swaps the official webserver for Next's private loopback one, and the shims
+   // put a `node` on the package manager's PATH. Both are invisible to a `yarn start` run, which
+@@ -12,43 +113,50 @@ export function verifyNextPayload(root: string): void {
+     'lib/native-ui/index.html', 'cordis.patch.yml', 'host.cordis.patch.yml',
+     'scripts/node-bin/node', 'scripts/node-bin/node.cmd',
+     'assets/tray-iconTemplate.png', 'assets/tray-icon-blue.png']) {
+-    if (!existsSync(join(root, path))) throw new Error(`Missing Next payload: ${path}`)
++    if (!view.exists(path)) throw new Error(`Missing Next payload: ${path} in ${view.label}`)
+   }
+-  const queued = [join(root, 'package.json')]; const visited = new Set<string>()
++  const queued = ['package.json']
++  const visited = new Set<string>()
+   while (queued.length) {
+-    const manifest = realpathSync(queued.pop()!)
++    const manifest = queued.pop()!
+     if (visited.has(manifest)) continue
+     visited.add(manifest)
+-    const data = JSON.parse(readFileSync(manifest, 'utf8'))
++    const data = JSON.parse(view.read(manifest))
+     // Required peers are runtime edges too: a plugin whose peer is absent throws on import and the
+     // Host reports it as an entry that did not activate, long after packaging reported success.
+     // They are the packages most easily missed, because the workspace resolves them from the
+     // repository root even when this application never declares them.
+     const optionalPeers = data.peerDependenciesMeta ?? {}
+     const required = [...Object.keys(data.dependencies ?? {}),
+-      ...Object.keys(data.peerDependencies ?? {}).filter(name => optionalPeers[name]?.optional !== true)]
++      ...Object.keys(data.peerDependencies ?? {}).filter((name: string) => optionalPeers[name]?.optional !== true)]
+     for (const name of required) {
+-      let parent = dirname(manifest)
+-      let found: string | undefined
+-      while (!relative(root, parent).startsWith('..')) {
+-        const candidate = join(parent, 'node_modules', name, 'package.json')
+-        if (existsSync(candidate)) { found = realpathSync(candidate); break }
+-        if (parent === root) break
+-        parent = dirname(parent)
+-      }
+-      if (!found) {
++      const found = view.resolveManifest(name, manifest)
++      if (found === undefined) {
+         if (Object.hasOwn(data.optionalDependencies ?? {}, name)) continue
+         throw new Error(`Missing packaged dependency ${name} required by ${data.name}`)
+       }
+-      if (relative(root, found).startsWith('..')) throw new Error(`Packaged dependency escapes the application: ${name}`)
+       queued.push(found)
+     }
+   }
+-  const frontend = join(root, 'node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html')
+-  if (!existsSync(frontend)) throw new Error('Official Web frontend was not packaged')
++  const frontend = 'node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html'
++  if (!view.exists(frontend)) throw new Error('Official Web frontend was not packaged')
+ }
++
++/** Directory-layout entry point, kept for the `asar: false` shape. */
++export function verifyNextPayload(root: string): void {
++  verifyNextPayloadView(directoryView(root))
++}
++
+ export default function afterPack(context: PackContext): void {
+   const resources = context.electronPlatformName === 'darwin' ? join(context.appOutDir, 'DSH NEXT.app/Contents/Resources') : join(context.appOutDir, 'resources')
+-  if (existsSync(join(resources, 'app.asar'))) throw new Error('Next must use the same asar:false runtime layout as Stable/Beta')
+-  verifyNextPayload(join(resources, 'app'))
++  const archive = join(resources, 'app.asar')
++  if (existsSync(archive)) {
++    verifyNextPayloadView(archiveView(archive))
++    return
++  }
++  const directory = join(resources, 'app')
++  if (!existsSync(directory)) {
++    throw new Error(`Next payload is missing: neither ${archive} nor ${directory} exists`)
++  }
++  verifyNextPayload(directory)
+ }
