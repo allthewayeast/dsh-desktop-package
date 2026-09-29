@@ -17,6 +17,7 @@
     3. dshmarket / AA 校验的工作区列表必须同时包含 next；
     4. 产物核对项按 next 的实际布局（lib/main.js、host.cordis.patch.yml 等）。
     5. 不做图标处理（按需求）。
+    6. 运行时跟随上游（不再钉 0.1.7-rc.2），deepseek-harness 子模块对齐上游 HEAD 的 gitlink。
 
 .PARAMETER Target
   构建目标。默认 package-dir（编译 + 解包目录，不打安装包）。
@@ -65,9 +66,14 @@ $script:SrcBranch = 'master'
 $script:WsName = 'dsh-desktop-next'
 $script:WsDir = Join-Path $script:Src $script:WsName
 
-# 运行时固定（与 stable 保持一致，见 build.ps1）
-$script:RuntimeVersion = '0.1.7-rc.2'
-$script:HarnessCommit = '477b4f420553e8a52c2fbccc464d7561b239c443'  # dsh-v0.1.7-rc.2
+# 运行时：跟随上游（不再硬钉 0.1.7-rc.2）
+# next 的 dsh 运行时由上游决定，三处必须一致：next 工作区声明的 @deepseek-ai/dsh 版本、
+# 根 package.json 的 resolutions 里该版本 → file:vendor/dsh-runtime/<ver>/... 的映射、
+# vendor\dsh-runtime\<ver> 目录本身。本脚本只校验并报告，不改写依赖串。
+# 2026-09-29：上游把 next/beta 一律升到 0.2.0-rc.1，而旧代码仍把 next 的依赖串改写成
+# 0.1.7-rc.2；resolutions 的键是带版本的（@deepseek-ai/dsh@npm:0.2.0-rc.1），降版本后
+# 不再匹配 → install 会绕过 vendored 产物退到 npm 解析，且与按 0.2.0-rc.1 peer 构建的
+# AA 产物（vendor\agents-anywhere）不一致。stable 通道仍由 build.ps1 钉 0.1.7-rc.2。
 
 # 本脚本不构建的工作区（只让它们不参与编译/打包），但其中有些仍需安装依赖：
 #   - dsh-plugin-desktop（stable）：next 完全不引用，排除即可。
@@ -93,6 +99,22 @@ $script:OverlayPatches = @(
   'dsh-desktop-next/src/main.ts'
   'dsh-desktop-next/scripts/verify-packaged.ts'
   'dsh-desktop-next/scripts/verify-fuses.ts'
+)
+
+# 只应用、不自动导出的补丁目标（与 build.ps1 的 NoAutoExportPatchFiles 同源）。
+# dsh-desktop-next\package.json 必然同时承受多处构建期注入：
+#   - 本脚本 Set-ElectronOverride  改写 electron 版本（-ElectronVersion）
+#   - 本脚本 Set-PackagingFixes    移除 build.afterAllArtifactBuild
+#   - build.ps1（stable）Set-AAVendorDependency 按 AA_WORKSPACES 动态遍历，
+#     把 @agents-anywhere/dsh-bridge-next 对齐到 vendor\agents-anywhere 的本机发布产物
+#     （该列表含 next）→ stable 的构建也会写这个文件
+# 于是 Export-Overlay 看到的“工作区 git diff”可能只含这些注入，导出即把
+# overlay-next\patches\package.json.patch 里手工维护的 ASAR 内容
+# （asar:{smartUnpack} + 两个 ASAR fuse + 三平台 asarUnpack）整份覆盖掉 ——
+# 产物会静默退回 resources\app\ 的散文件布局（build.ps1 侧已因此复发三次）。
+# 这里只应用、不自动导出；补丁内容在包根仓库手工维护并提交。
+$script:NoAutoExportPatchFiles = @(
+  'dsh-desktop-next/package.json'
 )
 
 # 产物核对：exe 同级 / 应用负载内必须具备的条目
@@ -176,18 +198,37 @@ function Update-SourceRepository {
 function Ensure-Submodule {
   if ($SkipSubmodule) { Write-WarnLine '已跳过子模块初始化（-SkipSubmodule）。'; return }
   $sub = Join-Path $script:Src 'deepseek-harness'
+
+  # 跟随上游：上游 HEAD 记录的 gitlink 就是本通道应有的 harness commit。
+  # （stable 由 build.ps1 钉 477b4f42 = 0.1.7-rc.2；next 跟随上游，随 beta 通道为
+  #  0.2.0-rc.1 对应 commit，硬编码会在上游升级时把子模块降级。）
+  $expected = $null
+  $prevNative = $PSNativeCommandUseErrorActionPreference
+  $PSNativeCommandUseErrorActionPreference = $false
+  try {
+    $link = @(& git -C $script:Src ls-tree HEAD deepseek-harness) -join ' '
+    $gl = [regex]::Match($link, 'commit\s+([0-9a-f]{40})')
+    if ($gl.Success) { $expected = $gl.Groups[1].Value }
+  } finally {
+    $PSNativeCommandUseErrorActionPreference = $prevNative
+  }
+
   if (-not (Test-Path -LiteralPath (Join-Path $sub '.git'))) {
     Write-Info '初始化 deepseek-harness 子模块 ...'
     & git -C $script:Src submodule update --init --recursive deepseek-harness 2>&1 | ForEach-Object { Write-Log $_ }
     if ($LASTEXITCODE -ne 0) { throw "submodule update 失败 (exit $LASTEXITCODE)" }
   }
+  if (-not $expected) {
+    Write-WarnLine '未读到上游记录的 deepseek-harness gitlink（上游结构变化？），跳过子模块核对。'
+    return
+  }
   $actual = (& git -C $sub rev-parse HEAD).Trim()
-  if ($actual -ne $script:HarnessCommit) {
-    Write-Info "对齐 deepseek-harness 到 $($script:HarnessCommit.Substring(0,10)) ..."
-    & git -C $sub checkout --force $script:HarnessCommit 2>&1 | ForEach-Object { Write-Log $_ }
+  if ($actual -ne $expected) {
+    Write-Info "对齐 deepseek-harness 到上游记录 $($expected.Substring(0,10)) ..."
+    & git -C $sub checkout --force $expected 2>&1 | ForEach-Object { Write-Log $_ }
     if ($LASTEXITCODE -ne 0) { throw "子模块 checkout 失败 (exit $LASTEXITCODE)" }
   }
-  Write-Ok "deepseek-harness = $($script:HarnessCommit.Substring(0,10))"
+  Write-Ok "deepseek-harness = $($expected.Substring(0,10))（跟随上游 gitlink）"
 }
 
 # ---------------- 覆盖层 ----------------
@@ -195,14 +236,33 @@ function Ensure-Submodule {
 function Export-Overlay {
   # 把工作区里这些文件的本地改动导出成 overlay-next\patches，然后再 pull。
   # 这样"改了源码 → 跑本脚本"就能固化改动，且 pull 不会丢。
+  # 例外：$script:NoAutoExportPatchFiles 列出的文件只告警不导出（其工作区改动里
+  # 必然混有构建期注入，导出即毁掉手工维护的策展内容）。
   if ($SkipPull) { return }
   Push-Location $script:Src
   try {
     $patchDir = Join-Path $script:OverlayDir 'patches'
     New-Item -ItemType Directory -Force -Path $patchDir | Out-Null
     foreach ($rel in $script:OverlayPatches) {
-      $diff = @(& git diff -- $rel 2>$null)
-      if ($LASTEXITCODE -ne 0) { continue }
+      if ($script:NoAutoExportPatchFiles -contains $rel) {
+        # 只告警、不落盘：该文件的本地改动多半来自构建期注入，导出会覆盖策展补丁。
+        $prevNativeGuard = $PSNativeCommandUseErrorActionPreference
+        $PSNativeCommandUseErrorActionPreference = $false
+        try { $dirty = @(& git status --porcelain -- $rel) } finally { $PSNativeCommandUseErrorActionPreference = $prevNativeGuard }
+        if ($dirty.Count -gt 0) {
+          Write-WarnLine "覆盖层：$rel 有本地改动，但该补丁为手工维护（构建期会注入依赖版本 / electron 版本 / AA 产物）→ 已跳过自动导出。如需固化，请手工更新 overlay-next\patches\$([IO.Path]::GetFileName($rel)).patch 并提交到包根仓库。"
+        }
+        continue
+      }
+      $prevNative = $PSNativeCommandUseErrorActionPreference
+      $PSNativeCommandUseErrorActionPreference = $false
+      try {
+        $diff = @(& git diff -- $rel)
+        $diffCode = $LASTEXITCODE
+      } finally {
+        $PSNativeCommandUseErrorActionPreference = $prevNative
+      }
+      if ($diffCode -ne 0) { continue }
       if ($diff.Count -eq 0) { continue }
       $out = Join-Path $patchDir ("$([IO.Path]::GetFileName($rel)).patch")
       [System.IO.File]::WriteAllText($out, ([string]::Join("`n", $diff) + "`n"))
@@ -290,41 +350,63 @@ function Set-WorkspaceSelection {
   Write-WarnLine "工作区：保留 $((($keep | Sort-Object -Unique)) -join '、')（排除 $($script:ExcludedWorkspaces -join '、')）"
 }
 
-function Set-RuntimeVersionPinned {
-  # stable 的 build.ps1 会把运行时固定到 $script:RuntimeVersion。next 这边上游
-  # 已经与固定值一致（0.1.7-rc.2），保持一致性与可重复性，这里做同样的校验，
-  # 只在真的不一致时才改写，避免无谓地动上游文件。
-  $upPath = Join-Path $script:Src 'upstream.json'
-  if (-not (Test-Path -LiteralPath $upPath)) { Write-WarnLine '未找到 upstream.json，跳过运行时校验。'; return }
-  $up = Get-JsonObject $upPath
-  $next = $up.channels.next
-  if ($null -eq $next) { Write-WarnLine 'upstream.json 无 next 通道条目，跳过。'; return }
-  if ($next.sourceVersion -ne $script:RuntimeVersion) {
-    Write-WarnLine "next 通道运行时为 $($next.sourceVersion)，与固定值 $($script:RuntimeVersion) 不一致（本脚本不改写，请确认是否预期）。"
-  } else {
-    Write-Info "运行时版本一致：next = $($script:RuntimeVersion)"
+function Get-NextDeclaredRuntime {
+  # next 工作区自己声明的 dsh 运行时版本（上游的权威来源）。
+  $pkgPath = Join-Path $script:WsDir 'package.json'
+  if (-not (Test-Path -LiteralPath $pkgPath)) { return $null }
+  $text = Get-Content -LiteralPath $pkgPath -Raw -Encoding utf8
+  $m = [regex]::Match($text, '"@deepseek-ai/dsh"\s*:\s*"([^"]+)"')
+  if ($m.Success) { return $m.Groups[1].Value }
+  return $null
+}
+
+function Test-NextRuntimeVersion {
+  # 只校验、不改写：next 的运行时跟随上游（2026-09-29 起上游为 0.2.0-rc.1）。
+  # 旧实现把 next 的 @deepseek-ai/dsh* 依赖串改写成硬钉的 0.1.7-rc.2，与上游根
+  # resolutions 的带版本键（@deepseek-ai/dsh@npm:0.2.0-rc.1 → file:vendor/...）不再
+  # 匹配，install 会绕过 vendored 产物退到 npm 解析，也与按 0.2.0-rc.1 peer 构建的
+  # AA 产物不一致。这里改成三处一致性校验，缺一处只告警（上游可能重构）。
+  $declared = Get-NextDeclaredRuntime
+  if (-not $declared) {
+    Write-WarnLine '未读到 next 工作区的 @deepseek-ai/dsh 声明（上游格式变化？），跳过运行时校验。'
+    return
   }
 
-  # 依赖版本：确保 next 工作区声明的是固定版本
-  $wsPkgPath = Join-Path $script:WsDir 'package.json'
-  $pkg = Get-JsonObject $wsPkgPath
-  $changed = $false
-  foreach ($field in @('dependencies', 'devDependencies')) {
-    $prop = $pkg.PSObject.Properties[$field]
-    if (-not $prop -or $null -eq $prop.Value) { continue }
-    $dep = $prop.Value
-    foreach ($name in @($dep.PSObject.Properties.Name)) {
-      if ($name -like '@deepseek-ai/dsh*' -and $dep.$name -ne $script:RuntimeVersion) {
-        Write-WarnLine "依赖不一致：$name = $($dep.$name)（期望 $($script:RuntimeVersion)）"
-        $dep.$name = $script:RuntimeVersion
-        $changed = $true
-      }
+  # ① vendored 运行时目录
+  $manifest = Join-Path $script:Src "vendor\dsh-runtime\$declared\manifest.json"
+  if (Test-Path -LiteralPath $manifest) {
+    Write-Info "运行时：next 声明 $declared，vendor\dsh-runtime\$declared 已就位"
+  } else {
+    Write-WarnLine "运行时：vendor\dsh-runtime\$declared\manifest.json 缺失（install 会退到 npm 解析）"
+  }
+
+  # ② 根 resolutions 是否把该版本映射到 vendored 产物
+  $rootPkgPath = Join-Path $script:Src 'package.json'
+  if (Test-Path -LiteralPath $rootPkgPath) {
+    $rootText = Get-Content -LiteralPath $rootPkgPath -Raw -Encoding utf8
+    $key = '"@deepseek-ai/dsh@npm:' + $declared + '"'
+    if ($rootText.Contains($key)) {
+      Write-Info "运行时：根 resolutions 已把 @deepseek-ai/dsh@npm:$declared 指向 vendored 产物"
+    } else {
+      Write-WarnLine "运行时：根 resolutions 没有 @deepseek-ai/dsh@npm:$declared 的映射（install 可能走 npm）"
     }
   }
-  if ($changed) {
-    Set-Content -LiteralPath $wsPkgPath -Value (ConvertTo-Json $pkg -Depth 100) -Encoding utf8 -NoNewline
-    Write-WarnLine "运行时版本固定：$script:WsName 的 @deepseek-ai/dsh* 依赖 → $($script:RuntimeVersion)"
+
+  # ③ 与 upstream.json 的通道声明对照（只为发现上游自身不一致）
+  $upPath = Join-Path $script:Src 'upstream.json'
+  if (Test-Path -LiteralPath $upPath) {
+    $up = Get-JsonObject $upPath
+    if ($up.channels.PSObject.Properties.Name -notcontains 'next') {
+      Write-Info '运行时：upstream.json 无 next 通道条目（上游未把 next 纳入通道表），以工作区声明为准'
+    }
+    $betaVer = $null
+    if ($up.channels.beta) { $betaVer = $up.channels.beta.sourceVersion }
+    if ($betaVer -and $betaVer -ne $declared) {
+      Write-WarnLine "运行时：next 声明 $declared，而 upstream.json 的 beta 通道是 $betaVer（上游 desktop 家族版本不一致，请确认是否预期）"
+    }
   }
+
+  Write-Ok "运行时已按上游确定：$declared（本脚本不改写依赖版本）"
 }
 
 function Set-ElectronOverride {
@@ -655,6 +737,8 @@ function Update-PackagedTimestamps {  $exeDir = Get-PackagedDir
 # ---------------- 主流程 ----------------
 
 try {
+  $bannerRuntime = Get-NextDeclaredRuntime
+  if (-not $bannerRuntime) { $bannerRuntime = '(跟随上游，待校验)' }
   $banner = @"
 DSH NEXT build log
 started : $(Get-Date -Format o)
@@ -662,7 +746,7 @@ root    : $script:Root
 src     : $script:Src
 workspace: $script:WsName
 target  : $Target
-runtime : $script:RuntimeVersion
+runtime : $bannerRuntime（跟随上游）
 "@
   Write-Log $banner
   Write-Host $banner -ForegroundColor DarkGray
@@ -689,8 +773,8 @@ runtime : $script:RuntimeVersion
   Invoke-Step '对齐 deepseek-harness 子模块' { Ensure-Submodule }
   Invoke-Step '选择工作区（加入 next / 排除 stable+beta）' { Set-WorkspaceSelection }
   Invoke-Step '应用 next 覆盖层（代码补丁）' { Apply-Overlay }
-  Invoke-Step '固定运行时版本与打包修复' {
-    Set-RuntimeVersionPinned
+  Invoke-Step '校验运行时版本并应用打包修复' {
+    Test-NextRuntimeVersion
     Set-ElectronOverride
     Set-PackagingFixes
     Set-MarketWorkspaceCheck

@@ -155,8 +155,18 @@ $script:ElectronVersionExplicit = $MyInvocation.BoundParameters.ContainsKey('Ele
 # 跳过（构建上游原样）；不一致时才固定（本地领先上游或需强制回落）。改版本 =
 # 改这两个值 + 重新生成 vendor/dsh-runtime/<版本>/（yarn upstream:prepare-runtime
 # && sync-vendored-runtime）。
-$script:RuntimeVersion = '0.1.7-rc.2'
-$script:HarnessCommit  = '477b4f420553e8a52c2fbccc464d7561b239c443'  # dsh-v0.1.7-rc.2 tag
+# 2026-09-29：上游 dsh-desktop master 的 stable 通道已官方化到 dsh 0.2.0-rc.1 ——
+# upstream.json: stable.commit=4878cdabd8 / sourceVersion=0.2.0-rc.1 /
+# runtimeSource=vendor/dsh-runtime/0.2.0-rc.1/manifest.json，仓库同时自带
+# patches\*@0.2.0-rc.1.patch（21 份）与上游 AA 发布记录（peers 只含 0.2.0-rc.1）。
+# 这两个值随之改为官方版本：Set-RuntimeVersionPinned 命中“已与官方一致”分支，
+# 不再改写 upstream.json / 依赖版本串 / 根 resolutions（旧的 0.1.7-rc.2 是本地降级，
+# 它会把本机 peer 联合范围撑成 “0.1.7-rc.2 || 0.2.0-rc.1”，使 AA 快路径永不成立）。
+# 要回退到别的 dsh 版本：改这两个值（commit 取 https://github.com/deepseek-ai/
+# deepseek-harness.git 上 dsh-v<版本> 标签指向的 commit），并确认该版本的
+# vendor/dsh-runtime/<版本>/ 与 patches/*@<版本>.patch 已存在。
+$script:RuntimeVersion = '0.2.0-rc.1'
+$script:HarnessCommit  = '4878cdabd87d4041bdaff61d04c966883b9fd07a'  # dsh-v0.2.0-rc.1 tag
 # 排除 beta 通道：不再安装 dsh-plugin-desktop-beta 的依赖、不参与任何编译，
 # 其 manifest 也不再被 AA 准备脚本读取/改写。设为 $false 可临时恢复 beta。
 $script:DisableBeta = $true
@@ -180,7 +190,8 @@ $script:AaSourceRef = 'a022d9286dd025bb4ae9f77b59cc2b7581f78b34'
 #   overlay\patches\<basename>.patch  已跟踪文件的修改（pull 前 git diff 导出，pull 后 git apply）
 # 往下面两个数组加仓库相对路径即可扩展；覆盖层构建时若检测到工作区里这些文件
 # 有未保存的改动/新文件，会自动先导出再重置，因此“改了源码 → 跑 quick-build-overlay”
-# 就能把改动固化进覆盖层。
+# 就能把改动固化进覆盖层。例外：$script:NoAutoExportPatchFiles 列出的文件只告警
+# 不导出（其工作区改动里必然混有构建期注入，导出即毁掉手工维护的策展内容）。
 $script:SrcOverlayDir = Join-Path $script:Root 'overlay'
 $script:SrcOverlayFiles = @(
   'dsh-plugin-desktop/src/startup-config.ts'          # 新建文件（上游无此文件）
@@ -194,10 +205,20 @@ $script:SrcPatchFiles = @(
   # 物理解出，spawn 无法进入 asar 归档）。补丁**只含 ASAR 相关改动**：electron
   # 版本与 afterAllArtifactBuild 钩子由 Set-ElectronOverride /
   # Set-AllArtifactVerifyDisabled 单独管理，不能写进补丁（否则会互相打架）。
-  # 历史坑：上一版该补丁退化成纯版本串改写（把 0.1.7-rc.2 依赖降级回 0.1.5-rc.2），
-  # 备份仍在 logs\backups\package.json.patch.bak-stale-0.1.5-*.patch。
+  # 历史坑（已复发三次）：该文件的本地改动里必然混入构建期注入 —— Set-RuntimeVersionPinned
+  # 改写 @deepseek-ai/dsh* 依赖版本串，Invoke-RequiredWinFixes 移除 afterAllArtifactBuild
+  # 并补 npmRebuild。过去每次带 -Overlay 的构建都会把这份“工作区 git diff”（= 纯注入）
+  # 当成用户改动写回本补丁，把 ASAR 内容整份覆盖掉：asar 退回 false → 产物
+  # resources\app\ 变成 2.5 万个散文件 / 730 MB，而构建全程不报错，因此长期不可见。
+  # 现列入 NoAutoExportPatchFiles：只应用、不自动导出；内容在包根仓库手工维护并提交。
   'dsh-plugin-desktop/package.json'                    # 重新启用 ASAR（smartUnpack + fuses + asarUnpack）
   'dsh-plugin-desktop/scripts/verify-packaged-runtime.ts'  # 产物运行时校验白名单（@dataiku/uv- 平台前缀）
+)
+
+# 只应用、不自动导出的补丁目标（理由见上）。这里的文件仍由 Apply-SrcOverlay 应用，
+# 但 Export-SrcOverlay 不会再覆盖其补丁文件，只打印告警。
+$script:NoAutoExportPatchFiles = @(
+  'dsh-plugin-desktop/package.json'
 )
 
 function Write-Banner {
@@ -643,6 +664,7 @@ function Export-SrcOverlay {
   # 覆盖层构建前，把工作区里 src 覆盖层文件的新改动固化到包根 overlay\：
   #   1) $script:SrcPatchFiles（已跟踪）→ git diff 导出为 overlay\patches\<basename>.patch
   #   2) $script:SrcOverlayFiles（新建/未跟踪）→ 复制为 overlay\src\<basename>
+  #   注：$script:NoAutoExportPatchFiles 里的文件只告警不导出（构建期注入会污染 diff）。
   # 仅 -Overlay 时执行（无覆盖层构建不应收走用户源码改动）；随后 Reset-OverlayTrackedFiles
   # 会 checkout 掉跟踪文件的改动、移除未跟踪文件，pull 后才由 Apply-SrcOverlay 恢复。
   if (-not $script:Overlay) { return }
@@ -650,6 +672,16 @@ function Export-SrcOverlay {
   New-Item -ItemType Directory -Force -Path (Join-Path $script:SrcOverlayDir 'patches') | Out-Null
   New-Item -ItemType Directory -Force -Path (Join-Path $script:SrcOverlayDir 'src') | Out-Null
   foreach ($rel in $script:SrcPatchFiles) {
+    if ($script:NoAutoExportPatchFiles -contains $rel) {
+      # 只告警、不落盘：该文件的本地改动多半来自构建期注入，导出会覆盖策展补丁。
+      $prevNativeGuard = $PSNativeCommandUseErrorActionPreference
+      $PSNativeCommandUseErrorActionPreference = $false
+      try { $dirty = @(& git -C $script:Src status --porcelain -- $rel) } finally { $PSNativeCommandUseErrorActionPreference = $prevNativeGuard }
+      if ($dirty.Count -gt 0) {
+        Write-WarnLine "覆盖层：$rel 有本地改动，但该补丁为手工维护（构建期会注入依赖版本/钩子改动）→ 已跳过自动导出。如需固化，请手工更新 overlay\patches\$([IO.Path]::GetFileName($rel)).patch 并提交到包根仓库。"
+      }
+      continue
+    }
     $prevNative = $PSNativeCommandUseErrorActionPreference
     $PSNativeCommandUseErrorActionPreference = $false
     try {
@@ -1277,24 +1309,60 @@ function Set-RuntimeVersionPinned {
 }
 
 function Set-AAVendorDependency {
+  # 上游 aa:prepare-release 的“复用已验证产物”条件之一：AA policy 的 AA_WORKSPACES 里
+  # **每一个**工作区，其 "@agents-anywhere/dsh-bridge-next" 依赖都必须精确等于
+  # file:../vendor/agents-anywhere/<provenance.artifact>。上游 31641c3961
+  # （Pin coherent AA build dependencies and include Next in release checks）把
+  # dsh-desktop-next 也纳入了该列表，而旧实现只对齐 stable（+ beta），于是快路径永远
+  # 不成立 → 每次构建都全量重打包（≈7 分钟 + 需联网），并可能撞上 “Existing artifact
+  # differs” 守卫中止打包。这里改为按 policy 的 AA_WORKSPACES 动态对齐，不再硬编码。
   $provPath = Join-Path $script:Src 'vendor\agents-anywhere\provenance.json'
   if (-not (Test-Path -LiteralPath $provPath)) { return }
   $prov = Get-JsonObject $provPath
   if (-not $prov.artifact) { return }
   $expected = "file:../vendor/agents-anywhere/$($prov.artifact)"
-  $aaScript = Join-Path $script:Src 'scripts\prepare-agents-anywhere-release.mjs'
-  $alignBeta = (-not $script:DisableBeta) -or
-    ((Test-Path -LiteralPath $aaScript) -and ([System.IO.File]::ReadAllText($aaScript)).Contains('dsh-plugin-desktop-beta'))
-  $targets = @((Join-Path $script:Src 'dsh-plugin-desktop\package.json'))
-  if ($alignBeta) { $targets += (Join-Path $script:Src 'dsh-plugin-desktop-beta\package.json') }
-  foreach ($pkg in $targets) {
+  $workspaces = @()
+  $policyPath = Join-Path $script:Src 'scripts\agents-anywhere-release-policy.mjs'
+  if (Test-Path -LiteralPath $policyPath) {
+    $policyText = [System.IO.File]::ReadAllText($policyPath)
+    $m = [regex]::Match($policyText, 'AA_WORKSPACES\s*=\s*\[([^\]]*)\]')
+    if ($m.Success) {
+      $workspaces = @([regex]::Matches($m.Groups[1].Value, "'([^']+)'") | ForEach-Object { $_.Groups[1].Value })
+    }
+  }
+  if ($workspaces.Count -eq 0) {
+    # policy 读不到时回落旧行为（stable；beta 启用或脚本仍引用 beta 时含 beta）
+    $aaScript = Join-Path $script:Src 'scripts\prepare-agents-anywhere-release.mjs'
+    $alignBeta = (-not $script:DisableBeta) -or
+      ((Test-Path -LiteralPath $aaScript) -and ([System.IO.File]::ReadAllText($aaScript)).Contains('dsh-plugin-desktop-beta'))
+    $workspaces = if ($alignBeta) { @($script:ChannelWsName, 'dsh-plugin-desktop-beta') } else { @($script:ChannelWsName) }
+  }
+  foreach ($ws in $workspaces) {
+    $pkg = Join-Path $script:Src (Join-Path $ws 'package.json')
     if (-not (Test-Path -LiteralPath $pkg)) { continue }
     $text = Get-Content -LiteralPath $pkg -Raw -Encoding utf8
     if ($text -notmatch '"@agents-anywhere/dsh-bridge-next"\s*:\s*"([^"]+)"') { continue }
     if ($Matches[1] -eq $expected) { continue }
     $fixed = [regex]::Replace($text, '("@agents-anywhere/dsh-bridge-next"\s*:\s*")[^"]+(")', "`${1}$expected`${2}", 1)
     Set-Content -LiteralPath $pkg -Value $fixed -Encoding utf8 -NoNewline
-    Write-WarnLine "修复：$(Split-Path (Split-Path $pkg) -Leaf) 的 AA 依赖已对齐 provenance（$($prov.artifact)）"
+    Write-WarnLine "修复：$ws 的 AA 依赖已对齐 provenance（$($prov.artifact)）"
+  }
+
+  # 根 package.json resolutions 里的 connector 补丁也必须指向同一产物：上游
+  # aaConnectorResolution() 把它写成
+  #   patch:@agents-anywhere/dsh-bridge-next@file%3Avendor/agents-anywhere/<artifact>#./patches/agents-anywhere-connector-httpx.patch
+  # 只对齐工作区依赖时，assertPreparedAaRelease 会以 “Connector compatibility patch
+  # references a different AA artifact” 直接中止打包。保留原有补丁路径，只替换产物名。
+  $rootPkgPath = Join-Path $script:Src 'package.json'
+  if (Test-Path -LiteralPath $rootPkgPath) {
+    $rootText = Get-Content -LiteralPath $rootPkgPath -Raw -Encoding utf8
+    $res = [regex]::Match($rootText, '"@agents-anywhere/dsh-bridge-next"\s*:\s*"([^"]*@file%3Avendor/agents-anywhere/)([^"#]+\.tgz)([^"]*)"')
+    if ($res.Success -and $res.Groups[2].Value -ne $prov.artifact) {
+      $replacement = '"@agents-anywhere/dsh-bridge-next": "' + $res.Groups[1].Value + $prov.artifact + $res.Groups[3].Value + '"'
+      $rootText = $rootText.Remove($res.Index, $res.Length).Insert($res.Index, $replacement)
+      Set-Content -LiteralPath $rootPkgPath -Value $rootText -Encoding utf8 -NoNewline
+      Write-WarnLine "修复：根 package.json 的 AA connector 补丁已对齐 provenance（$($prov.artifact)）"
+    }
   }
 }
 
@@ -1534,11 +1602,134 @@ function Apply-SrcOverlay {
   }
 }
 
+# ---- AA（Agents Anywhere）本机发布的固化与恢复 ----
+# 上游 package:dir 会先跑 aa:prepare-release。它的“复用已验证产物”快路径要求三条同时成立：
+#   ① provenance.commit == AA main 当前 commit
+#   ② provenance.runtimePeers == 本机 runtimePeerRanges() 算出的 peer 联合范围
+#   ③ 各工作区依赖 + 根 resolutions 指向 provenance.artifact，且该文件存在、sha256 一致
+# 本机把运行时钉在 0.1.7-rc.2（本地降级）且按三个桌面工作区求并集，peer 联合范围
+# 撑成 “0.1.7-rc.2 || 0.2.0-rc.1”，r-hash（rc########）必然与上游发布的产物（只含
+# 0.2.0-rc.1，r27dbe9f7）不同 → 快路径永远不成立 → 每次构建全量重打包（≈7 分钟、需
+# 联网，AA 源 clone + install + build + typecheck + pack）；而重打包字节不可复现，于是
+# 撞上 “Existing artifact differs: …; refusing to overwrite it” 守卫直接中止打包。
+# 更麻烦的是这份发布记录写在受跟踪文件里（vendor/agents-anywhere/provenance.json 等），
+# 每次 pull 的 git checkout -f 都把它还原成上游版本，而重打包出来的 .tgz 是未跟踪文件会
+# 留下来 —— 同一个坑每次构建重演。
+# 对策①：把“本机发布”当覆盖层 —— 打包成功后导出到 overlay\aa\，下次 pull 后恢复回
+# vendor\agents-anywhere\，快路径即可命中（打包回到 ≈40 秒），只有 AA main 真的前进时
+# 才需要重新打包并再次固化。
+# 对策②（2026-09-29 新增，因运行时改为跟随上游 0.2.0-rc.1 而必需）：覆盖层只在本机
+# 发布**确实与当前配置匹配**时才恢复 —— 恢复前核对 overlay\aa\record.json 记录的
+# runtimeVersion 是否等于 $script:RuntimeVersion。理由：pin 一旦等于上游版本，peer 联合
+# 范围就与上游自带的那份发布完全一致，此时上游自己 commit 在仓库里的产物（同名
+# r27dbe9f7）才是快路径该用的；若仍按旧记录把本机那份（异 hash、异 peers）盖上去，
+# 快路径必然不成立 → 全量重打包 → 重新打包出来的产物与上游同名却字节不同 → 直接被
+# “Existing artifact differs” 守卫中止（构建 7 分钟后硬失败）。旧格式记录（无
+# record.json）同样视为不匹配并跳过，等下一次真正需要本机打包时再重新固化。
+$script:AaVendorDir = Join-Path $script:Src 'vendor\agents-anywhere'
+$script:AaOverlayDir = Join-Path $script:SrcOverlayDir 'aa'
+
+function Get-AaOverlayRuntimeVersion {
+  # overlay\aa\record.json：本机发布记录的自述文件——“这份发布是为哪个运行时版本
+  # 建的”。旧格式（没有该文件）返回 $null，调用方按“不匹配”处理。
+  $markerPath = Join-Path $script:AaOverlayDir 'record.json'
+  if (-not (Test-Path -LiteralPath $markerPath)) { return $null }
+  $marker = Get-JsonObject $markerPath
+  if ($marker.PSObject.Properties['runtimeVersion']) { return $marker.runtimeVersion }
+  return $null
+}
+
+function Restore-AaVendorPublication {
+  # pull 重置之后、打包之前：恢复本机发布记录，并清理未被引用的未跟踪产物。
+  # 清理是必需的：它们与重打包结果同名却字节不同，直接触发上游的守卫。
+  # 恢复的前提是记录与当前固定的运行时版本相符（详见上方“对策②”）：pin 跟随上游时
+  # 上游自带的那份发布才是快路径该用的，用异 peers 的本机记录覆盖它必然导致重打包，
+  # 而重打包产物与上游同名不同字节 → 撞 “Existing artifact differs” 守卫硬失败。
+  if (-not $script:Overlay) { return }
+  $recordPath = Join-Path $script:AaOverlayDir 'provenance.json'
+  if (Test-Path -LiteralPath $recordPath) {
+    $record = Get-JsonObject $recordPath
+    if ($record.artifact) {
+      $recordedArtifact = Join-Path $script:AaOverlayDir $record.artifact
+      $recordVersion = Get-AaOverlayRuntimeVersion
+      if ($recordVersion -ne $script:RuntimeVersion) {
+        $label = if ($recordVersion) { $recordVersion } else { '未知（旧格式，无 record.json）' }
+        Write-WarnLine "AA 覆盖层：本机发布记录面向运行时 $label，与当前固定的 $($script:RuntimeVersion) 不匹配 → 跳过恢复，" +
+          '改用上游自带的发布记录（若上游产物同样不匹配，AA 会重新打包并在成功后重新固化本覆盖层）。'
+      } elseif (Test-Path -LiteralPath $recordedArtifact) {
+        New-Item -ItemType Directory -Force -Path $script:AaVendorDir | Out-Null
+        Copy-Item -LiteralPath $recordedArtifact -Destination (Join-Path $script:AaVendorDir $record.artifact) -Force
+        Copy-Item -LiteralPath $recordPath -Destination (Join-Path $script:AaVendorDir 'provenance.json') -Force
+        Write-WarnLine "AA 覆盖层：已恢复本机发布记录 $($record.artifact) → vendor\agents-anywhere"
+      } else {
+        Write-WarnLine "AA 覆盖层：overlay\aa 缺少产物 $($record.artifact)，跳过恢复（本次按上游 provenance 走，可能触发全量重打包）。"
+      }
+    }
+  }
+  $vendorProv = Join-Path $script:AaVendorDir 'provenance.json'
+  $referenced = $null
+  if (Test-Path -LiteralPath $vendorProv) { $referenced = (Get-JsonObject $vendorProv).artifact }
+  $prevNative = $PSNativeCommandUseErrorActionPreference
+  $PSNativeCommandUseErrorActionPreference = $false
+  try { $untracked = @(& git -C $script:Src ls-files --others --exclude-standard -- 'vendor/agents-anywhere') }
+  finally { $PSNativeCommandUseErrorActionPreference = $prevNative }
+  foreach ($rel in $untracked) {
+    if ($rel -notmatch '\.tgz$') { continue }
+    $name = [IO.Path]::GetFileName($rel)
+    if ($name -eq $referenced) { continue }
+    Remove-Item -LiteralPath (Join-Path $script:Src ($rel -replace '/', '\')) -Force -ErrorAction SilentlyContinue
+    Write-WarnLine "AA 覆盖层：已清理未被引用的本机产物 $name（防止重打包撞 “Existing artifact differs” 守卫）"
+  }
+}
+
+function Export-AaVendorPublication {
+  # 打包成功后：把 vendor\agents-anywhere 的本机发布记录固化到 overlay\aa\，并写下
+  # record.json（自述：这份发布是面向哪个运行时版本建的 —— 恢复时要按它判断是否
+  # 仍然适用，见 Restore-AaVendorPublication）。
+  if (-not $script:Overlay) { return }
+  $vendorProv = Join-Path $script:AaVendorDir 'provenance.json'
+  if (-not (Test-Path -LiteralPath $vendorProv)) { return }
+  $prov = Get-JsonObject $vendorProv
+  if (-not $prov.artifact) {
+    Write-WarnLine 'AA 覆盖层：vendor provenance 缺少 artifact 字段，跳过固化。'
+    return
+  }
+  $artifactPath = Join-Path $script:AaVendorDir $prov.artifact
+  if (-not (Test-Path -LiteralPath $artifactPath)) {
+    Write-WarnLine "AA 覆盖层：vendor 缺少产物 $($prov.artifact)，跳过固化。"
+    return
+  }
+  $recordPath = Join-Path $script:AaOverlayDir 'provenance.json'
+  if ((Test-Path -LiteralPath $recordPath) -and
+      ((Get-FileHash $recordPath -Algorithm SHA256).Hash -eq (Get-FileHash $vendorProv -Algorithm SHA256).Hash) -and
+      (Test-Path -LiteralPath (Join-Path $script:AaOverlayDir $prov.artifact)) -and
+      ((Get-AaOverlayRuntimeVersion) -eq $script:RuntimeVersion)) {
+    Write-Info "AA 覆盖层：本机发布未变化（$($prov.artifact)，运行时 $($script:RuntimeVersion)），无需固化。"
+    return
+  }
+  New-Item -ItemType Directory -Force -Path $script:AaOverlayDir | Out-Null
+  # 只保留当前产物，避免 overlay\aa 无限膨胀
+  Get-ChildItem -LiteralPath $script:AaOverlayDir -File -Filter '*.tgz' -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -ne $prov.artifact } |
+    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+  Copy-Item -LiteralPath $artifactPath -Destination (Join-Path $script:AaOverlayDir $prov.artifact) -Force
+  Copy-Item -LiteralPath $vendorProv -Destination $recordPath -Force
+  Set-Content -LiteralPath (Join-Path $script:AaOverlayDir 'record.json') -Encoding utf8 -NoNewline -Value (ConvertTo-Json ([ordered]@{
+        runtimeVersion = $script:RuntimeVersion
+        harnessCommit  = $script:HarnessCommit
+        artifact       = $prov.artifact
+        recordedAt     = (Get-Date).ToString('s')
+      }) -Depth 5)
+  $kb = [math]::Round((Get-Item -LiteralPath $artifactPath).Length / 1KB)
+  Write-WarnLine "AA 覆盖层：本机发布已固化 → overlay\aa\$($prov.artifact)（$kb KB，运行时 $($script:RuntimeVersion)），下次 pull 后自动恢复"
+}
+
 function Invoke-ChannelOverlayPreInstall {
   # 用户定制覆盖层（安装前，仅 -Overlay）：electron 版本 / .yarnrc.yml 门禁 / 图标
-  # / src 覆盖层（新建文件 + 修改补丁）
+  # / src 覆盖层（新建文件 + 修改补丁）/ AA 本机发布记录
   # （npmRebuild=false 与 afterAllArtifactBuild 移除属本机必需修复，另行无条件应用）
   Reset-OverlayTrackedFiles  # 确保工作树覆盖层文件与上游一致后再改（幂等）
+  Restore-AaVendorPublication
   $null = Set-ElectronOverride
   Set-AgeGateConfig
   Copy-TrayIconAssets
@@ -2122,8 +2313,11 @@ try {
 
   # 覆盖层部署 + 核对：产物必须自带 startup.json，且补丁代码 / 图标资源都在里面。
   # 放在时间戳规整之前，让新拷入的 startup.json 也一起被规整。
+  # AA 本机发布固化必须放在最前：package:dir 里的 aa:prepare-release 若重新发布了产物，
+  # 这里把它固化进 overlay\aa\，下次 pull 后才能恢复、避免每次构建都全量重打包。
   if ($Overlay -and $script:Failed -eq 0 -and
       $Target -in @('package-dir', 'dist-win', 'dist-win-portable', 'dist-mac', 'dist-mac-smoke')) {
+    Invoke-Step '固化 AA 本机发布（overlay\aa）' { Export-AaVendorPublication }
     Invoke-Step '部署覆盖层运行时资源（startup.json → 产物 exe 同级）' { Publish-OverlayRuntimeAssets }
     Invoke-Step '核对覆盖层已进入产物' { Assert-OverlayArtifacts }
   }

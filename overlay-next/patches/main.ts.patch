@@ -1,5 +1,5 @@
 diff --git a/dsh-desktop-next/src/main.ts b/dsh-desktop-next/src/main.ts
-index f1cc2c05bc..3932586cfd 100644
+index 9bc092ae6a..b581b49faf 100644
 --- a/dsh-desktop-next/src/main.ts
 +++ b/dsh-desktop-next/src/main.ts
 @@ -23,6 +23,10 @@ import { createLanHttpsCertificate, lanHttpsCertificateDiagnostic } from './lan-
@@ -11,9 +11,9 @@ index f1cc2c05bc..3932586cfd 100644
 +  resolveStartupConfigPath,
 +} from './startup-config.ts'
  import { auxiliaryWindowChromeOptions, auxiliaryWindowHasCustomFrame } from '../../dsh-plugin-desktop-beta/src/auxiliary-window-options.ts'
+ import { cleanupDisposableTree } from '../../dsh-plugin-desktop-beta/src/disposable-tree.ts'
  import { atomicJson, privateDirectory } from './private-files.ts'
- import { windowMaterial } from './window-material.ts'
-@@ -39,11 +43,33 @@ import { updateLabel } from './update-state.ts'
+@@ -40,11 +44,33 @@ import { updateLabel } from './update-state.ts'
  // Inherit the package policy across the Host and every runtime child process.
  applyDesktopPackageAgePolicy(process.env)
  

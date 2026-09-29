@@ -1,16 +1,16 @@
 diff --git a/dsh-desktop-next/package.json b/dsh-desktop-next/package.json
-index a217769e87..762cba627a 100644
+index bd69d6a441..5e1a7edf03 100644
 --- a/dsh-desktop-next/package.json
 +++ b/dsh-desktop-next/package.json
-@@ -207,6 +207,7 @@
-     "@deepseek-ai/dsh-client-ui-sidebar-browser": "0.1.7-rc.2",
-     "@deepseek-ai/dsh-client-ui-sidebar-right": "0.1.7-rc.2",
-     "@deepseek-ai/dsh-host-open-in-app": "0.1.7-rc.2",
+@@ -211,6 +211,7 @@
+     "@deepseek-ai/dsh-client-ui-sidebar-browser": "0.2.0-rc.1",
+     "@deepseek-ai/dsh-client-ui-sidebar-right": "0.2.0-rc.1",
+     "@deepseek-ai/dsh-host-open-in-app": "0.2.0-rc.1",
 +    "@electron/asar": "3.4.1",
      "@fontsource-variable/inter": "^5.3.0",
      "@shikijs/langs": "^4.3.1",
      "@tailwindcss/vite": "^4",
-@@ -287,13 +288,14 @@
+@@ -288,13 +289,14 @@
    "build": {
      "appId": "ai.deepseek.dsh.desktop.next",
      "productName": "DSH NEXT",
@@ -29,7 +29,7 @@ index a217769e87..762cba627a 100644
        "resetAdHocDarwinSignature": true,
        "runAsNode": true
      },
-@@ -347,10 +349,18 @@
+@@ -348,10 +350,18 @@
          "\\.(?:pak|dat|wasm)$"
        ],
        "x64ArchFiles": "**/node_modules/{@deepseek-ai/node-addon-system-darwin-*/**,node-pty/prebuilds/darwin-*/**,fs-ext/prebuilds/darwin-*/**,node-addon-require-builtin-darwin-*/**,@vscode/ripgrep-darwin-*/**,@img/sharp-darwin-*/**,@img/sharp-libvips-darwin-*/**,@koromix/koffi-darwin-*/**,@dataiku/uv-darwin-*/**,@deepseek-ai/libreoffice-kit-darwin-*/**,sherpa-onnx-darwin-*/**,@trycua/cua-driver-darwin-*/**,@ubjs/node-darwin-*/**}",
@@ -49,7 +49,7 @@ index a217769e87..762cba627a 100644
        "target": [
          {
            "target": "nsis",
-@@ -360,8 +370,7 @@
+@@ -361,8 +371,7 @@
          }
        ],
        "artifactName": "DSH-NEXT-${version}-${arch}-Portable.${ext}",
@@ -59,7 +59,7 @@ index a217769e87..762cba627a 100644
      },
      "nsis": {
        "oneClick": false,
-@@ -383,7 +392,9 @@
+@@ -384,7 +393,9 @@
          "dir"
        ],
        "icon": "build/app-icon.png",
