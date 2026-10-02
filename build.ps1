@@ -62,7 +62,7 @@
   quick-build-overlay.bat 携带 -Overlay。
 
 .PARAMETER ElectronVersion
-  覆盖层使用的 Electron 版本（默认 44.4.3，即脚本原始版本）。仅在 -Overlay 时生效：
+  覆盖层使用的 Electron 版本（默认 44.5.1，即脚本原始版本）。仅在 -Overlay 时生效：
   会把 <通道>/package.json 的 devDependencies.electron 改写为该版本，已装版本与之
   不一致时自动补装依赖（含 Electron 头文件缓存与 dist 解包）。不指定时沿用默认版本；
   需要临时换版本时在执行时指定，例如 -ElectronVersion 45.0.0。
@@ -119,7 +119,7 @@ param(
   # 覆盖层 Electron 版本（仅在 -Overlay 时生效）。默认值 = 脚本原始版本：
   # 不指定参数时行为与改造前完全一致；需要临时换版本时在执行时指定。
   [ValidatePattern('^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?$')]
-  [string]$ElectronVersion = '44.4.3'
+  [string]$ElectronVersion = '44.5.1'
 )
 
 Set-StrictMode -Version Latest
@@ -143,7 +143,7 @@ $script:GithubVersion = $null
 # 产品线固定为 stable：只构建 dsh-plugin-desktop（beta 通道已移除）
 $script:Channel = 'stable'
 $script:ChannelWsName = 'dsh-plugin-desktop'
-# 本地覆盖层：electron 目标版本。取值来源为 -ElectronVersion 参数（默认 '44.4.3'，
+# 本地覆盖层：electron 目标版本。取值来源为 -ElectronVersion 参数（默认 '44.5.1'，
 # 即脚本原始版本）：不指定参数时构建行为与改造前一致；需要临时换版本时在执行时指定。
 # Set-ElectronOverride 在官方声明与目标一致时自动跳过覆盖（构建上游原样）；仅在需要
 # 强制指定其他版本时才实际改写（例如官方尚未跟进、本地确需更新的版本）。
@@ -155,18 +155,18 @@ $script:ElectronVersionExplicit = $MyInvocation.BoundParameters.ContainsKey('Ele
 # 跳过（构建上游原样）；不一致时才固定（本地领先上游或需强制回落）。改版本 =
 # 改这两个值 + 重新生成 vendor/dsh-runtime/<版本>/（yarn upstream:prepare-runtime
 # && sync-vendored-runtime）。
-# 2026-09-29：上游 dsh-desktop master 的 stable 通道已官方化到 dsh 0.2.0-rc.1 ——
-# upstream.json: stable.commit=4878cdabd8 / sourceVersion=0.2.0-rc.1 /
-# runtimeSource=vendor/dsh-runtime/0.2.0-rc.1/manifest.json，仓库同时自带
-# patches\*@0.2.0-rc.1.patch（21 份）与上游 AA 发布记录（peers 只含 0.2.0-rc.1）。
+# 2026-09-29：上游 dsh-desktop master 的 stable 通道已官方化到 dsh 0.2.0-rc.2 ——
+# upstream.json: stable.commit=4878cdabd8 / sourceVersion=0.2.0-rc.2 /
+# runtimeSource=vendor/dsh-runtime/0.2.0-rc.2/manifest.json，仓库同时自带
+# patches\*@0.2.0-rc.2.patch（21 份）与上游 AA 发布记录（peers 只含 0.2.0-rc.2）。
 # 这两个值随之改为官方版本：Set-RuntimeVersionPinned 命中“已与官方一致”分支，
 # 不再改写 upstream.json / 依赖版本串 / 根 resolutions（旧的 0.1.7-rc.2 是本地降级，
-# 它会把本机 peer 联合范围撑成 “0.1.7-rc.2 || 0.2.0-rc.1”，使 AA 快路径永不成立）。
+# 它会把本机 peer 联合范围撑成 “0.1.7-rc.2 || 0.2.0-rc.2”，使 AA 快路径永不成立）。
 # 要回退到别的 dsh 版本：改这两个值（commit 取 https://github.com/deepseek-ai/
 # deepseek-harness.git 上 dsh-v<版本> 标签指向的 commit），并确认该版本的
 # vendor/dsh-runtime/<版本>/ 与 patches/*@<版本>.patch 已存在。
-$script:RuntimeVersion = '0.2.0-rc.1'
-$script:HarnessCommit  = '4878cdabd87d4041bdaff61d04c966883b9fd07a'  # dsh-v0.2.0-rc.1 tag
+$script:RuntimeVersion = '0.2.0-rc.2'
+$script:HarnessCommit  = '4878cdabd87d4041bdaff61d04c966883b9fd07a'  # dsh-v0.2.0-rc.2 tag
 # 排除 beta 通道：不再安装 dsh-plugin-desktop-beta 的依赖、不参与任何编译，
 # 其 manifest 也不再被 AA 准备脚本读取/改写。设为 $false 可临时恢复 beta。
 $script:DisableBeta = $true
@@ -213,6 +213,16 @@ $script:SrcPatchFiles = @(
   # 现列入 NoAutoExportPatchFiles：只应用、不自动导出；内容在包根仓库手工维护并提交。
   'dsh-plugin-desktop/package.json'                    # 重新启用 ASAR（smartUnpack + fuses + asarUnpack）
   'dsh-plugin-desktop/scripts/verify-packaged-runtime.ts'  # 产物运行时校验白名单（@dataiku/uv- 平台前缀）
+  # 【已移除】dshmarket 策展补丁（原条目：'.yarn/patches/dshmarket-desktop.patch'）。
+  # 它曾用于让 dshmarket 把自身的“可更新”条目算进 selfName（自更新）。上游现已收编
+  # 该改动：.yarn/patches/dshmarket-desktop.patch 在 HEAD 上就含 12 个 hunk 与
+  # `updates["dshmarket"]` 的 selfName 逻辑，本地策展版本反而更旧更少（仅 client.js），
+  # 因此这处定制完全冗余。
+  # 之所以必须删除：它的源补丁 overlay/patches/dshmarket-desktop.patch.patch 以“旧版
+  # 上游补丁内容”为基准（before 侧带 `ignoredUpdateSet`、7 行上下文），而上游已改写该
+  # 文件，git apply 必然失配 → 整个 [03] 覆盖层步骤抛错中止，连带后面的 ASAR / 白名单 /
+  # main.ts / 图标补丁都拿不到应用机会（2026-10 实际故障）。
+  # 一律使用上游版本；若日后上游再次去掉该逻辑，按上面的规则重新新增一条即可。
 )
 
 # 只应用、不自动导出的补丁目标（理由见上）。这里的文件仍由 Apply-SrcOverlay 应用，
@@ -1078,6 +1088,74 @@ function Disable-MarketWorkspaceCheck {
   Write-WarnLine "beta/Next 排除：dshmarket 校验工作区已收缩（排除 $($excluded -join '、')）"
 }
 
+# dshmarket 兼容补丁停用（本地决定）：
+#   上游 .yarn/patches/dshmarket-desktop.patch 给 checkUpdates 增加了一个“host 提供版本”
+#   形参（hostProvidedNpmVersions），使市场 UI 把 dshmarket 自身也算作可更新项。该补丁
+#   必须**同时**匹配仓库 pin 的版本（步骤[05] 按 pin 装依赖）与 npm latest（package:dir 里的
+#   market:prepare 跟随升级后重装）。但 1.66.8 已把第 6 个形参让给 catalogNpmByRepo，改动行
+#   的前后文本在两版中不同，单个 hunk 无法同时匹配 → yarn 报 “Cannot apply hunk #2” 并
+#   中断整个 package:dir（2026-10 实际故障，此前已因同类上下文漂移复发一次）。
+#   本函数让补丁彻底不参与安装：
+#     1) scripts/prepare-dsh-market.mjs 的 marketResolution 改为输出纯版本号；
+#     2) 根 package.json 里 pin 的 patch: 解析一并改为纯版本号。
+#   上游的 .yarn/patches/dshmarket-desktop.patch 文件保留不动（仅失效，不再被引用）。
+#   代价：市场 UI 不再提供 dshmarket 自身的更新入口；安装/卸载其它插件不受影响。
+#   恢复：删掉 Invoke-RequiredWinFixes 里的调用，并把 marketResolution 还原为
+#     `patch:dshmarket@npm%3A${version}#./.yarn/patches/dshmarket-desktop.patch`
+#   同时把该补丁更新到当时的 latest（且 pin 与 latest 两版都能应用）。
+#   幂等；格式变化时跳过并告警（不静默破坏）。
+function Set-MarketPatchDisabled {
+  $marketPath = Join-Path $script:Src 'scripts\prepare-dsh-market.mjs'
+  if (Test-Path -LiteralPath $marketPath) {
+    $text = [System.IO.File]::ReadAllText($marketPath)
+    if ($text.Contains('MARKET_PATCH_DISABLED')) {
+      Write-Info 'dshmarket 兼容补丁：marketResolution 已停用'
+    }
+    else {
+      $anchor = 'export const marketResolution = version => `patch:dshmarket@npm%3A${version}#./.yarn/patches/dshmarket-desktop.patch`'
+      if (-not $text.Contains($anchor)) {
+        Write-WarnLine 'dshmarket 兼容补丁：marketResolution 声明格式已变（无法停用），跳过。'
+      }
+      else {
+        $replacement = @(
+          '// MARKET_PATCH_DISABLED: DSH Desktop 不再维护 dshmarket 兼容补丁，改为纯 npm 规格。',
+          '// 该补丁必须同时匹配 pin 的版本与 npm latest，而 1.66.8 起的形参变化使其无法兼顾，',
+          '// 详见 build.ps1 的 Set-MarketPatchDisabled。'
+          'export const marketResolution = version => version'
+        ) -join "`n"
+        $text = $text.Replace($anchor, $replacement)
+        $oldNote = @(
+          '    // Follow latest while retaining Desktop self-update and rollback fixes. Yarn rejects',
+          '    // incompatible patch contexts; never silently ship a new release without these safeguards.'
+        ) -join "`n"
+        $newNote = @(
+          '    // Follow latest. The Desktop self-update patch is deliberately not applied here:',
+          '    // no single patch can match both the pinned release and npm latest (see build.ps1).'
+        ) -join "`n"
+        if ($text.Contains($oldNote)) { $text = $text.Replace($oldNote, $newNote) }
+        [System.IO.File]::WriteAllText($marketPath, $text)
+        Write-WarnLine 'dshmarket 兼容补丁：已停用（marketResolution → 纯版本号）'
+      }
+    }
+  }
+
+  $rootManifest = Join-Path $script:Src 'package.json'
+  if (Test-Path -LiteralPath $rootManifest) {
+    $manifest = [System.IO.File]::ReadAllText($rootManifest)
+    $match = [regex]::Match($manifest, '"dshmarket@npm:([0-9][^"]*)":\s*"patch:dshmarket@npm%3A[^"]*"')
+    if ($match.Success) {
+      $version = $match.Groups[1].Value
+      $plain = '"dshmarket@npm:' + $version + '": "' + $version + '"'
+      $manifest = $manifest.Remove($match.Index, $match.Length).Insert($match.Index, $plain)
+      [System.IO.File]::WriteAllText($rootManifest, $manifest)
+      Write-WarnLine "dshmarket 兼容补丁：根 package.json 解析已改为纯版本（$version）"
+    }
+    else {
+      Write-Info 'dshmarket 兼容补丁：根 package.json 已无 patch: 形式解析'
+    }
+  }
+}
+
 # AA（Agents-Anywhere）桥接产物依赖对齐：
 #   上游 package:dir 先跑 aa:prepare-release，其“复用已验证产物”的校验要求每个桌面
 #   工作区的 "@agents-anywhere/dsh-bridge-next" 依赖行都指向 provenance.json 记录的
@@ -1373,6 +1451,7 @@ function Invoke-RequiredWinFixes {
   Disable-ExcludedWorkspaces
   Disable-BetaAaPipeline
   Disable-MarketWorkspaceCheck
+  Set-MarketPatchDisabled
   Set-PackageDirRebuildDisabled -WorkspaceName $script:ChannelWsName
   Set-AllArtifactVerifyDisabled -WorkspaceName $script:ChannelWsName
   Set-AAVendorDependency
@@ -1380,7 +1459,7 @@ function Invoke-RequiredWinFixes {
   # 会把 upstream.json / 根 package.json / 依赖版本还原回上游（目前仍是 rc.1）。
   # 必须在安装依赖之前把 stable 通道固定回本地版本，否则装出来的是旧运行时。
   Set-RuntimeVersionPinned
-  Write-Ok 'Windows 打包必需修复已应用（beta/Next 工作区排除 / npmRebuild=false / 移除 PR #829 事后校验钩子 / AA 依赖对齐 / 运行时版本固定）'
+  Write-Ok 'Windows 打包必需修复已应用（beta/Next 工作区排除 / npmRebuild=false / 移除 PR #829 事后校验钩子 / AA 依赖对齐 / 运行时版本固定 / dshmarket 兼容补丁停用）'
 }
 
 function Copy-TrayIconAssets {
@@ -1608,8 +1687,8 @@ function Apply-SrcOverlay {
 #   ② provenance.runtimePeers == 本机 runtimePeerRanges() 算出的 peer 联合范围
 #   ③ 各工作区依赖 + 根 resolutions 指向 provenance.artifact，且该文件存在、sha256 一致
 # 本机把运行时钉在 0.1.7-rc.2（本地降级）且按三个桌面工作区求并集，peer 联合范围
-# 撑成 “0.1.7-rc.2 || 0.2.0-rc.1”，r-hash（rc########）必然与上游发布的产物（只含
-# 0.2.0-rc.1，r27dbe9f7）不同 → 快路径永远不成立 → 每次构建全量重打包（≈7 分钟、需
+# 撑成 “0.1.7-rc.2 || 0.2.0-rc.2”，r-hash（rc########）必然与上游发布的产物（只含
+# 0.2.0-rc.2，r27dbe9f7）不同 → 快路径永远不成立 → 每次构建全量重打包（≈7 分钟、需
 # 联网，AA 源 clone + install + build + typecheck + pack）；而重打包字节不可复现，于是
 # 撞上 “Existing artifact differs: …; refusing to overwrite it” 守卫直接中止打包。
 # 更麻烦的是这份发布记录写在受跟踪文件里（vendor/agents-anywhere/provenance.json 等），
@@ -1618,7 +1697,7 @@ function Apply-SrcOverlay {
 # 对策①：把“本机发布”当覆盖层 —— 打包成功后导出到 overlay\aa\，下次 pull 后恢复回
 # vendor\agents-anywhere\，快路径即可命中（打包回到 ≈40 秒），只有 AA main 真的前进时
 # 才需要重新打包并再次固化。
-# 对策②（2026-09-29 新增，因运行时改为跟随上游 0.2.0-rc.1 而必需）：覆盖层只在本机
+# 对策②（2026-09-29 新增，因运行时改为跟随上游 0.2.0-rc.2 而必需）：覆盖层只在本机
 # 发布**确实与当前配置匹配**时才恢复 —— 恢复前核对 overlay\aa\record.json 记录的
 # runtimeVersion 是否等于 $script:RuntimeVersion。理由：pin 一旦等于上游版本，peer 联合
 # 范围就与上游自带的那份发布完全一致，此时上游自己 commit 在仓库里的产物（同名
