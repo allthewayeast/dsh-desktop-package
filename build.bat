@@ -8,7 +8,10 @@ REM   build.bat check              - Full CI check
 REM   build.bat dev                - Build and launch GUI
 REM   build.bat --no-proxy         - Disable proxy
 REM   build.bat --skip-pull        - Skip submodule alignment (use existing source)
-REM   build.bat --overlay          - Apply local overlays (electron pin, icons, pnpm patch)
+REM   build.bat --overlay          - Apply local overlays (icons, pnpm patch, ASAR)
+REM   build.bat --electron 44.5.1  - Override Electron version (default: follow upstream)
+REM   build.bat --harness 0.2.0-rc.2 - Override dsh runtime version (default: follow upstream)
+REM   build.bat --harness-commit <sha> - commit for --harness (required if it differs from upstream)
 
 setlocal enabledelayedexpansion
 
@@ -18,6 +21,9 @@ set "SKIP_INSTALL_FLAG="
 set "SKIP_SUBMODULE_FLAG="
 set "SKIP_PULL_FLAG="
 set "OVERLAY_FLAG="
+set "ELECTRON_FLAG="
+set "HARNESS_FLAG="
+set "HARNESS_COMMIT_FLAG="
 
 :parse_args
 if "%~1"=="" goto end_parse
@@ -43,6 +49,24 @@ if /i "%~1"=="--skip-pull" (
 )
 if /i "%~1"=="--overlay" (
     set "OVERLAY_FLAG=-Overlay"
+    shift
+    goto parse_args
+)
+if /i "%~1"=="--electron" (
+    set "ELECTRON_FLAG=-ElectronVersion %~2"
+    shift
+    shift
+    goto parse_args
+)
+if /i "%~1"=="--harness" (
+    set "HARNESS_FLAG=-HarnessVersion %~2"
+    shift
+    shift
+    goto parse_args
+)
+if /i "%~1"=="--harness-commit" (
+    set "HARNESS_COMMIT_FLAG=-HarnessCommit %~2"
+    shift
     shift
     goto parse_args
 )
@@ -78,6 +102,6 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0build.ps1" -Target %TARGET% %NO_PROXY_FLAG% %SKIP_INSTALL_FLAG% %SKIP_SUBMODULE_FLAG% %SKIP_PULL_FLAG% %OVERLAY_FLAG%
+pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0build.ps1" -Target %TARGET% %NO_PROXY_FLAG% %SKIP_INSTALL_FLAG% %SKIP_SUBMODULE_FLAG% %SKIP_PULL_FLAG% %OVERLAY_FLAG% %ELECTRON_FLAG% %HARNESS_FLAG% %HARNESS_COMMIT_FLAG%
 
 exit /b %ERRORLEVEL%

@@ -62,11 +62,27 @@
   quick-build-overlay.bat 携带 -Overlay。
 
 .PARAMETER ElectronVersion
-  覆盖层使用的 Electron 版本（默认 44.5.1，即脚本原始版本）。仅在 -Overlay 时生效：
-  会把 <通道>/package.json 的 devDependencies.electron 改写为该版本，已装版本与之
-  不一致时自动补装依赖（含 Electron 头文件缓存与 dist 解包）。不指定时沿用默认版本；
-  需要临时换版本时在执行时指定，例如 -ElectronVersion 45.0.0。
-  当上游声明的版本与目标一致时自动跳过改写（构建上游原样）。
+  覆盖 Electron 版本（可选）。**不指定时使用上游声明的版本**：完全不改写
+  <通道>/package.json 的 electron，构建上游原样。仅在 -Overlay 时生效；指定后把
+  devDependencies.electron 改写为该版本，已装版本与之不一致时自动补装依赖（含 Electron
+  头文件缓存与 dist 解包）。
+  与 build-next.ps1 的 -ElectronVersion 同款语义（未指定 = 沿用上游声明）；上游声明与
+  目标一致时同样跳过改写。例：-ElectronVersion 45.0.0。
+
+.PARAMETER HarnessVersion
+  覆盖 deepseek-harness（dsh 运行时）版本（可选）。**不指定时使用上游 upstream.json
+  stable 通道声明的版本**：不固定、不改写任何文件，构建上游原样。指定后把 stable 通道
+  固定到该版本 —— 改写 upstream.json 的 commit / sourceVersion / runtimePackageVersion /
+  runtimeSource，以及当前通道工作区的 @deepseek-ai/dsh* 依赖与根 package.json resolutions。
+  该版本的 vendor/dsh-runtime/<版本>/manifest.json 必须已存在（由 yarn upstream:prepare-runtime
+  + node scripts/sync-vendored-runtime.mjs --write --channel stable 生成）。
+  目标版本与上游声明**不同**时必须同时给 -HarnessCommit。
+
+.PARAMETER HarnessCommit
+  -HarnessVersion 对应的 deepseek-harness commit（7-40 位十六进制 SHA，取
+  https://github.com/deepseek-ai/deepseek-harness.git 上 dsh-v<版本> 标签指向的 commit）。
+  仅在 -HarnessVersion 与上游声明版本**不同**时必需；未指定 -HarnessVersion，或目标版本
+  与上游声明相同时，自动取上游 upstream.json 里的 commit。
 
 .PARAMETER KeepTimestamps
   保留 Electron 官方 zip 的 1980-01-01 时间戳（可复现构建行为）。
@@ -77,6 +93,7 @@
   .\build.ps1 -Target package-dir              # 解包打包（无覆盖层）
   .\build.ps1 -Overlay -Target package-dir     # 应用本地覆盖层（quick-build-overlay 默认）
   .\build.ps1 -Overlay -Target package-dir -ElectronVersion 45.0.0   # 临时换 Electron 版本
+  .\build.ps1 -Target package-dir -HarnessVersion 0.2.1-alpha.1 -HarnessCommit 639ed015397290b3745d163aafe02ffee4aa3f84   # 换 dsh 运行时版本
   .\build.ps1 -Target build                    # 编译
   .\build.ps1 -Target dist-win-portable
   .\build.ps1 -Target dist-win -Proxy http://127.0.0.1:7890
@@ -116,10 +133,23 @@ param(
   [switch]$Overlay,
   [switch]$KeepTimestamps,
 
-  # 覆盖层 Electron 版本（仅在 -Overlay 时生效）。默认值 = 脚本原始版本：
-  # 不指定参数时行为与改造前完全一致；需要临时换版本时在执行时指定。
-  [ValidatePattern('^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?$')]
-  [string]$ElectronVersion = '44.5.1'
+  # 覆盖层 Electron 版本（仅在 -Overlay 时生效）。**未指定时使用上游声明的版本**：
+  # '' = 未指定 → 完全不改写 <通道>/package.json 的 electron（构建上游原样）；指定 → 改写为
+  # 该版本（需要临时换版本时在执行时传入，如 45.0.0）。与 build-next.ps1 同款语义。
+  # 校验模式允许空串（默认值 '' 表示未指定）。
+  [ValidatePattern('^(?:\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?)?$')]
+  [string]$ElectronVersion = '',
+
+  # deepseek-harness（dsh 运行时）版本覆盖。**未指定时使用上游 upstream.json stable 通道
+  # 声明的版本**（不固定 / 不改写）。指定时把 stable 通道固定到该版本，该版本的
+  # vendor/dsh-runtime/<版本>/ 必须已存在；与上游声明不同的目标必须同时给 -HarnessCommit。
+  [ValidatePattern('^(?:\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?)?$')]
+  [string]$HarnessVersion = '',
+
+  # -HarnessVersion 对应的 deepseek-harness commit（7-40 位十六进制）。仅在 -HarnessVersion
+  # 与上游声明版本不同时必需；其余情况自动取上游 upstream.json 里的 commit。
+  [ValidatePattern('^(?:[0-9a-fA-F]{7,40})?$')]
+  [string]$HarnessCommit = ''
 )
 
 Set-StrictMode -Version Latest
@@ -143,30 +173,39 @@ $script:GithubVersion = $null
 # 产品线固定为 stable：只构建 dsh-plugin-desktop（beta 通道已移除）
 $script:Channel = 'stable'
 $script:ChannelWsName = 'dsh-plugin-desktop'
-# 本地覆盖层：electron 目标版本。取值来源为 -ElectronVersion 参数（默认 '44.5.1'，
-# 即脚本原始版本）：不指定参数时构建行为与改造前一致；需要临时换版本时在执行时指定。
-# Set-ElectronOverride 在官方声明与目标一致时自动跳过覆盖（构建上游原样）；仅在需要
-# 强制指定其他版本时才实际改写（例如官方尚未跟进、本地确需更新的版本）。
+# 本地覆盖层：electron 目标版本。取值来源为 -ElectronVersion 参数 —— **未指定（''）时
+# 不覆盖，直接使用上游声明的版本**（构建上游原样）；与 build-next.ps1 的
+# Set-ElectronOverride 同款语义。Set-ElectronOverride 只在显式指定时才改写
+# <通道>/package.json，且官方声明与目标一致时同样跳过 —— 两者都不成立时才真正改写
+# （例如官方尚未跟进、本地确需更新的版本）。
 $script:ElectronOverride = $ElectronVersion
-# 是否由命令行显式指定（用于日志区分“脚本默认”与“参数指定”）。
+# 是否由命令行显式指定了**非空**版本（用于日志区分“上游声明”与“参数指定”）。
 $script:ElectronVersionExplicit = $MyInvocation.BoundParameters.ContainsKey('ElectronVersion')
-# deepseek-harness（dsh 运行时）版本固定：把 stable 通道固定到本地指定版本。当
-# upstream.json 已与这两个值一致（上游官方化后）时 Set-RuntimeVersionPinned 自动
-# 跳过（构建上游原样）；不一致时才固定（本地领先上游或需强制回落）。改版本 =
-# 改这两个值 + 重新生成 vendor/dsh-runtime/<版本>/（yarn upstream:prepare-runtime
-# && sync-vendored-runtime）。
-# 2026-09-29：上游 dsh-desktop master 的 stable 通道已官方化到 dsh 0.2.0-rc.2 ——
-# upstream.json: stable.commit=4878cdabd8 / sourceVersion=0.2.0-rc.2 /
-# runtimeSource=vendor/dsh-runtime/0.2.0-rc.2/manifest.json，仓库同时自带
-# patches\*@0.2.0-rc.2.patch（21 份）与上游 AA 发布记录（peers 只含 0.2.0-rc.2）。
-# 这两个值随之改为官方版本：Set-RuntimeVersionPinned 命中“已与官方一致”分支，
-# 不再改写 upstream.json / 依赖版本串 / 根 resolutions（旧的 0.1.7-rc.2 是本地降级，
-# 它会把本机 peer 联合范围撑成 “0.1.7-rc.2 || 0.2.0-rc.2”，使 AA 快路径永不成立）。
-# 要回退到别的 dsh 版本：改这两个值（commit 取 https://github.com/deepseek-ai/
-# deepseek-harness.git 上 dsh-v<版本> 标签指向的 commit），并确认该版本的
-# vendor/dsh-runtime/<版本>/ 与 patches/*@<版本>.patch 已存在。
-$script:RuntimeVersion = '0.2.0-rc.2'
-$script:HarnessCommit  = '4878cdabd87d4041bdaff61d04c966883b9fd07a'  # dsh-v0.2.0-rc.2 tag
+$script:ElectronOverrideActive = $script:ElectronVersionExplicit -and
+  (-not [string]::IsNullOrWhiteSpace($ElectronVersion))
+# deepseek-harness（dsh 运行时）版本：**未指定 -HarnessVersion 时使用上游 upstream.json
+# stable 通道声明的版本**（sourceVersion / commit），不做任何固定或改写 —— 构建上游原样。
+# 指定 -HarnessVersion 时才固定到该版本（与上游声明不同时必须同时给 -HarnessCommit）。
+#
+# ⚠️ 命名铁律：解析结果必须叫 $script:ResolvedRuntimeVersion / $script:ResolvedHarnessCommit，
+# **绝不能叫 $script:HarnessCommit** —— PowerShell 里「参数」就是脚本作用域变量，
+# $script:HarnessCommit 与参数 $HarnessCommit **是同一个变量**。2026-10-04 实际踩到：
+# 变量块先写 $script:HarnessCommit = <常量>，把用户传入的 -HarnessCommit 静默覆盖成常量，
+# 于是「版本与上游不同必须显式给 commit」的校验被绕过、直接固定到错误的 commit
+# （表现为 -HarnessCommit 被无声忽略）。改写脚本时不要把解析结果写回参数同名变量。
+#
+# 两个解析结果由 Resolve-HarnessVersion 在源码同步之后写入，此前为 $null 占位。
+# 上游声明优先从 `git show HEAD:upstream.json` 读取 —— 工作区那份可能已被上一次构建的
+# 固定改写（或已被覆盖层重置），不代表上游声明。
+# 基线参考（本脚本最近一次验证过的上游版本，仅供人工比对，不参与运行）：
+#   stable / dsh 0.2.0-rc.2 —— 但注意上游会把同一 sourceVersion 的 commit 前移
+#   （实测 4878cdabd8 → 639ed01539），所以 commit 一律以上游 upstream.json 为准。
+$script:HarnessVersionOverride = $HarnessVersion
+$script:HarnessCommitOverride = $HarnessCommit
+$script:HarnessOverrideActive = $MyInvocation.BoundParameters.ContainsKey('HarnessVersion') -and
+  (-not [string]::IsNullOrWhiteSpace($HarnessVersion))
+$script:ResolvedRuntimeVersion = $null
+$script:ResolvedHarnessCommit = $null
 # 排除 beta 通道：不再安装 dsh-plugin-desktop-beta 的依赖、不参与任何编译，
 # 其 manifest 也不再被 AA 准备脚本读取/改写。设为 $false 可临时恢复 beta。
 $script:DisableBeta = $true
@@ -277,7 +316,8 @@ function Initialize-Log {
     "root    : $script:Root"
     "src     : $script:Src"
     "target  : $Target"
-    "electron: $(if ($Overlay) { $script:ElectronOverride } else { 'upstream' })"
+    "electron: $(if ($Overlay -and $script:ElectronOverrideActive) { $script:ElectronOverride } else { 'upstream' })"
+    "harness : $(if ($script:HarnessOverrideActive) { $script:HarnessVersionOverride } else { 'upstream' })"
     "host    : $([System.Environment]::OSVersion.VersionString)"
     "arch    : $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
     ""
@@ -507,9 +547,13 @@ function Show-Environment {
     Write-Info "排除工作区  : $($excludedWs -join '、')（不安装依赖 / 不参与编译）"
   }
   if ($Overlay) {
-    $elFrom = if ($script:ElectronVersionExplicit) { '参数指定' } else { '脚本默认' }
-    Write-Info "Electron    : $script:ElectronOverride（$elFrom）"
+    $elDesc = if ($script:ElectronOverrideActive) { "$($script:ElectronOverride)（-ElectronVersion 指定）" }
+              else { '上游声明版本（未指定 -ElectronVersion，不覆盖）' }
+    Write-Info "Electron    : $elDesc"
   }
+  $harnessDesc = if ($script:HarnessOverrideActive) { "$($script:ResolvedRuntimeVersion)（-HarnessVersion 指定，commit $($script:ResolvedHarnessCommit.Substring(0, [Math]::Min(12, $script:ResolvedHarnessCommit.Length)))）" }
+                 else { "$($script:ResolvedRuntimeVersion)（上游 upstream.json 声明，未指定 -HarnessVersion，不固定）" }
+  Write-Info "dsh 运行时  : $harnessDesc"
   Write-Info "仓库根      : $script:Src"
   Write-Info "操作系统    : $([System.Environment]::OSVersion.VersionString)"
   Write-Info "架构        : $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
@@ -519,10 +563,14 @@ function Show-Environment {
   Write-Info "Git         : $git"
   Write-Info "上游仓库    : $($upstream.repository)"
   if ($channelInfo) {
-    Write-Info "上游 commit : $($channelInfo.commit)（$script:Channel 通道）"
+    # 这三个值来自**工作区** upstream.json，可能已被上一次构建的运行时固定改写（不带
+    # -Overlay 时不会重置），只作参考；本次构建真正使用的版本见下面「本次目标」。
+    Write-Info "上游 commit : $($channelInfo.commit)（$script:Channel 通道，工作区 upstream.json）"
     Write-Info "上游版本    : $($channelInfo.sourceVersion)"
     Write-Info "运行时包    : $($channelInfo.runtimePackageVersion)"
   }
+  $targetShort = if ($script:ResolvedHarnessCommit) { $script:ResolvedHarnessCommit.Substring(0, [Math]::Min(12, $script:ResolvedHarnessCommit.Length)) } else { '(未解析)' }
+  Write-Info "本次目标    : dsh $($script:ResolvedRuntimeVersion) @ $targetShort（$(if ($script:HarnessOverrideActive) { '-HarnessVersion 指定' } else { '上游声明' })）"
   Write-Info "GitHub HEAD  : $($script:GithubVersion.Short)"
   if ($NoProxy) {
     Write-Info "代理        : 已禁用"
@@ -561,6 +609,11 @@ function Initialize-Submodule {
   if (-not $channelInfo -or -not $channelInfo.commit) {
     throw "upstream.json 中找不到通道 $script:Channel 的 pinned commit。"
   }
+  # 目标 commit 取 Resolve-HarnessVersion 的解析结果：未指定 -HarnessVersion 时 = 上游
+  # upstream.json 声明的 commit；指定时 = 该覆盖版本对应的 commit。
+  # **不直接读工作区 upstream.json 的 commit**：那份可能残留上一次构建的固定值（不带
+  # -Overlay 构建时不会执行 Reset-OverlayTrackedFiles），会把子模块对齐到错误的 commit。
+  $targetCommit = if ($script:ResolvedHarnessCommit) { $script:ResolvedHarnessCommit } else { $channelInfo.commit }
   $harness = Join-Path $script:Src 'deepseek-harness'
   $harnessPkg = Join-Path $harness 'package.json'
 
@@ -574,15 +627,15 @@ function Initialize-Submodule {
   }
 
   $head = (git -C $harness rev-parse HEAD).Trim()
-  if ($head -ne $channelInfo.commit) {
-    Write-WarnLine "检出 commit 为 $head，期望 $($channelInfo.commit)（通道 $script:Channel），正在强制对齐 pinned commit。"
-    Invoke-External git @('-C', $harness, 'fetch', '--depth', '1', 'origin', $channelInfo.commit)
-    Invoke-External git @('-C', $harness, 'checkout', '--detach', $channelInfo.commit)
+  if ($head -ne $targetCommit) {
+    Write-WarnLine "检出 commit 为 $head，期望 $targetCommit（通道 $script:Channel），正在强制对齐 pinned commit。"
+    Invoke-External git @('-C', $harness, 'fetch', '--depth', '1', 'origin', $targetCommit)
+    Invoke-External git @('-C', $harness, 'checkout', '--detach', $targetCommit)
   }
 
   $head = (git -C $harness rev-parse HEAD).Trim()
-  if ($head -ne $channelInfo.commit) {
-    throw "上游子模块 HEAD=$head，与 upstream.json 中通道 $script:Channel 的 $($channelInfo.commit) 不一致。"
+  if ($head -ne $targetCommit) {
+    throw "上游子模块 HEAD=$head，与通道 $script:Channel 的目标 commit $targetCommit 不一致。"
   }
   Write-Ok "上游子模块已固定到 $head（通道 $script:Channel）"
 }
@@ -793,27 +846,30 @@ function Reset-OverlayTrackedFiles {
 
 function Set-ElectronOverride {
   # <channel>/package.json 的 devDependencies.electron → $script:ElectronOverride
-  # 官方声明已与 $script:ElectronOverride 一致时跳过（覆盖值 = 官方值则无需改写，
-  # 构建上游原样；仅在本地强制指定其他版本时才实际覆盖）。
+  # **未指定 -ElectronVersion 时完全不改写**（使用上游声明的版本，构建上游原样）；
+  # 官方声明已与覆盖目标一致时同样跳过。仅在显式指定了不同版本时才实际覆盖。
   $pkgPath = Get-ChannelWsPath 'package.json'
   if (-not (Test-Path -LiteralPath $pkgPath)) {
     throw "通道 $script:Channel 的工作区不存在：$pkgPath。请先同步到最新 master（双通道目录结构）。"
   }
   $text = Get-Content -LiteralPath $pkgPath -Raw -Encoding utf8
-  if ($text -match '("electron"\s*:\s*")([^"]+)(")') {
-    $current = $Matches[2]
-    if ($current -eq $script:ElectronOverride) {
-      Write-Info "electron 官方声明已与覆盖目标一致（$current），跳过版本覆盖。"
-      return $false
-    }
-    $fixed = [regex]::Replace($text, '("electron"\s*:\s*")([^"]+)(")', "`${1}$($script:ElectronOverride)`${3}", 1)
-    Set-Content -LiteralPath $pkgPath -Value $fixed -Encoding utf8 -NoNewline
-    Write-WarnLine "覆盖层：$script:ChannelWsName electron $current → $($script:ElectronOverride)"
-    return $true
-  } else {
+  if ($text -notmatch '("electron"\s*:\s*")([^"]+)(")') {
     Write-WarnLine "覆盖层：$pkgPath 中未找到 electron 声明，跳过。"
+    return $false
   }
-  return $false
+  $current = $Matches[2]
+  if (-not $script:ElectronOverrideActive) {
+    Write-Info "electron 使用上游声明版本（$current）：未指定 -ElectronVersion，跳过版本覆盖。"
+    return $false
+  }
+  if ($current -eq $script:ElectronOverride) {
+    Write-Info "electron 官方声明已与覆盖目标一致（$current），跳过版本覆盖。"
+    return $false
+  }
+  $fixed = [regex]::Replace($text, '("electron"\s*:\s*")([^"]+)(")', "`${1}$($script:ElectronOverride)`${3}", 1)
+  Set-Content -LiteralPath $pkgPath -Value $fixed -Encoding utf8 -NoNewline
+  Write-WarnLine "覆盖层：$script:ChannelWsName electron $current → $($script:ElectronOverride)"
+  return $true
 }
 
 function Set-AgeGateConfig {
@@ -1166,24 +1222,106 @@ function Set-MarketPatchDisabled {
 #   这里按 provenance 把相关工作区的依赖行对齐（幂等）。
 #   默认只对齐 stable；仅当 AA 脚本补丁未生效（上游改过格式、仍会校验 beta）时才继续
 #   对齐 beta，保证复用校验不失败。
-# 运行时版本固定：把 stable 通道固定到 $script:RuntimeVersion（deepseek-harness 子模块
-# commit / upstream.json / dsh-plugin-desktop 依赖 / 根 package.json resolutions）。
-# 当 upstream.json 已与 $script:RuntimeVersion / $script:HarnessCommit 一致（上游官方化）
-# 时自动跳过，构建上游原样；不一致时（本地领先上游或需强制回落）才固定。幂等。
+# 上游 upstream.json 里指定通道声明的运行时信息（$null = 读不到）。
+# 优先读 **git HEAD 里的** upstream.json：工作区那份可能已被上一次构建的运行时固定改写
+# （或已被覆盖层重置），不能代表“上游声明的版本”。git 读取失败（离线 / 非 git 工作区）时
+# 才回落到工作区文件。
+function Get-UpstreamStableChannel {
+  param([string]$ChannelName = $script:Channel)
+  $json = $null
+  try {
+    $raw = @(git -C $script:Src show 'HEAD:upstream.json' 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $raw.Count -gt 0) {
+      try { $json = ($raw -join [Environment]::NewLine) | ConvertFrom-Json } catch { $json = $null }
+    }
+  } catch { $json = $null }
+  if (-not $json) {
+    $upPath = Join-Path $script:Src 'upstream.json'
+    if (-not (Test-Path -LiteralPath $upPath)) { return $null }
+    $json = Get-JsonObject $upPath
+  }
+  if (-not $json -or -not ($json.PSObject.Properties.Name -contains 'channels')) { return $null }
+  $ch = $json.channels
+  if (-not $ch -or -not ($ch.PSObject.Properties.Name -contains $ChannelName)) { return $null }
+  return $ch.PSObject.Properties[$ChannelName].Value
+}
+
+# 决定本次构建使用的 deepseek-harness 运行时版本（必须在源码同步之后、任何依赖安装 /
+# 覆盖层应用之前调用）：
+#   -HarnessVersion 指定 → 固定到该版本（commit 取 -HarnessCommit；目标版本与上游声明相同
+#                          时可省略，自动取上游 commit）
+#   未指定               → 使用上游 upstream.json stable 通道声明的版本（不固定 / 不改写）
+function Resolve-HarnessVersion {
+  $stable = Get-UpstreamStableChannel
+  if (-not $stable) {
+    throw "无法读取上游 upstream.json 的 $($script:Channel) 通道（$script:Src）。请确认源码已同步（首次克隆不要用 -SkipPull），或改用 -HarnessVersion / -HarnessCommit 显式指定。"
+  }
+  $props = $stable.PSObject.Properties
+  $upVersion = if ($props.Name -contains 'sourceVersion') { [string]$props['sourceVersion'].Value } else { '' }
+  $upCommit = if ($props.Name -contains 'commit') { [string]$props['commit'].Value } else { '' }
+  if (-not $upVersion) {
+    throw "上游 upstream.json 的 $($script:Channel).sourceVersion 为空：$(Join-Path $script:Src 'upstream.json')"
+  }
+  $shortUp = if ($upCommit) { $upCommit.Substring(0, [Math]::Min(12, $upCommit.Length)) } else { '(无)' }
+
+  if (-not $script:HarnessOverrideActive) {
+    $script:ResolvedRuntimeVersion = $upVersion
+    $script:ResolvedHarnessCommit = $upCommit
+    Write-Info "dsh 运行时：使用上游声明 $upVersion（commit $shortUp）—— 未指定 -HarnessVersion，不固定。"
+  } else {
+    $v = $script:HarnessVersionOverride
+    $c = $script:HarnessCommitOverride
+    if ($v -eq $upVersion) {
+      if (-not $c) { $c = $upCommit }
+      Write-Info "dsh 运行时：-HarnessVersion $v 与上游声明一致，commit 取上游 $shortUp。"
+    } elseif (-not $c) {
+      throw "-HarnessVersion $v 与上游声明的 $upVersion 不同，必须同时指定 -HarnessCommit <sha>（取 https://github.com/deepseek-ai/deepseek-harness.git 上 dsh-v$v 标签指向的 commit）。"
+    } else {
+      Write-WarnLine "dsh 运行时：按 -HarnessVersion 固定到 $v（上游声明为 $upVersion）。"
+    }
+    if (-not $c) {
+      throw "-HarnessVersion $v 缺少对应的 deepseek-harness commit：请同时指定 -HarnessCommit（dsh-v$v 标签指向的 commit）。"
+    }
+    $script:ResolvedRuntimeVersion = $v
+    $script:ResolvedHarnessCommit = $c
+  }
+
+  # 该版本的 vendor 运行时产物必须齐备（否则后面固定出来的是半成品）。缺失时：
+  # 显式指定的版本 → 直接报错；随上游的版本 → 交由 Set-RuntimeVersionPinned 告警后继续。
+  if ($script:HarnessOverrideActive) {
+    $mp = Join-Path $script:Src ("vendor/dsh-runtime/$($script:ResolvedRuntimeVersion)" -replace '/', [IO.Path]::DirectorySeparatorChar)
+    $mp = Join-Path $mp 'manifest.json'
+    if (-not (Test-Path -LiteralPath $mp)) {
+      throw "运行时版本 $($script:ResolvedRuntimeVersion) 的 vendor manifest 缺失：$mp。请先运行 yarn upstream:prepare-runtime 与 node scripts/sync-vendored-runtime.mjs --write --channel stable 生成。"
+    }
+  }
+}
+
+# 运行时版本固定：把 stable 通道固定到 $script:ResolvedRuntimeVersion（deepseek-harness commit /
+# upstream.json / dsh-plugin-desktop 依赖 / 根 package.json resolutions）。
+# **$script:ResolvedRuntimeVersion 来自 Resolve-HarnessVersion**：
+#   - 未指定 -HarnessVersion → = 上游 upstream.json 声明的版本 → 本函数**不做任何固定**
+#     （直接使用上游声明，构建上游原样）；
+#   - 指定了 -HarnessVersion   → 与上游一致时跳过、不一致时才固定（幂等）。
 # vendor/dsh-runtime/<版本>/ 由上游 sync 流程生成（yarn upstream:prepare-runtime
 # + node scripts/sync-vendored-runtime.mjs --write --channel stable）。
 function Set-RuntimeVersionPinned {
-  $v = $script:RuntimeVersion
+  $v = $script:ResolvedRuntimeVersion
   $vendorRelative = "vendor/dsh-runtime/$v"
   $manifestPath = Join-Path $script:Src ($vendorRelative -replace '/', [IO.Path]::DirectorySeparatorChar)
   $manifestPath = Join-Path $manifestPath 'manifest.json'
-  if (-not (Test-Path -LiteralPath $manifestPath)) {
-    throw "运行时版本 $v 的 vendor manifest 缺失：$manifestPath。请先运行 yarn upstream:prepare-runtime 与 node scripts/sync-vendored-runtime.mjs --write --channel stable 生成。"
-  }
-  $manifest = Get-JsonObject $manifestPath
   $entryByName = @{}
-  foreach ($p in @($manifest.packages)) { $entryByName[$p.name] = $p.filename }
-  if ($entryByName.Count -eq 0) { throw "运行时 manifest 为空：$manifestPath" }
+  if (Test-Path -LiteralPath $manifestPath) {
+    $manifest = Get-JsonObject $manifestPath
+    foreach ($p in @($manifest.packages)) { $entryByName[$p.name] = $p.filename }
+    if ($entryByName.Count -eq 0) { throw "运行时 manifest 为空：$manifestPath" }
+  } elseif ($script:HarnessOverrideActive) {
+    # 显式指定的版本必须自带 vendor 产物，否则固定出来的是半成品
+    throw "运行时版本 $v 的 vendor manifest 缺失：$manifestPath。请先运行 yarn upstream:prepare-runtime 与 node scripts/sync-vendored-runtime.mjs --write --channel stable 生成。"
+  } else {
+    # 未指定 -HarnessVersion：按上游声明继续（上游若真缺产物，会在后续解析/安装阶段失败）
+    Write-WarnLine "运行时版本 $v（上游声明）的 vendor manifest 缺失：$manifestPath —— 继续按上游声明构建。"
+  }
 
   # 0) AA provenance 同步（始终执行，不受下方“官方一致跳过”影响）：
   #    runtimePeers 是 AA prepare 复用检查的关键条件。必须与 AA policy 的
@@ -1247,15 +1385,25 @@ function Set-RuntimeVersionPinned {
     }
   }
 
-  # 0b) 官方一致 → 跳过：upstream.json stable 已指向脚本固定的 commit + 版本
+  # 0b) 未指定 -HarnessVersion → 使用上游 upstream.json 声明的版本，不做任何固定/改写。
+  #     $script:ResolvedRuntimeVersion / $script:ResolvedHarnessCommit 已被 Resolve-HarnessVersion 置为上游
+  #     值（从 `git show HEAD:upstream.json` 读取），因此这里直接返回即可 ——
+  #     upstream.json / 依赖版本串 / 根 resolutions 全部保持上游原样。
+  #     注意：§0 的 AA provenance 同步仍照常执行（与版本固定正交，见上）。
+  if (-not $script:HarnessOverrideActive) {
+    Write-Info "运行时版本使用上游声明（dsh $v @ $($script:ResolvedHarnessCommit.Substring(0, [Math]::Min(12, $script:ResolvedHarnessCommit.Length)))）：未指定 -HarnessVersion，不做本地固定。"
+    return
+  }
+
+  # 0c) 显式指定的版本与官方一致 → 跳过：upstream.json stable 已指向该 commit + 版本
   #     （runtimeSource 也随版本一致），无需改写 upstream.json / dsh 依赖 / resolutions
   #     （AA provenance 已在 0) 同步完成，不在此跳过范围）。
   $upPath = Join-Path $script:Src 'upstream.json'
   if (Test-Path -LiteralPath $upPath) {
     $upNow = Get-JsonObject $upPath
     $stableNow = $upNow.channels.stable
-    if ($stableNow.commit -eq $script:HarnessCommit -and $stableNow.sourceVersion -eq $v) {
-      Write-Info "运行时版本已与官方一致（dsh $v @ $($script:HarnessCommit.Substring(0,10))），跳过本地固定。"
+    if ($stableNow.commit -eq $script:ResolvedHarnessCommit -and $stableNow.sourceVersion -eq $v) {
+      Write-Info "运行时版本已与官方一致（dsh $v @ $($script:ResolvedHarnessCommit.Substring(0,10))），跳过本地固定。"
       return
     }
   }
@@ -1263,7 +1411,7 @@ function Set-RuntimeVersionPinned {
   # 1) upstream.json：stable 通道的 commit / 版本 / runtimeSource 固定
   $up = Get-JsonObject $upPath
   $stable = $up.channels.stable
-  $stable.commit = $script:HarnessCommit
+  $stable.commit = $script:ResolvedHarnessCommit
   $stable.sourceVersion = $v
   $stable.runtimePackageVersion = $v
   $stable.runtimeSource = "$vendorRelative/manifest.json"
@@ -1395,7 +1543,7 @@ function Set-RuntimeVersionPinned {
   $rootPkg.resolutions = $newRes
   Set-Content -LiteralPath $rootPkgPath -Value (ConvertTo-Json $rootPkg -Depth 100) -Encoding utf8 -NoNewline
 
-  Write-Ok "运行时版本已固定：dsh $v（commit $($script:HarnessCommit.Substring(0,10))，$($entryByName.Count) 个包）"
+  Write-Ok "运行时版本已固定：dsh $v（commit $($script:ResolvedHarnessCommit.Substring(0,10))，$($entryByName.Count) 个包）"
 }
 
 function Set-AAVendorDependency {
@@ -1711,7 +1859,7 @@ function Apply-SrcOverlay {
 # 才需要重新打包并再次固化。
 # 对策②（2026-09-29 新增，因运行时改为跟随上游 0.2.0-rc.2 而必需）：覆盖层只在本机
 # 发布**确实与当前配置匹配**时才恢复 —— 恢复前核对 overlay\aa\record.json 记录的
-# runtimeVersion 是否等于 $script:RuntimeVersion。理由：pin 一旦等于上游版本，peer 联合
+# runtimeVersion 是否等于 $script:ResolvedRuntimeVersion。理由：pin 一旦等于上游版本，peer 联合
 # 范围就与上游自带的那份发布完全一致，此时上游自己 commit 在仓库里的产物（同名
 # r27dbe9f7）才是快路径该用的；若仍按旧记录把本机那份（异 hash、异 peers）盖上去，
 # 快路径必然不成立 → 全量重打包 → 重新打包出来的产物与上游同名却字节不同 → 直接被
@@ -1743,9 +1891,9 @@ function Restore-AaVendorPublication {
     if ($record.artifact) {
       $recordedArtifact = Join-Path $script:AaOverlayDir $record.artifact
       $recordVersion = Get-AaOverlayRuntimeVersion
-      if ($recordVersion -ne $script:RuntimeVersion) {
+      if ($recordVersion -ne $script:ResolvedRuntimeVersion) {
         $label = if ($recordVersion) { $recordVersion } else { '未知（旧格式，无 record.json）' }
-        Write-WarnLine "AA 覆盖层：本机发布记录面向运行时 $label，与当前固定的 $($script:RuntimeVersion) 不匹配 → 跳过恢复，" +
+        Write-WarnLine "AA 覆盖层：本机发布记录面向运行时 $label，与当前固定的 $($script:ResolvedRuntimeVersion) 不匹配 → 跳过恢复，" +
           '改用上游自带的发布记录（若上游产物同样不匹配，AA 会重新打包并在成功后重新固化本覆盖层）。'
       } elseif (Test-Path -LiteralPath $recordedArtifact) {
         New-Item -ItemType Directory -Force -Path $script:AaVendorDir | Out-Null
@@ -1794,8 +1942,8 @@ function Export-AaVendorPublication {
   if ((Test-Path -LiteralPath $recordPath) -and
       ((Get-FileHash $recordPath -Algorithm SHA256).Hash -eq (Get-FileHash $vendorProv -Algorithm SHA256).Hash) -and
       (Test-Path -LiteralPath (Join-Path $script:AaOverlayDir $prov.artifact)) -and
-      ((Get-AaOverlayRuntimeVersion) -eq $script:RuntimeVersion)) {
-    Write-Info "AA 覆盖层：本机发布未变化（$($prov.artifact)，运行时 $($script:RuntimeVersion)），无需固化。"
+      ((Get-AaOverlayRuntimeVersion) -eq $script:ResolvedRuntimeVersion)) {
+    Write-Info "AA 覆盖层：本机发布未变化（$($prov.artifact)，运行时 $($script:ResolvedRuntimeVersion)），无需固化。"
     return
   }
   New-Item -ItemType Directory -Force -Path $script:AaOverlayDir | Out-Null
@@ -1806,13 +1954,13 @@ function Export-AaVendorPublication {
   Copy-Item -LiteralPath $artifactPath -Destination (Join-Path $script:AaOverlayDir $prov.artifact) -Force
   Copy-Item -LiteralPath $vendorProv -Destination $recordPath -Force
   Set-Content -LiteralPath (Join-Path $script:AaOverlayDir 'record.json') -Encoding utf8 -NoNewline -Value (ConvertTo-Json ([ordered]@{
-        runtimeVersion = $script:RuntimeVersion
-        harnessCommit  = $script:HarnessCommit
+        runtimeVersion = $script:ResolvedRuntimeVersion
+        harnessCommit  = $script:ResolvedHarnessCommit
         artifact       = $prov.artifact
         recordedAt     = (Get-Date).ToString('s')
       }) -Depth 5)
   $kb = [math]::Round((Get-Item -LiteralPath $artifactPath).Length / 1KB)
-  Write-WarnLine "AA 覆盖层：本机发布已固化 → overlay\aa\$($prov.artifact)（$kb KB，运行时 $($script:RuntimeVersion)），下次 pull 后自动恢复"
+  Write-WarnLine "AA 覆盖层：本机发布已固化 → overlay\aa\$($prov.artifact)（$kb KB，运行时 $($script:ResolvedRuntimeVersion)），下次 pull 后自动恢复"
 }
 
 function Invoke-ChannelOverlayPreInstall {
@@ -2282,7 +2430,8 @@ try {
 
   Initialize-Log
   Invoke-Step '获取 / 更新 dsh-desktop 源码' { Ensure-Source }
-  Invoke-Step "固定运行时版本（deepseek-harness $($script:RuntimeVersion)）" { Set-RuntimeVersionPinned }
+  Invoke-Step '解析 deepseek-harness 运行时版本（-HarnessVersion / 上游声明）' { Resolve-HarnessVersion }
+  Invoke-Step "固定运行时版本（deepseek-harness $($script:ResolvedRuntimeVersion)）" { Set-RuntimeVersionPinned }
   $script:GithubVersion = Get-GithubVersion
   Invoke-VersionGuard
   Show-Environment
@@ -2312,8 +2461,8 @@ try {
     # （上游更新过依赖 / 覆盖层改过 electron 都会改变锁文件 → 必须补装，否则打包崩溃）。
     $needInstall = @()
     $installedElectron = Test-InstalledElectron
-    if ($Overlay -and $installedElectron -and $installedElectron -ne $script:ElectronOverride) {
-      $needInstall += "electron 已装 $installedElectron ≠ 覆盖层目标 $($script:ElectronOverride)"
+    if ($Overlay -and $script:ElectronOverrideActive -and $installedElectron -and $installedElectron -ne $script:ElectronOverride) {
+      $needInstall += "electron 已装 $installedElectron ≠ 覆盖目标 $($script:ElectronOverride)"
     }
     $state = Read-BuildState
     $lastLockHash = $null

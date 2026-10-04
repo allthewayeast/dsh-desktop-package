@@ -10,15 +10,20 @@ echo   - Align dsh-desktop submodule to pinned commit (overlay reset, then re-ap
 echo   - Skip submodule update
 echo   - Run yarn install (fast when cached; always keeps deps in sync with the
 echo     freshly pulled code - never skip it or packaging can crash)
-echo   - Apply local overlays: electron (default 44.4.3), npmMinimalAgeGate,
-echo     npmRebuild, tray icons, pnpm.mjs patch
+echo   - Apply local overlays: npmMinimalAgeGate, npmRebuild, tray icons,
+echo     pnpm.mjs patch
 echo   - Build and package dsh-plugin-desktop to dist\win-unpacked
 echo   - NOT create any ZIP package
 echo.
-echo Optional: extra build.ps1 arguments are forwarded, e.g.
-echo   quick-build-overlay.bat -ElectronVersion 45.0.0
+echo Electron / dsh runtime versions FOLLOW THE UPSTREAM DECLARATION by default.
+echo Extra arguments are forwarded to build.ps1, e.g.
+echo   quick-build-overlay.bat -ElectronVersion 44.5.1
+echo   quick-build-overlay.bat -HarnessVersion 0.2.0-rc.2
+echo   quick-build-overlay.bat -HarnessVersion 0.2.1-alpha.1 -HarnessCommit ^<sha^>
+echo Do NOT repeat -Target / -Overlay / -SkipSubmodule here: duplicate named
+echo parameters are a hard error under pwsh -File.
 echo.
 rem echo Press Ctrl+C to cancel, or
 rem pause
 echo.
-pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0build.ps1" -Target package-dir -Overlay -SkipSubmodule -ElectronVersion 44.5.1
+pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0build.ps1" -Target package-dir -Overlay -SkipSubmodule %*

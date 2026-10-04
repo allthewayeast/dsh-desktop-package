@@ -187,7 +187,10 @@ pwsh -File .\build-next.ps1 -Target package-dir -SkipSubmodule   # 等同 bat
 
 `-Overlay` 开关在构建前应用本地定制（每次构建先重置子模块再注入，保证可复现）：
 
-- electron 对齐到 `-ElectronVersion`（默认值见 `build.ps1` 参数；与上游官方声明一致时**跳过**不改写）
+- electron **跟随上游声明**（不改写）；需要临时换版本时传 `-ElectronVersion <版本>`，
+  例如 `-Overlay -ElectronVersion 45.0.0`。与上游声明一致时同样跳过改写
+- dsh 运行时（deepseek-harness）**跟随上游 `upstream.json` stable 通道声明**（不固定）；
+  需要换版本时传 `-HarnessVersion <版本>`（与上游声明不同时必须同时给 `-HarnessCommit <sha>`）
 - `.yarnrc.yml` 追加 `npmMinimalAgeGate: 0`（允许使用刚发布的版本）
 - 定制托盘 / 应用图标（源在仓库 `build/` 目录）
 - `overlay/src/*.ts` 复制为 `dsh-plugin-desktop` 新文件（`startup-config.ts` 及其测试）
@@ -207,6 +210,53 @@ pwsh -File .\build-next.ps1 -Target package-dir -SkipSubmodule   # 等同 bat
    它们由 `Set-ElectronOverride` / `Set-AllArtifactVerifyDisabled` 管理，写进补丁会互相打架。
 2. **需要同时满足多版本的补丁要用 `git diff -U1`** 最小上下文导出，
    并加进 `NoAutoExportPatchFiles`，防止被自动导出覆盖回 `-U3` 版本。
+
+### 版本覆盖参数（`-ElectronVersion` / `-HarnessVersion`）
+
+两个版本都遵循同一条规则：**不指定 = 使用上游声明的版本，不改写任何文件；指定 = 覆盖**。
+
+| 参数 | 不指定时 | 指定时 | 作用范围 |
+|------|----------|--------|----------|
+| `-ElectronVersion <版本>` | 用上游 `<通道>/package.json` 里的 `devDependencies.electron`（**完全不改写**） | 改写为该版本；已装版本不一致时自动补装依赖（含 Electron 头文件缓存与 dist 解包） | 仅 `-Overlay` 生效 |
+| `-HarnessVersion <版本>` | 用上游 `upstream.json` stable 通道的 `sourceVersion` / `commit`（**不固定、不改写**） | 改写 `upstream.json`（commit / sourceVersion / runtimePackageVersion / runtimeSource）+ 当前通道工作区 `@deepseek-ai/dsh*` 依赖 + 根 `resolutions` | 与 `-Overlay` 无关 |
+| `-HarnessCommit <sha>` | 自动取上游 `upstream.json` 的 `commit` | 用指定 commit | 仅当 `-HarnessVersion` 与上游声明**不同**时必需 |
+
+```powershell
+.\build.ps1 -Overlay -Target package-dir                              # 两个版本都随上游
+.\build.ps1 -Overlay -Target package-dir -ElectronVersion 45.0.0      # 只换 Electron
+.\build.ps1 -Target package-dir -HarnessVersion 0.2.0-rc.2             # 与上游同版本，自动取上游 commit
+.\build.ps1 -Target package-dir -HarnessVersion 0.2.1-alpha.1 `
+                                   -HarnessCommit 639ed015397290b3745d163aafe02ffee4aa3f84  # 换到别的 dsh 版本
+```
+
+**运行时版本的读取来源是 `git show HEAD:upstream.json`，不是工作区文件。** 因为工作区那份可能已被上一次构建的版本固定改写（或已被覆盖层重置），不代表上游声明。解析在 `[01]` 源码同步之后、任何依赖安装之前进行（`Resolve-HarnessVersion`，独立步骤），随后 `Set-RuntimeVersionPinned` 据此决定是否固定。
+
+**为什么必须允许「不指定」：** 2026-10-04 实测发现上游把 stable 的 `commit` 从 `4878cdabd8` 前移到 `639ed01539`（`sourceVersion` 仍是 `0.2.0-rc.2`）。旧实现里脚本硬编码的 pin 是 `4878cdabd8`，而「官方一致即跳过」分支要求 **commit 与版本双相等**，于是每次都**不命中**跳过、每次都把上游的 commit 改写回旧的 `4878cdabd8` —— 即构建产物向上游**回退**一个 commit，且只看版本号完全看不出来。改为「未指定即随上游」后该问题不再发生。判据：
+
+```powershell
+cd X:\dsh-desktop-package
+git -C dsh-desktop show HEAD:upstream.json | ConvertFrom-Json | % { $_.channels.stable }   # 上游声明（真身）
+Get-Content dsh-desktop\upstream.json -Raw | ConvertFrom-Json | % { $_.channels.stable }   # 工作区（可能已被固定改写）
+```
+
+**目标版本的 vendor 产物必须齐备**：`-HarnessVersion` 指定的版本要求
+`vendor/dsh-runtime/<版本>/manifest.json` 已存在（由 `yarn upstream:prepare-runtime` +
+`node scripts/sync-vendored-runtime.mjs --write --channel stable` 生成），否则直接报错；
+随上游的版本若缺产物则只告警并继续（交由后续解析/安装阶段暴露真实原因）。
+
+**实测值（2026-10-04，随上游刷新，仅供参考）**：stable 通道 = dsh `0.2.0-rc.2` @ `639ed01539`；
+上游 `devDependencies.electron` = **`44.0.0`**（不是 44.5.1 —— 44.5.1 是历次 `-ElectronVersion 44.5.1`
+构建覆写在工作区 `package.json` 里的残留，读工作区会看错）。
+
+#### ⚠️ 改写本节逻辑时的命名铁律（已实际踩过）
+
+解析结果**必须**叫 `$script:ResolvedRuntimeVersion` / `$script:ResolvedHarnessCommit`，
+**绝不能叫 `$script:HarnessCommit`**。PowerShell 里「参数」就是脚本作用域变量，于是
+`$script:HarnessCommit` 与参数 `$HarnessCommit` **是同一个变量**：变量块里写
+`$script:HarnessCommit = <常量>`，就把用户传入的 `-HarnessCommit` 静默覆盖成该常量，
+导致「目标版本与上游不同时必须显式给 commit」的校验被绕过、直接固定到错误的 commit。
+症状极隐蔽：不报错、不看 commit 值就发现不了，`-HarnessCommit` 表现为「传了没用」。
+同理，不要新建与任何参数同名的 `$script:` 变量（现有参数见 `build.ps1` 的 `param()` 块）。
 
 ## 故障排查
 
@@ -240,25 +290,30 @@ logs\build-YYYYMMDD-HHMMSS.log
 
 **附：版本固定点速查。** 「装错运行时 / 版本不匹配」类问题先看这几处：
 
-| 常量 / 文件 | 位置 | 说明 |
+| 常量 / 参数 | 位置 | 说明 |
 |------|------|------|
-| `$script:RuntimeVersion` | `build.ps1` | 固定的 dsh 运行时版本 |
-| `$script:HarnessCommit` | `build.ps1` | `deepseek-harness` 子模块对齐的 commit（取 `dsh-v<版本>` 标签指向的 commit） |
-| `$script:ElectronOverride` | `build.ps1` | = `-ElectronVersion` 参数；与官方声明一致时跳过 |
-| `upstream.json` | `dsh-desktop\upstream.json` | 各通道的 `commit` / `sourceVersion` / `runtimeSource` |
+| `-ElectronVersion` → `$script:ElectronOverride` | `build.ps1` | Electron 版本覆盖；**不指定 = 随上游** `devDependencies.electron`，与官方声明一致时跳过改写 |
+| `-HarnessVersion` → `$script:ResolvedRuntimeVersion` | `build.ps1` | dsh 运行时版本；**不指定 = 随上游** `upstream.json` stable 的 `sourceVersion` |
+| `-HarnessCommit` → `$script:ResolvedHarnessCommit` | `build.ps1` | 目标 `deepseek-harness` commit；未显式给时自动取上游 `upstream.json` 的 `commit` |
+| `$script:HarnessVersionOverride` / `$script:HarnessCommitOverride` | `build.ps1` | 命令行传入的覆盖值（解析前捕获；**勿与 `Resolved*` 混用**，见 6.6 命名铁律） |
+| `upstream.json` | `dsh-desktop\upstream.json` | 各通道的 `commit` / `sourceVersion` / `runtimeSource`。⚠️ **工作区那份可能已被上一次构建固定改写**，上游真身要看 `git show HEAD:upstream.json` |
 
-改版本时要**同时**改这些值并确认对应的 `vendor/dsh-runtime/<版本>/` 与 `patches/*@<版本>.patch` 已存在。
+换版本**用参数**（`-ElectronVersion` / `-HarnessVersion`，后者与上游声明不同时加 `-HarnessCommit`），
+不要改常量；并确认目标版本的 `vendor/dsh-runtime/<版本>/` 与 `patches/*@<版本>.patch` 已存在。
 
-一致性检查（两者应相同）：
+一致性检查（三者应相同）——注意**上游声明要读 git，不能读工作区文件**：
 
 ```powershell
 cd X:\dsh-desktop-package
-$u = Get-Content dsh-desktop\upstream.json -Raw | ConvertFrom-Json
-"upstream <通道>.commit = " + $u.channels.stable.commit
+$up = git -C dsh-desktop show HEAD:upstream.json | ConvertFrom-Json    # 上游真身
+$wk = Get-Content dsh-desktop\upstream.json -Raw | ConvertFrom-Json    # 工作区（可能被固定改写）
+"上游声明 stable.commit = " + $up.channels.stable.commit
+"工作区   stable.commit = " + $wk.channels.stable.commit
 "submodule HEAD         = " + (git -C dsh-desktop\deepseek-harness rev-parse HEAD)
 ```
 
-不一致说明子模块没对齐——常见于用了 `-SkipSubmodule`，或子模块还停在旧 commit。
+未指定 `-HarnessVersion` 时前两者应相同；不同就说明工作区残留了上一次构建的固定值
+（跑一次不带 `-Overlay` 的构建不会重置它），用 `git -C dsh-desktop checkout -- upstream.json` 清掉。
 
 ---
 
@@ -688,7 +743,8 @@ node tools\dsh-session-read.mjs find "dsh-community-market" "$env:TEMP\dsh-plain
   `dsh-plugin-desktop/package.json` 等。
 - **`Set-RuntimeVersionPinned`**（`build.ps1`）：pull 后把**当前通道工作区**
   （stable → `dsh-plugin-desktop`）的 `@deepseek-ai/dsh*` 依赖改写成 pin 的
-  `$script:RuntimeVersion`。**自 2026-10-04 起不再改写 `dsh-community-market`**（见 6.5）。
+  `$script:ResolvedRuntimeVersion`（**只在你显式传了 `-HarnessVersion` 时才动手**；
+  未指定时该值 = 上游声明，函数直接返回不改写）。**自 2026-10-04 起不再改写 `dsh-community-market`**（见 6.5）。
   因此 `$exact` 里的 market 条目现在只是**幂等安全网**（清残留），已没有对应的写入方。
 
 **历史行为（已移除）**：`dsh-community-market/package.json` 曾被注入 99 行版本串改写 ——
