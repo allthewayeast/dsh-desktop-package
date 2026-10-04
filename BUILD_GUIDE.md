@@ -679,24 +679,24 @@ node tools\dsh-session-read.mjs find "dsh-community-market" "$env:TEMP\dsh-plain
 | `dsh-plugin-desktop/package.json` | `overlay/patches/package.json.patch`（ASAR） |
 | `dsh-plugin-desktop/src/main.ts`、`scripts/verify-packaged-runtime.ts` | 对应 overlay 补丁 |
 | `scripts/prepare-dsh-market.mjs`、`scripts/agents-anywhere-release-policy.mjs`、`upstream.json`、`yarn.lock` | `Disable-MarketWorkspaceCheck` / AA 对齐 / 版本固定 |
-| `dsh-community-market/package.json` | `Set-RuntimeVersionPinned` 改写 `@deepseek-ai/dsh*` 版本串 |
+| `dsh-community-market/package.json` | **不再出现**（2026-10-04 起）：构建期已不改写它，见 6.5 |
 
 关键是**一对方向相反、互相抵消的操作**，不是丢改动：
 
 - **`Reset-OverlayTrackedFiles`**（`build.ps1`）：pull 前把一批受跟踪文件 `git checkout --`
   还原成**上游原始状态**。名单是函数内的 `$exact` 数组，含 `dsh-community-market/package.json`、
   `dsh-plugin-desktop/package.json` 等。
-- **`Set-RuntimeVersionPinned`**（`build.ps1`）：pull 后再把 `@deepseek-ai/dsh*` 依赖统一改写成
-  pin 的 `$script:RuntimeVersion`。
+- **`Set-RuntimeVersionPinned`**（`build.ps1`）：pull 后把**当前通道工作区**
+  （stable → `dsh-plugin-desktop`）的 `@deepseek-ai/dsh*` 依赖改写成 pin 的
+  `$script:RuntimeVersion`。**自 2026-10-04 起不再改写 `dsh-community-market`**（见 6.5）。
+  因此 `$exact` 里的 market 条目现在只是**幂等安全网**（清残留），已没有对应的写入方。
 
-以 `dsh-community-market/package.json` 为例（2026-10 实测，99 增 99 删、无键增删）：
+**历史行为（已移除）**：`dsh-community-market/package.json` 曾被注入 99 行版本串改写 ——
+`peerDependencies` 的 `0.2.0-rc.2 || 0.2.1-alpha.1` 被压成 `0.2.0-rc.2`（42 处），其余 dsh
+依赖的 `0.2.1-alpha.1` 被改成 `0.2.0-rc.2`（57 处）。该行为自 0.1.5 时代（`62dc01b`）就存在，
+不是某次改动引入的。**现在 market 保持上游原样，这份 diff 不再出现**（原因与实测见 6.5）。
 
-| hunk | 上游值 | 注入后 |
-|------|--------|--------|
-| `-89,42`（`peerDependencies`） | `0.2.0-rc.2 \|\| 0.2.1-alpha.1` | `0.2.0-rc.2` |
-| `-216,57` | `0.2.1-alpha.1` | `0.2.0-rc.2` |
-
-该行为自 0.1.5 时代（`62dc01b`）就存在，**不是某次改动引入的**。判定某个 modified 是否纯注入：
+判定某个 modified 是否纯注入（把 `--` 后面的路径换成待查文件）：
 
 ```powershell
 $repo = 'X:\dsh-desktop-package\dsh-desktop'
@@ -706,6 +706,40 @@ $d = & git -C $repo diff --unified=0 -- dsh-community-market/package.json
 ```
 
 出现**非版本串**的增删行（键名增删、逻辑行）时，才需要怀疑是人改的。
+
+#### 6.5 为什么 `dsh-community-market` 保持上游原样（2026-10-04 起）
+
+`Set-RuntimeVersionPinned` 第 2 步原先同时改写 `dsh-plugin-desktop` 与 `dsh-community-market`
+的 `@deepseek-ai/dsh*` 依赖，现**只改写当前通道工作区**，market 不再被触碰。
+
+上游在 market 里刻意声明多通道版本串（HEAD `a1ff68b2` 实测）：
+
+| 位置 | 上游声明 | 处数 |
+|------|---------|------|
+| `peerDependencies` | `0.2.0-rc.2 \|\| 0.2.1-alpha.1` | 42 |
+| 其余 dsh 依赖 | `0.2.1-alpha.1` | 57 |
+
+**旧理由已失效**：当年把 market 加进来，是为防 “Yarn 嵌套安装旧版副本，与 pin 的 rc.2 类型定义
+冲突 → TS2717/TS2344”。但上游现在自带 `vendor/dsh-runtime/0.2.1-alpha.1/manifest.json`，并在根
+`package.json` 的 `resolutions` 里提供 **321 条** `@deepseek-ai/dsh-*@npm:0.2.1-alpha.1` 选择器
+（dsh 相关选择器共 1278 条），全部指向 `file:vendor/dsh-runtime/0.2.1-alpha.1/*.tgz`。market 的
+beta 依赖因此被解析到**仓库内已存在的 vendor 产物**，不会去 registry 拉嵌套副本。
+
+2026-10-04 实测（改动后，market 已还原为上游原样）：
+
+| 步骤 | 结果 |
+|------|------|
+| `corepack yarn install` | exit 0 · 新增 73 个包 / +15.31 MiB（alpha.1 的 vendor 产物） |
+| `corepack yarn workspace dsh-community-market build` | exit 0 · `tsc` 全量编译 + `verify-client-externals` 通过（12 个 client external 全部已声明） |
+| `corepack yarn install --immutable` | exit 0 · lockfile 自洽 |
+| 三轮之后 `git diff --quiet -- dsh-community-market/package.json` | 无差异 ✓ |
+
+install 会输出 `YN0002`（market 未在自己 `peerDependencies` 里声明部分 dsh 包）告警，属上游声明
+形态所致，退出码仍为 0，不影响构建。
+
+**恢复方式**：把 `build.ps1` 里 `$pkgPaths` 数组中那行注释
+（`# (Join-Path $script:Src 'dsh-community-market\package.json')`）取消注释即可。仅当上游恢复
+“无 resolutions 覆盖 + 从 registry 拉包”的形态时才需要这样做。
 
 ---
 
@@ -735,8 +769,8 @@ $d = & git -C $repo diff --unified=0 -- dsh-community-market/package.json
 - `dsh-desktop\upstream.json` - 上游 deepseek-harness 版本信息（子模块）
 - `dsh-desktop\.yarn\patches\` - 工作区依赖补丁（上游跟踪文件；其中 `dshmarket-desktop.patch`
   仍在但**不再被引用**，见 `Set-MarketPatchDisabled`）
-- `dsh-desktop\dsh-community-market\package.json` - 市场工作区；构建期被 `Set-RuntimeVersionPinned`
-  改写版本串，pull 前由 `Reset-OverlayTrackedFiles` 还原（详见「六、溯源与防丢」6.4）
+- `dsh-desktop\dsh-community-market\package.json` - 市场工作区。**2026-10-04 起构建期不再改写它**，
+  保持上游原样（详见「六、溯源与防丢」6.5）；pull 前仍由 `Reset-OverlayTrackedFiles` 还原，作幂等安全网
 
 ### 诊断用
 

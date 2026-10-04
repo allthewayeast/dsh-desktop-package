@@ -744,6 +744,8 @@ function Reset-OverlayTrackedFiles {
       'package.json',
       'dsh-plugin-desktop/package.json',
       'dsh-plugin-desktop-beta/package.json',
+      # market：构建期已不再改写它（见 Set-RuntimeVersionPinned 第 2 步）。保留此条目
+      # 仅用于丢弃历史遗留的本地改动，是幂等安全网，不产生任何写入。
       'dsh-community-market/package.json',
       'dsh-plugin-desktop/scripts/package-dir.mjs',
       'scripts/prepare-agents-anywhere-release.mjs',
@@ -1267,12 +1269,22 @@ function Set-RuntimeVersionPinned {
   $stable.runtimeSource = "$vendorRelative/manifest.json"
   Set-Content -LiteralPath $upPath -Value (ConvertTo-Json $up -Depth 10) -Encoding utf8 -NoNewline
 
-  # 2) dsh-plugin-desktop + dsh-community-market 的 @deepseek-ai/dsh* 依赖 → $v
-  #    （上游 stable 两包同版本；market 若仍声明 rc.1 会让 Yarn 嵌套安装 rc.1 副本，
-  #    与 rc.2 的类型定义冲突 → TS2717/TS2344。）
+  # 2) 只改写**当前通道工作区**（stable → dsh-plugin-desktop）的 @deepseek-ai/dsh* 依赖 → $v。
+  #    【不再触碰 dsh-community-market/package.json】：市场工作区保持上游原样。
+  #    上游在那里刻意声明多通道版本串（实测 57 处 "0.2.1-alpha.1" + 42 处联合范围
+  #    "0.2.0-rc.2 || 0.2.1-alpha.1"，共 99 行），把它压平成单一 $v 会让工作区每次
+  #    构建都变脏（git status 常驻 198 行 diff），且与上游自带 yarn.lock 不一致。
+  #    旧理由已失效：当年把 market 加进来是为防 “Yarn 嵌套安装旧版副本，与 $v 的类型
+  #    定义冲突 → TS2717/TS2344”。但上游现在自带 vendor/dsh-runtime/0.2.1-alpha.1/
+  #    与 321 条 "@deepseek-ai/dsh-*@npm:0.2.1-alpha.1" 形式（另有 ^ 形式）的根
+  #    resolutions，全部指向 file:vendor/dsh-runtime/0.2.1-alpha.1/*.tgz —— market 的
+  #    beta 依赖会被解析到仓库内已存在的 vendor 产物，不会去 registry 拉嵌套副本，
+  #    因此旧冲突前提不再成立。
+  #    注意：仅当上游恢复“无 resolutions 覆盖 + registry 拉包”的形态时，才需要把下面
+  #    被注释的那行加回 $pkgPaths。
   $pkgPaths = @(
-    (Get-ChannelWsPath 'package.json'),
-    (Join-Path $script:Src 'dsh-community-market\package.json')
+    (Get-ChannelWsPath 'package.json')
+    # (Join-Path $script:Src 'dsh-community-market\package.json')
   )
   foreach ($pkgPath in $pkgPaths) {
     if (-not (Test-Path -LiteralPath $pkgPath)) { continue }
