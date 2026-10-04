@@ -264,6 +264,59 @@ Get-Content dsh-desktop\upstream.json -Raw | ConvertFrom-Json | % { $_.channels.
 `node scripts/sync-vendored-runtime.mjs --write --channel stable` 生成），否则直接报错；
 随上游的版本若缺产物则只告警并继续（交由后续解析/安装阶段暴露真实原因）。
 
+#### 换版本时还会连带迁移「伴随依赖」（漏了它必以 TS6200 失败）
+
+把 stable 通道固定到**另一条** harness 线时，只改 `@deepseek-ai/dsh*` 是不够的。
+还有一类包名字里没有 `dsh`、却同样随 harness 线走 —— `@deepseek-ai/cordis` 家族与
+`@deepseek-ai/schemastery`。上游为每条线各维护一个通道工作区，两条线的声明如下：
+
+| 伴随包 | stable 线（rc.2，`dsh-plugin-desktop`） | alpha.1 线（`dsh-plugin-desktop-beta`） |
+|--------|------------------------------------------|------------------------------------------|
+| `@deepseek-ai/cordis` | `4.0.4` | `4.0.5-alpha.1` |
+| `@deepseek-ai/cordis-plugin-group` | `1.0.4` | `1.0.5-alpha.1` |
+| `@deepseek-ai/cordis-plugin-include` | `1.0.9` | `1.0.10-alpha.1` |
+| `@deepseek-ai/cordis-plugin-loader` | `1.0.5` | `1.0.6-alpha.1` |
+| `@deepseek-ai/cordis-plugin-timer` | `1.1.6` | `1.1.7-alpha.1` |
+| `@deepseek-ai/schemastery` | `^3.18.4` | `^3.18.5-alpha.1` |
+
+**失败机理（2026-10-05 实测，`logs\build-20261004-235833.log`）**：`^3.18.4` 收不进
+`3.18.5-alpha.1` —— semver 规定预发布版本只在 `major.minor.patch` 三元组相同时才被普通范围
+接受，所以 `^3.18.4` 与 alpha.1 运行时的 `~3.18.5-alpha.1` 互不满足，Yarn 只好在
+`dsh-llm` 下**再装一份嵌套副本**。于是同一个包出现两份 `lib/types/index.d.ts`，而它们是
+「全局脚本」（无顶层 import/export）且声明同一批标识符，进 `tsc` 程序即刻冲突：
+
+```
+node_modules/@deepseek-ai/dsh-llm/node_modules/@deepseek-ai/schemastery/lib/types/index.d.ts(1,1): error TS6200: ...
+node_modules/@deepseek-ai/schemastery/lib/types/index.d.ts(1,1): error TS6200: ...
+src/webserver.ts(50,19): error TS2883: The inferred type of 'Config' cannot be named without a reference to 'Schema' ...
+```
+
+`[08] yarn package:dir` 直接失败。修法在 `Set-RuntimeVersionPinned` 的**步骤 2b**：按
+`upstream.json`（HEAD）找到与目标版本**同线**的兄弟通道工作区，照抄它对**目标工作区已声明的
+同名伴随包**的版本（找不到同线通道则只告警并说明后果）。同一修复也顺带消除了 cordis 家族
+被嵌套成第二份副本的问题 —— 那类重复在运行时是真实风险（cordis 是插件 DI 容器）。
+
+**跳过判据也跟着收紧了（自愈）**：旧实现的「声明已一致 → 跳过固定」只比对 `upstream.json`，
+于是**只改写了 upstream.json、漏掉伴随包的半成品状态永远无法自愈**（重跑一律走跳过路径）。
+现在用 `Test-HarnessPinConsistent` 复核工作区依赖是否真的对齐，不一致就继续执行完整固定。
+
+自查命令（列出通道工作区里存在多版本副本的 `@deepseek-ai/*` 包）：
+
+```powershell
+$ws = 'X:\dsh-desktop-package\dsh-desktop\dsh-plugin-desktop'
+Get-ChildItem $ws -Recurse -Directory -Filter '@deepseek-ai' |
+  Where-Object { $_.FullName -notmatch '\\\.yarn\\' } |
+  ForEach-Object { Get-ChildItem $_.FullName -Directory } |
+  ForEach-Object { [pscustomobject]@{ Name=$_.Name; Version=(Get-Content "$($_.FullName)\package.json" -Raw | ConvertFrom-Json).version } } |
+  Group-Object Name | Where-Object Count -gt 1 | Select-Object Name, @{n='Versions';e={($_.Group.Version | Sort-Object -Unique) -join ' , '}}
+```
+
+> 注：换版本后仍可能有**非 `@deepseek-ai`** 的重复副本（如 `libreoffice-kit-win32-x64`），
+> 以及上游自身打包不一致留下的 `dsh-*` 旧线副本（`dsh-experimental-schedule-bundle`
+> 的 `dependencies` 仍指向 `0.2.0-rc.2`）。这些不进入 `tsc` 的全局脚本冲突，实测不阻塞门禁；
+> 上面的自查命令可以确认它们的存在与规模。
+
+
 **实测值（2026-10-04，随上游刷新，仅供参考）**：stable 通道 = dsh `0.2.0-rc.2` @ `639ed01539`；
 上游 `devDependencies.electron` = **`44.0.0`**（不是 44.5.1 —— 44.5.1 是历次 `-ElectronVersion 44.5.1`
 构建覆写在工作区 `package.json` 里的残留，读工作区会看错）。

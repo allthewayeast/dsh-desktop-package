@@ -73,7 +73,9 @@
   覆盖 deepseek-harness（dsh 运行时）版本（可选）。**不指定时使用上游 upstream.json
   stable 通道声明的版本**：不固定、不改写任何文件，构建上游原样。指定后把 stable 通道
   固定到该版本 —— 改写 upstream.json 的 commit / sourceVersion / runtimePackageVersion /
-  runtimeSource，以及当前通道工作区的 @deepseek-ai/dsh* 依赖与根 package.json resolutions。
+  runtimeSource，以及当前通道工作区的 @deepseek-ai/dsh* 依赖、**同属该 harness 线的伴随依赖**
+  （@deepseek-ai/cordis*、@deepseek-ai/schemastery 等，按上游同线通道工作区的声明照抄）
+  与根 package.json resolutions。
   该版本的 vendor/dsh-runtime/<版本>/manifest.json 必须已存在（由 yarn upstream:prepare-runtime
   + node scripts/sync-vendored-runtime.mjs --write --channel stable 生成）。
   目标版本与上游声明**不同**时，commit 自动取自 deepseek-harness 仓库里 dsh-v<版本> 标签
@@ -1235,24 +1237,27 @@ function Set-MarketPatchDisabled {
 #   这里按 provenance 把相关工作区的依赖行对齐（幂等）。
 #   默认只对齐 stable；仅当 AA 脚本补丁未生效（上游改过格式、仍会校验 beta）时才继续
 #   对齐 beta，保证复用校验不失败。
+# 读取上游仓库内某个 JSON 文件，**优先 git HEAD**：工作区那份可能已被上一次构建改写
+# （Set-RuntimeVersionPinned 会写 upstream.json 与当前通道工作区 package.json），
+# 不能代表“上游声明”。git 读取失败（离线 / 非 git 工作区）时才回落到工作区文件。
+function Get-HeadJsonObject {
+  param([Parameter(Mandatory = $true)][string]$RelativePath)
+  $rel = $RelativePath -replace '\\', '/'
+  try {
+    $raw = @(git -C $script:Src show "HEAD:$rel" 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $raw.Count -gt 0) {
+      try { return (($raw -join [Environment]::NewLine) | ConvertFrom-Json) } catch { }
+    }
+  } catch { }
+  $p = Join-Path $script:Src ($rel -replace '/', [IO.Path]::DirectorySeparatorChar)
+  if (-not (Test-Path -LiteralPath $p)) { return $null }
+  return Get-JsonObject $p
+}
+
 # 上游 upstream.json 里指定通道声明的运行时信息（$null = 读不到）。
-# 优先读 **git HEAD 里的** upstream.json：工作区那份可能已被上一次构建的运行时固定改写
-# （或已被覆盖层重置），不能代表“上游声明的版本”。git 读取失败（离线 / 非 git 工作区）时
-# 才回落到工作区文件。
 function Get-UpstreamStableChannel {
   param([string]$ChannelName = $script:Channel)
-  $json = $null
-  try {
-    $raw = @(git -C $script:Src show 'HEAD:upstream.json' 2>$null)
-    if ($LASTEXITCODE -eq 0 -and $raw.Count -gt 0) {
-      try { $json = ($raw -join [Environment]::NewLine) | ConvertFrom-Json } catch { $json = $null }
-    }
-  } catch { $json = $null }
-  if (-not $json) {
-    $upPath = Join-Path $script:Src 'upstream.json'
-    if (-not (Test-Path -LiteralPath $upPath)) { return $null }
-    $json = Get-JsonObject $upPath
-  }
+  $json = Get-HeadJsonObject 'upstream.json'
   if (-not $json -or -not ($json.PSObject.Properties.Name -contains 'channels')) { return $null }
   $ch = $json.channels
   if (-not $ch -or -not ($ch.PSObject.Properties.Name -contains $ChannelName)) { return $null }
@@ -1373,8 +1378,61 @@ function Resolve-HarnessVersion {
   }
 }
 
+# 找到与 $Version 同一条 harness 线的**兄弟通道工作区**：上游为每条线各维护一个通道工作区
+# （stable → dsh-plugin-desktop 是 rc.2 线；beta → dsh-plugin-desktop-beta 是 alpha.1 线）。
+# 它的 package.json 就是该线配套依赖的权威版本表 —— 除了 @deepseek-ai/dsh*，还包括
+# @deepseek-ai/cordis*、@deepseek-ai/schemastery 这类**伴随包**（名字里没有 dsh，
+# 同样随 harness 线走）。
+# 返回 @{ Name = <工作区目录名>; Pkg = <package.json 对象> }；找不到返回 $null。
+function Get-HarnessLineSiblingWorkspace {
+  param([Parameter(Mandatory = $true)][string]$Version)
+  $headUp = Get-HeadJsonObject 'upstream.json'
+  if (-not $headUp -or -not ($headUp.PSObject.Properties.Name -contains 'channels')) { return $null }
+  foreach ($chName in @($headUp.channels.PSObject.Properties.Name)) {
+    $chInfo = $headUp.channels.PSObject.Properties[$chName].Value
+    if (-not $chInfo) { continue }
+    if ($chInfo.sourceVersion -ne $Version) { continue }
+    $candWs = [string]$chInfo.package
+    if (-not $candWs -or $candWs -eq $script:ChannelWsName) { continue }
+    $candPkg = Get-HeadJsonObject "$candWs/package.json"
+    if (-not $candPkg) { continue }
+    return @{ Name = $candWs; Pkg = $candPkg }
+  }
+  return $null
+}
+
+# 固定是否已**真正落到工作区**：upstream.json 里写着目标版本，不等于依赖也改过了。
+# 旧版本脚本只改写 @deepseek-ai/dsh* 而漏掉伴随包，这时 0c) 的「声明已一致 → 跳过」
+# 会让这个半成品**永远无法自愈**（实测：stable 被固定到 0.2.1-alpha.1 之后，
+# schemastery 停在 ^3.18.4、cordis 停在 4.0.4，重跑构建一律走跳过路径 → 门禁必然 TS6200）。
+function Test-HarnessPinConsistent {
+  param(
+    [Parameter(Mandatory = $true)][string]$Version,
+    [Parameter(Mandatory = $true)][hashtable]$ManifestByName,
+    $Sibling = $null
+  )
+  $wsPkg = Get-JsonObject (Get-ChannelWsPath 'package.json')
+  foreach ($field in @('dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies')) {
+    $prop = $wsPkg.PSObject.Properties[$field]
+    if (-not $prop -or $null -eq $prop.Value) { continue }
+    $sibProp = if ($Sibling) { $Sibling.Pkg.PSObject.Properties[$field] } else { $null }
+    foreach ($name in @($prop.Value.PSObject.Properties.Name)) {
+      $val = $prop.Value.$name
+      if ($name -eq '@deepseek-ai/dsh' -or $name.StartsWith('@deepseek-ai/dsh-')) {
+        if ($ManifestByName.ContainsKey($name) -and $val -ne $Version) { return $false }
+        continue
+      }
+      if (-not $name.StartsWith('@deepseek-ai/')) { continue }
+      if (-not $sibProp -or $null -eq $sibProp.Value) { continue }
+      $want = $sibProp.Value.$name
+      if ($want -is [string] -and $want -and $val -ne $want) { return $false }
+    }
+  }
+  return $true
+}
+
 # 运行时版本固定：把 stable 通道固定到 $script:ResolvedRuntimeVersion（deepseek-harness commit /
-# upstream.json / dsh-plugin-desktop 依赖 / 根 package.json resolutions）。
+# upstream.json / dsh-plugin-desktop 依赖（含同线伴随包）/ 根 package.json resolutions）。
 # **$script:ResolvedRuntimeVersion 来自 Resolve-HarnessVersion**：
 #   - 未指定 -HarnessVersion → = 上游 upstream.json 声明的版本 → 本函数**不做任何固定**
 #     （直接使用上游声明，构建上游原样）；
@@ -1475,12 +1533,17 @@ function Set-RuntimeVersionPinned {
   #     （runtimeSource 也随版本一致），无需改写 upstream.json / dsh 依赖 / resolutions
   #     （AA provenance 已在 0) 同步完成，不在此跳过范围）。
   $upPath = Join-Path $script:Src 'upstream.json'
+  $sibling = Get-HarnessLineSiblingWorkspace -Version $v
   if (Test-Path -LiteralPath $upPath) {
     $upNow = Get-JsonObject $upPath
     $stableNow = $upNow.channels.stable
     if ($stableNow.commit -eq $script:ResolvedHarnessCommit -and $stableNow.sourceVersion -eq $v) {
-      Write-Info "运行时版本已与官方一致（dsh $v @ $($script:ResolvedHarnessCommit.Substring(0,10))），跳过本地固定。"
-      return
+      # 声明一致 ≠ 已经改完：必须再确认工作区依赖真的对齐（见 Test-HarnessPinConsistent）。
+      if (Test-HarnessPinConsistent -Version $v -ManifestByName $entryByName -Sibling $sibling) {
+        Write-Info "运行时版本已与官方一致（dsh $v @ $($script:ResolvedHarnessCommit.Substring(0,10))），跳过本地固定。"
+        return
+      }
+      Write-WarnLine "upstream.json 已声明 $v，但工作区依赖尚未对齐（旧版本脚本可能只改写了 upstream.json）→ 继续执行完整固定。"
     }
   }
 
@@ -1530,6 +1593,51 @@ function Set-RuntimeVersionPinned {
       Set-Content -LiteralPath $pkgPath -Value (ConvertTo-Json $pkg -Depth 100) -Encoding utf8 -NoNewline
       Write-WarnLine "运行时版本固定：$([IO.Path]::GetFileNameWithoutExtension($pkgPath)) 的 @deepseek-ai/dsh* 依赖 → $v"
     }
+  }
+
+  # 2b) 伴随依赖迁移：同属 harness 线、但名字不是 @deepseek-ai/dsh* 的包
+  #     （@deepseek-ai/cordis 家族、@deepseek-ai/schemastery）也必须跟着 $v 走。
+  #     2) 的过滤条件（$isDsh）**永远碰不到它们** —— 后果是把 stable 通道固定到另一条
+  #     harness 线时，工作区仍声明上一条线的版本（实测 0.2.1-alpha.1：cordis 停在 4.0.4、
+  #     schemastery 停在 ^3.18.4），而 $v 的运行时要求 4.0.5-alpha.1 / ~3.18.5-alpha.1。
+  #     `^3.18.4` 不满足 `~3.18.5-alpha.1`（semver：预发布版本只在 major.minor.patch 三元组
+  #     相同时才被普通范围接受，故 ^3.18.4 收不进 3.18.5-alpha.1）→ Yarn 在 dsh-llm 下再装
+  #     一份嵌套副本 → schemastery 的两份 lib/types/index.d.ts 都是「全局脚本」且声明同一批
+  #     标识符 → tsc 报 TS6200 ×2 + TS2883 → yarn package:dir 直接失败
+  #     （2026-10-05 实测，日志 build-20261004-235833.log）。
+  #     权威版本表：上游为每条 harness 线各维护一个通道工作区，其 package.json 里的
+  #     @deepseek-ai/* 声明就是该线配套的版本（beta/next 工作区已写着 4.0.5-alpha.1 /
+  #     ^3.18.5-alpha.1）。所以按 upstream.json（HEAD）找到与 $v 同线的兄弟通道，
+  #     只照抄**目标工作区已声明的同名伴随包**，不动其余依赖。
+  if ($sibling) {
+    $wsPkgPath = Get-ChannelWsPath 'package.json'
+    $wsPkg = Get-JsonObject $wsPkgPath
+    $wsChanged = $false
+    foreach ($field in @('dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies')) {
+      $wsProp = $wsPkg.PSObject.Properties[$field]
+      $sibProp = $sibling.Pkg.PSObject.Properties[$field]
+      if (-not $wsProp -or $null -eq $wsProp.Value -or -not $sibProp -or $null -eq $sibProp.Value) { continue }
+      foreach ($name in @($wsProp.Value.PSObject.Properties.Name)) {
+        if (-not $name.StartsWith('@deepseek-ai/')) { continue }
+        # dsh* 已由 2) 按 runtime manifest 处理，这里只补伴随包
+        if ($name -eq '@deepseek-ai/dsh' -or $name.StartsWith('@deepseek-ai/dsh-')) { continue }
+        $sibVal = $sibProp.Value.$name
+        if ($sibVal -isnot [string] -or -not $sibVal) { continue }
+        if ($wsProp.Value.$name -ne $sibVal) {
+          Write-WarnLine "伴随依赖迁移（$($sibling.Name) 线）：$name $($wsProp.Value.$name) → $sibVal"
+          $wsProp.Value.$name = $sibVal
+          $wsChanged = $true
+        }
+      }
+    }
+    if ($wsChanged) {
+      Set-Content -LiteralPath $wsPkgPath -Value (ConvertTo-Json $wsPkg -Depth 100) -Encoding utf8 -NoNewline
+      Write-WarnLine "运行时版本固定：$($script:ChannelWsName)\package.json 的伴随依赖已对齐 $v 线（$($sibling.Name)）→ 重装后不再嵌套第二份副本"
+    }
+  } else {
+    Write-WarnLine "运行时版本固定：上游 upstream.json（HEAD）里没有与 $v 同线的其他通道工作区 → 跳过伴随依赖" +
+      "（@deepseek-ai/cordis*、@deepseek-ai/schemastery 等）迁移。若这些包停在上一条线的版本，" +
+      "Yarn 会嵌套安装第二份副本，类型门禁可能以 TS6200 失败。"
   }
 
   # 3) 根 package.json resolutions：删掉旧 stable 通道的 dsh 条目（@npm:$v / @npm:^$v，
