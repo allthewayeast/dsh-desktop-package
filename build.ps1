@@ -76,13 +76,16 @@
   runtimeSource，以及当前通道工作区的 @deepseek-ai/dsh* 依赖与根 package.json resolutions。
   该版本的 vendor/dsh-runtime/<版本>/manifest.json 必须已存在（由 yarn upstream:prepare-runtime
   + node scripts/sync-vendored-runtime.mjs --write --channel stable 生成）。
-  目标版本与上游声明**不同**时必须同时给 -HarnessCommit。
+  目标版本与上游声明**不同**时，commit 自动取自 deepseek-harness 仓库里 dsh-v<版本> 标签
+  指向的 commit（先查本地子模块标签，再退回远端 ls-remote）；只有该版本查不到标签时，
+  才需要 -HarnessCommit 显式指定。
 
 .PARAMETER HarnessCommit
-  -HarnessVersion 对应的 deepseek-harness commit（7-40 位十六进制 SHA，取
-  https://github.com/deepseek-ai/deepseek-harness.git 上 dsh-v<版本> 标签指向的 commit）。
-  仅在 -HarnessVersion 与上游声明版本**不同**时必需；未指定 -HarnessVersion，或目标版本
-  与上游声明相同时，自动取上游 upstream.json 里的 commit。
+  -HarnessVersion 对应的 deepseek-harness commit（7-40 位十六进制 SHA）。**通常无需指定**：
+  不指定时按顺序取 —— 目标版本与上游声明相同时取上游 upstream.json 的 commit；否则取
+  deepseek-harness 仓库 dsh-v<版本> 标签指向的 commit（先本地子模块标签，再远端 ls-remote）。
+  显式指定时以参数为准，并与标签核对（不一致只告警，因为上游会前移同一版本的 commit）。
+  仅在目标版本没有对应标签、或需要临时指向标签以外的 commit 时才用。
 
 .PARAMETER KeepTimestamps
   保留 Electron 官方 zip 的 1980-01-01 时间戳（可复现构建行为）。
@@ -93,7 +96,7 @@
   .\build.ps1 -Target package-dir              # 解包打包（无覆盖层）
   .\build.ps1 -Overlay -Target package-dir     # 应用本地覆盖层（quick-build-overlay 默认）
   .\build.ps1 -Overlay -Target package-dir -ElectronVersion 45.0.0   # 临时换 Electron 版本
-  .\build.ps1 -Target package-dir -HarnessVersion 0.2.1-alpha.1 -HarnessCommit 639ed015397290b3745d163aafe02ffee4aa3f84   # 换 dsh 运行时版本
+  .\build.ps1 -Target package-dir -HarnessVersion 0.2.1-alpha.1   # 换 dsh 运行时版本（commit 由标签 dsh-v0.2.1-alpha.1 解析）
   .\build.ps1 -Target build                    # 编译
   .\build.ps1 -Target dist-win-portable
   .\build.ps1 -Target dist-win -Proxy http://127.0.0.1:7890
@@ -142,12 +145,14 @@ param(
 
   # deepseek-harness（dsh 运行时）版本覆盖。**未指定时使用上游 upstream.json stable 通道
   # 声明的版本**（不固定 / 不改写）。指定时把 stable 通道固定到该版本，该版本的
-  # vendor/dsh-runtime/<版本>/ 必须已存在；与上游声明不同的目标必须同时给 -HarnessCommit。
+  # vendor/dsh-runtime/<版本>/ 必须已存在；与上游声明不同的目标，commit 自动由标签
+  # dsh-v<版本> 解析（见 Resolve-HarnessCommitFromTag），无需手抄 sha。
   [ValidatePattern('^(?:\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?)?$')]
   [string]$HarnessVersion = '',
 
-  # -HarnessVersion 对应的 deepseek-harness commit（7-40 位十六进制）。仅在 -HarnessVersion
-  # 与上游声明版本不同时必需；其余情况自动取上游 upstream.json 里的 commit。
+  # -HarnessVersion 对应的 deepseek-harness commit（7-40 位十六进制）。**通常无需指定**：
+  # 版本 == 上游声明 → 取上游 upstream.json 的 commit；否则 → 取标签 dsh-v<版本> 的 commit。
+  # 显式给出时以参数为准，并与标签核对（不一致只告警：上游会前移同一版本的 commit）。
   [ValidatePattern('^(?:[0-9a-fA-F]{7,40})?$')]
   [string]$HarnessCommit = ''
 )
@@ -163,6 +168,11 @@ $script:Src = Join-Path $script:Root 'dsh-desktop'
 # 父仓库的 gitlink / .gitmodules —— 拉取总是拿到上游最新，不会停在旧版本。
 $script:SrcRepository = 'https://github.com/anywhere-labs/dsh-desktop.git'
 $script:SrcBranch = 'master'
+# deepseek-harness 子模块（嵌套在 dsh-desktop 内）的远端。**只用于把 -HarnessVersion
+# 解析成 commit**（查标签 dsh-v<版本>）；构建本体不使用该 URL —— 不做额外 fetch / checkout，
+# commit 归属仍由 upstream.json / 标签决定。换目标版本时上游 upstream.json 只声明自己那一版，
+# 所以「版本 → commit」只能靠标签。
+$script:HarnessRepository = 'https://github.com/deepseek-ai/deepseek-harness.git'
 $script:StartedAt = Get-Date
 $script:StepIndex = 0
 $script:Failed = 0
@@ -185,7 +195,8 @@ $script:ElectronOverrideActive = $script:ElectronVersionExplicit -and
   (-not [string]::IsNullOrWhiteSpace($ElectronVersion))
 # deepseek-harness（dsh 运行时）版本：**未指定 -HarnessVersion 时使用上游 upstream.json
 # stable 通道声明的版本**（sourceVersion / commit），不做任何固定或改写 —— 构建上游原样。
-# 指定 -HarnessVersion 时才固定到该版本（与上游声明不同时必须同时给 -HarnessCommit）。
+# 指定 -HarnessVersion 时才固定到该版本；commit 由 Resolve-HarnessVersion 决定
+# （显式参数 > 上游 upstream.json > 标签 dsh-v<版本>），通常无需手抄 sha。
 #
 # ⚠️ 命名铁律：解析结果必须叫 $script:ResolvedRuntimeVersion / $script:ResolvedHarnessCommit，
 # **绝不能叫 $script:HarnessCommit** —— PowerShell 里「参数」就是脚本作用域变量，
@@ -199,7 +210,9 @@ $script:ElectronOverrideActive = $script:ElectronVersionExplicit -and
 # 固定改写（或已被覆盖层重置），不代表上游声明。
 # 基线参考（本脚本最近一次验证过的上游版本，仅供人工比对，不参与运行）：
 #   stable / dsh 0.2.0-rc.2 —— 但注意上游会把同一 sourceVersion 的 commit 前移
-#   （实测 4878cdabd8 → 639ed01539），所以 commit 一律以上游 upstream.json 为准。
+#   （实测 4878cdabd8 → 639ed01539：前者正是标签 dsh-v0.2.0-rc.1 的 commit），
+#   所以「未指定 -HarnessVersion」时 commit 以上游 upstream.json 为准；
+#   「指定了版本」时以标签 dsh-v<版本> 为准（upstream.json 只声明自己那一版）。
 $script:HarnessVersionOverride = $HarnessVersion
 $script:HarnessCommitOverride = $HarnessCommit
 $script:HarnessOverrideActive = $MyInvocation.BoundParameters.ContainsKey('HarnessVersion') -and
@@ -1246,10 +1259,53 @@ function Get-UpstreamStableChannel {
   return $ch.PSObject.Properties[$ChannelName].Value
 }
 
+# 把 deepseek-harness 版本解析为 commit：查仓库标签 dsh-v<版本>。
+#   1) 本地子模块（$src\deepseek-harness）—— 离线、无网络开销，优先；
+#   2) 远端 ls-remote —— 子模块 clone 可能没取全标签时的兜底。
+# 解析不出来（该版本无标签 / 网络不可用）返回 $null，由调用方决定报错还是告警。
+function Resolve-HarnessCommitFromTag {
+  param([Parameter(Mandatory = $true)][string]$Version)
+  $tag = "dsh-v$Version"
+  # 探测期间关掉「原生命令非零退出即终止」：脚本顶部把
+  # $PSNativeCommandUseErrorActionPreference 设为 $true，而「标签不存在」「远端不可达」
+  # 都是**本函数预期内的失败** —— 不关掉的话 git 的非零退出会直接抛出（配合
+  # $ErrorActionPreference='Stop' 成为终止性错误），下面的 $LASTEXITCODE 降级逻辑根本没机会跑。
+  $prevNative = $PSNativeCommandUseErrorActionPreference
+  $PSNativeCommandUseErrorActionPreference = $false
+  # 远端探测不允许交互（凭据提示会让构建挂住）：只查公开上游仓库，失败即降级。
+  $prevPrompt = $env:GIT_TERMINAL_PROMPT
+  $env:GIT_TERMINAL_PROMPT = '0'
+  try {
+    $harnessPath = Join-Path $script:Src 'deepseek-harness'
+    if (Test-Path -LiteralPath (Join-Path $harnessPath '.git')) {
+      # ^{commit} 让注释标签也解到 commit；--quiet 让标签缺失时不打噪音到 stderr。
+      $local = @(& git -C $harnessPath rev-parse --verify --quiet "refs/tags/$tag^{commit}" 2>$null)
+      if ($LASTEXITCODE -eq 0 -and $local.Count -gt 0) {
+        $shaLocal = ([string]$local[0]).Trim()
+        if ($shaLocal) { return $shaLocal }
+      }
+    }
+    # 注释标签会同时列出 <标签> 与 <标签>^{} 两行，^{} 指向 commit，优先取它。
+    $remote = @(& git ls-remote --tags $script:HarnessRepository "refs/tags/$tag" "refs/tags/$tag^{}" 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $remote.Count -eq 0) { return $null }
+    $peeled = @($remote | Where-Object { $_ -match '\^\{\}\s*$' })
+    $line = if ($peeled.Count -gt 0) { [string]$peeled[0] } else { [string]$remote[0] }
+    $sha = ($line -split '\s+')[0]
+    if ($sha -match '^[0-9a-fA-F]{7,40}$') { return $sha }
+    return $null
+  } finally {
+    $PSNativeCommandUseErrorActionPreference = $prevNative
+    $env:GIT_TERMINAL_PROMPT = $prevPrompt
+  }
+}
+
 # 决定本次构建使用的 deepseek-harness 运行时版本（必须在源码同步之后、任何依赖安装 /
 # 覆盖层应用之前调用）：
-#   -HarnessVersion 指定 → 固定到该版本（commit 取 -HarnessCommit；目标版本与上游声明相同
-#                          时可省略，自动取上游 commit）
+#   -HarnessVersion 指定 → 固定到该版本。commit 取值优先级：
+#                           1) -HarnessCommit 显式给出 → 以它为准（并与标签核对，不一致告警）
+#                           2) 目标版本 == 上游声明版本 → 上游 upstream.json 里的 commit
+#                           3) 其余 → 标签 dsh-v<版本> 指向的 commit（Resolve-HarnessCommitFromTag）
+#                           —— 所以换版本通常**不需要**手抄 sha。
 #   未指定               → 使用上游 upstream.json stable 通道声明的版本（不固定 / 不改写）
 function Resolve-HarnessVersion {
   $stable = Get-UpstreamStableChannel
@@ -1271,16 +1327,36 @@ function Resolve-HarnessVersion {
   } else {
     $v = $script:HarnessVersionOverride
     $c = $script:HarnessCommitOverride
+    $explicitCommit = -not [string]::IsNullOrWhiteSpace($script:HarnessCommitOverride)
     if ($v -eq $upVersion) {
       if (-not $c) { $c = $upCommit }
       Write-Info "dsh 运行时：-HarnessVersion $v 与上游声明一致，commit 取上游 $shortUp。"
     } elseif (-not $c) {
-      throw "-HarnessVersion $v 与上游声明的 $upVersion 不同，必须同时指定 -HarnessCommit <sha>（取 https://github.com/deepseek-ai/deepseek-harness.git 上 dsh-v$v 标签指向的 commit）。"
+      # 未给 commit：上游 upstream.json 只声明自己那一版，换版本时「版本 → commit」只有标签能给。
+      $c = Resolve-HarnessCommitFromTag -Version $v
+      if (-not $c) {
+        throw "-HarnessVersion $v 与上游声明的 $upVersion 不同，且未能从标签 dsh-v$v 解析 commit：本地 deepseek-harness 无此标签，远端 $($script:HarnessRepository) 也未查到（网络不通 / 用了 -NoProxy？）。请核对版本号拼写，或用 -HarnessCommit <sha> 显式指定。"
+      }
+      Write-Ok "dsh 运行时：-HarnessVersion $v（上游声明 $upVersion）→ commit 取自标签 dsh-v$v：$($c.Substring(0, [Math]::Min(12, $c.Length)))"
     } else {
       Write-WarnLine "dsh 运行时：按 -HarnessVersion 固定到 $v（上游声明为 $upVersion）。"
     }
     if (-not $c) {
-      throw "-HarnessVersion $v 缺少对应的 deepseek-harness commit：请同时指定 -HarnessCommit（dsh-v$v 标签指向的 commit）。"
+      # 只剩「版本与上游相同、但上游 upstream.json 没写 commit」这一种：同样用标签兜底。
+      $c = Resolve-HarnessCommitFromTag -Version $v
+      if (-not $c) {
+        throw "-HarnessVersion $v 缺少对应的 deepseek-harness commit：上游 upstream.json 未声明，标签 dsh-v$v 也未解析到。请用 -HarnessCommit 显式指定。"
+      }
+      Write-Ok "dsh 运行时：上游未声明 commit → 取自标签 dsh-v$v：$($c.Substring(0, [Math]::Min(12, $c.Length)))"
+    }
+    # 显式给的 commit 与标签核对，**不一致只告警**：上游会把同一 sourceVersion 的 commit
+    # 前移（实测 4878cdabd8 → 639ed01539），标签与 upstream.json 都不必然是唯一真相，
+    # 故以显式参数为准，但把差异暴露出来 —— 手抄 sha 抄错就是这个信号。
+    if ($explicitCommit) {
+      $tagSha = Resolve-HarnessCommitFromTag -Version $v
+      if ($tagSha -and $tagSha -ne $c) {
+        Write-WarnLine "dsh 运行时：-HarnessCommit $($c.Substring(0, [Math]::Min(12, $c.Length))) 与标签 dsh-v$v（$($tagSha.Substring(0, [Math]::Min(12, $tagSha.Length)))）不一致 —— 按参数值为准。"
+      }
     }
     $script:ResolvedRuntimeVersion = $v
     $script:ResolvedHarnessCommit = $c

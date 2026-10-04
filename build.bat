@@ -11,7 +11,7 @@ REM   build.bat --skip-pull        - Skip submodule alignment (use existing sour
 REM   build.bat --overlay          - Apply local overlays (icons, pnpm patch, ASAR)
 REM   build.bat --electron 44.5.1  - Override Electron version (default: follow upstream)
 REM   build.bat --harness 0.2.0-rc.2 - Override dsh runtime version (default: follow upstream)
-REM   build.bat --harness-commit <sha> - commit for --harness (required if it differs from upstream)
+REM   build.bat --harness-commit <sha> - pin commit for --harness (usually unnecessary: derived from tag dsh-v<version>)
 
 setlocal enabledelayedexpansion
 

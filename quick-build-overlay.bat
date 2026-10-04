@@ -19,7 +19,9 @@ echo Electron / dsh runtime versions FOLLOW THE UPSTREAM DECLARATION by default.
 echo Extra arguments are forwarded to build.ps1, e.g.
 echo   quick-build-overlay.bat -ElectronVersion 44.5.1
 echo   quick-build-overlay.bat -HarnessVersion 0.2.0-rc.2
-echo   quick-build-overlay.bat -HarnessVersion 0.2.1-alpha.1 -HarnessCommit ^<sha^>
+echo   quick-build-overlay.bat -HarnessVersion 0.2.1-alpha.1
+echo   (the commit is derived from tag dsh-v^<version^>; pass -HarnessCommit only
+echo    if that version has no such tag, or to pin some other commit)
 echo Do NOT repeat -Target / -Overlay / -SkipSubmodule here: duplicate named
 echo parameters are a hard error under pwsh -File.
 echo.
