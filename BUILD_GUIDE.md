@@ -194,8 +194,10 @@ pwsh -File .\build-next.ps1 -Target package-dir -SkipSubmodule   # 等同 bat
 - `overlay/patches/*.patch` 经 `git apply` 应用到 `dsh-plugin-desktop`（`main.ts` 接入、README 文档）
 - `overlay/patches/package.json.patch` 重新启用 **ASAR**（`smartUnpack` + 两个 fuse + `asarUnpack`），
   把产物从 `resources\app\`（2 万+ 文件）收进 `app.asar`（千级文件）
-- `overlay/patches/dshmarket-desktop.patch.patch` 保护 dshmarket 的自更新补丁
-  （用 `-U1` 最小上下文，同时兼容 install 与 market:prepare 两个版本）
+- ~~`overlay/patches/dshmarket-desktop.patch.patch`~~ **已于 2026-10 移除**：上游已收编该改动，
+  本地策展版本反而更旧；且它的基准是旧版上游补丁，`git apply` 必然失配并中止整个 `[03]` 阶段，
+  连带 ASAR / 白名单 / `main.ts` / 图标都拿不到应用机会。
+  现改由 `Set-MarketPatchDisabled`（`build.ps1`）让 dshmarket 补丁彻底不参与安装
 
 修改 `dsh-desktop` 工作区里的源码后，跑 `quick-build-overlay.bat` 会自动把改动导出到 `overlay/`（`Export-SrcOverlay`），下一次干净 clone 后仍能重现。
 
@@ -588,6 +590,125 @@ Remove-Item dist\.probe.cjs
 # ASAR 生效时应为千级；asar:false 时是 2 万+
 ```
 
+### 六、溯源与防丢（改动到底丢了没有）
+
+> 本节存在的原因：本仓库位于 **`X:`（Romex Primo RamDisk，24 GB，重启即丢）**。
+> 2026-10 曾据此误判「提交之后还有改动被丢了」，白查了一轮。结论与取证方法记在这里。
+
+#### 6.1 先认清什么会丢
+
+| 位置 | 重启后 | 说明 |
+|------|--------|------|
+| GitHub（`origin/main`） | **不丢** | 唯一可靠的持久化位置 |
+| `X:\dsh-desktop-package\.git` | **丢** | 在内存盘上，本地提交一起没 |
+| 工作树里未提交的改动 | **丢** | 无法恢复 |
+| `dsh-desktop\`（独立 clone） | **丢** | 可重建，`build.ps1` 会重新克隆/更新 |
+| `dist\` `logs\` `.build-state.json` | **丢** | 全是派生物，重跑即可 |
+
+已核实 Romex 没有有效镜像（`E:\软件备份\RamDisk.vdf` 仅 16 MB，不是 24 GB 盘的完整镜像），
+所以**内存盘上的内容没有离线备份可救**。推论：**改动做完就提交并推送**，别停在 X: 上。
+
+#### 6.2 判断「改动是否被推送」——别用本地引用
+
+重新克隆之后，`HEAD` 与本地缓存的 `origin/main` 引用必然相等，所以下面这些**不能**作为证据：
+
+```powershell
+git status        # 干净 ≠ 已推送，也可能只是改动已经没了
+git branch -vv    # origin/main 是克隆时写入的缓存，不是远端实时状态
+```
+
+两个可靠判据：
+
+```powershell
+# 1) 直连远端查真实 SHA，与本地 HEAD 比对
+git ls-remote origin refs/heads/main
+git rev-parse HEAD
+
+# 2) reflog：只有一条 clone 记录 ⇒ .git 是重新克隆的，本地提交已随内存盘丢失
+git reflog
+#    6ba3529 HEAD@{0}: clone: from https://github.com/allthewayeast/dsh-desktop-package
+```
+
+#### 6.3 权威证据是 DSH 会话记录，不是工作树
+
+DSH 把会话落在 **`E:`**（非内存盘），所以工作树丢了它还在：
+
+```text
+E:\AppData\YMZ\.dsh-desktop\sessions\<工作区目录>\session-<id>\session.v4.jsonl.zstd
+# 工作区目录名 = 转义后的 cwd，例如 X:\dsh-desktop-package → --X-dsh-desktop-package--
+```
+
+**坑：这些 `.zstd` 是多帧拼接容器。** 用错 API 会以为"文件里没内容"：
+
+| 用法 | 结果 |
+|------|------|
+| `zlib.zstdDecompressSync(buf)` | **只解第一帧**，拿到会话头 203 B 就"成功" |
+| `zlib.createZstdDecompress()` 流式 | 第二帧起抛 `Unknown frame descriptor` |
+| 按帧 magic `28 B5 2F FD` 切分后逐帧解压 | 正确（已封装为工具） |
+
+```powershell
+# 1) 解压某工作区的全部会话
+node tools\dsh-session-read.mjs expand `
+  'E:\AppData\YMZ\.dsh-desktop\sessions\--X-dsh-desktop-package--' `
+  "$env:TEMP\dsh-plain"
+
+# 2) 覆盖地图：每个会话覆盖的 turn / 时间范围（判断"那段时间在哪个会话里"）
+node tools\dsh-session-read.mjs map "$env:TEMP\dsh-plain"
+
+# 3) 编辑年表：所有 edit/write 调用的时间与文件路径（可加正则过滤）
+node tools\dsh-session-read.mjs edits "$env:TEMP\dsh-plain\session-<id>__session.v4.jsonl" "build\.ps1"
+
+# 4) 任意检索：在全部记录（含推理与工具输出）里找字符串
+node tools\dsh-session-read.mjs find "dsh-community-market" "$env:TEMP\dsh-plain\session-<id>__session.v4.jsonl"
+```
+
+会话文件会增长／轮转：v4 可能只含最近记录，旧内容留在同目录的 `session.v2/v3.jsonl.zstd`。
+用 `map` 输出的 `turn=.. time=..` 确认「要找的那段在哪个文件里」。
+
+**判据示例**（2026-10 实测）：本工作区会话 `session-e96a7b40` 覆盖 turn 1..12、09-25 → 10-04、
+652 次工具调用；其中 `build.ps1` 共 22 次编辑，**最后一条在 `2026-10-02 23:28:33`，早于提交
+`6ba3529`（23:38:08）**。⇒ 该提交之后没有任何源码改动，不存在"丢失的差异"。
+
+#### 6.4 别把构建期改写误判成"丢了的改动"
+
+`dsh-desktop` 是独立 clone，`git status` 里十几项 ` M ` **全部是构建期注入**，属正常：
+
+| 看到的改动 | 来源 |
+|-----------|------|
+| `dsh-plugin-desktop/build/tray-icon*.png` | 覆盖层图标替换 |
+| `dsh-plugin-desktop/package.json` | `overlay/patches/package.json.patch`（ASAR） |
+| `dsh-plugin-desktop/src/main.ts`、`scripts/verify-packaged-runtime.ts` | 对应 overlay 补丁 |
+| `scripts/prepare-dsh-market.mjs`、`scripts/agents-anywhere-release-policy.mjs`、`upstream.json`、`yarn.lock` | `Disable-MarketWorkspaceCheck` / AA 对齐 / 版本固定 |
+| `dsh-community-market/package.json` | `Set-RuntimeVersionPinned` 改写 `@deepseek-ai/dsh*` 版本串 |
+
+关键是**一对方向相反、互相抵消的操作**，不是丢改动：
+
+- **`Reset-OverlayTrackedFiles`**（`build.ps1`）：pull 前把一批受跟踪文件 `git checkout --`
+  还原成**上游原始状态**。名单是函数内的 `$exact` 数组，含 `dsh-community-market/package.json`、
+  `dsh-plugin-desktop/package.json` 等。
+- **`Set-RuntimeVersionPinned`**（`build.ps1`）：pull 后再把 `@deepseek-ai/dsh*` 依赖统一改写成
+  pin 的 `$script:RuntimeVersion`。
+
+以 `dsh-community-market/package.json` 为例（2026-10 实测，99 增 99 删、无键增删）：
+
+| hunk | 上游值 | 注入后 |
+|------|--------|--------|
+| `-89,42`（`peerDependencies`） | `0.2.0-rc.2 \|\| 0.2.1-alpha.1` | `0.2.0-rc.2` |
+| `-216,57` | `0.2.1-alpha.1` | `0.2.0-rc.2` |
+
+该行为自 0.1.5 时代（`62dc01b`）就存在，**不是某次改动引入的**。判定某个 modified 是否纯注入：
+
+```powershell
+$repo = 'X:\dsh-desktop-package\dsh-desktop'
+$d = & git -C $repo diff --unified=0 -- dsh-community-market/package.json
+@($d | Where-Object { $_ -like '@@*' })     # 改动落在哪些 JSON 段
+@($d | Where-Object { $_ -like '+*' -and $_ -notlike '+++*' }) | Select-Object -First 20
+```
+
+出现**非版本串**的增删行（键名增删、逻辑行）时，才需要怀疑是人改的。
+
+---
+
 ## 构建日志
 
 每次构建的详细日志保存在 `logs\build-YYYYMMDD-HHMMSS.log`。
@@ -612,9 +733,12 @@ Remove-Item dist\.probe.cjs
 
 - `dsh-desktop\package.json` - Yarn 工作区配置（子模块）
 - `dsh-desktop\upstream.json` - 上游 deepseek-harness 版本信息（子模块）
-- `dsh-desktop\.yarn\patches\` - 工作区依赖补丁（含 dshmarket 自更新补丁）
-- `overlay\patches\dshmarket-desktop.patch.patch` - 保护上面那个补丁的覆盖层补丁
+- `dsh-desktop\.yarn\patches\` - 工作区依赖补丁（上游跟踪文件；其中 `dshmarket-desktop.patch`
+  仍在但**不再被引用**，见 `Set-MarketPatchDisabled`）
+- `dsh-desktop\dsh-community-market\package.json` - 市场工作区；构建期被 `Set-RuntimeVersionPinned`
+  改写版本串，pull 前由 `Reset-OverlayTrackedFiles` 还原（详见「六、溯源与防丢」6.4）
 
 ### 诊断用
 
 - `logs\build-*.log` - 完整构建日志（控制台可能被截断，以这里为准）
+- `tools\dsh-session-read.mjs` - DSH 会话记录读取工具（溯源取证，见「六、溯源与防丢」）
