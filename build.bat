@@ -12,6 +12,7 @@ REM   build.bat --overlay          - Apply local overlays (icons, pnpm patch, AS
 REM   build.bat --electron 44.5.1  - Override Electron version (default: follow upstream)
 REM   build.bat --harness 0.2.0-rc.2 - Override dsh runtime version (default: follow upstream)
 REM   build.bat --harness-commit <sha> - pin commit for --harness (usually unnecessary: derived from tag dsh-v<version>)
+REM   build.bat --pnpm 11.28.5     - Override pnpm version (default: follow upstream; needs overlay\pnpm\pnpm@<ver>.patch)
 
 setlocal enabledelayedexpansion
 
@@ -24,6 +25,7 @@ set "OVERLAY_FLAG="
 set "ELECTRON_FLAG="
 set "HARNESS_FLAG="
 set "HARNESS_COMMIT_FLAG="
+set "PNPM_FLAG="
 
 :parse_args
 if "%~1"=="" goto end_parse
@@ -70,6 +72,12 @@ if /i "%~1"=="--harness-commit" (
     shift
     goto parse_args
 )
+if /i "%~1"=="--pnpm" (
+    set "PNPM_FLAG=-PnpmVersion %~2"
+    shift
+    shift
+    goto parse_args
+)
 if "!TARGET!"=="build" (
     set "TARGET=%~1"
 )
@@ -102,6 +110,6 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0build.ps1" -Target %TARGET% %NO_PROXY_FLAG% %SKIP_INSTALL_FLAG% %SKIP_SUBMODULE_FLAG% %SKIP_PULL_FLAG% %OVERLAY_FLAG% %ELECTRON_FLAG% %HARNESS_FLAG% %HARNESS_COMMIT_FLAG%
+pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0build.ps1" -Target %TARGET% %NO_PROXY_FLAG% %SKIP_INSTALL_FLAG% %SKIP_SUBMODULE_FLAG% %SKIP_PULL_FLAG% %OVERLAY_FLAG% %ELECTRON_FLAG% %HARNESS_FLAG% %HARNESS_COMMIT_FLAG% %PNPM_FLAG%
 
 exit /b %ERRORLEVEL%

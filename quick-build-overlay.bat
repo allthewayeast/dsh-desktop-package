@@ -15,11 +15,13 @@ echo     pnpm.mjs patch
 echo   - Build and package dsh-plugin-desktop to dist\win-unpacked
 echo   - NOT create any ZIP package
 echo.
-echo Electron / dsh runtime versions FOLLOW THE UPSTREAM DECLARATION by default.
+echo Electron / dsh runtime / pnpm versions FOLLOW THE UPSTREAM DECLARATION by default.
 echo Extra arguments are forwarded to build.ps1, e.g.
 echo   quick-build-overlay.bat -ElectronVersion 44.5.1
 echo   quick-build-overlay.bat -HarnessVersion 0.2.0-rc.2
 echo   quick-build-overlay.bat -HarnessVersion 0.2.1-alpha.1
+echo   quick-build-overlay.bat -PnpmVersion 11.28.5
+echo   (pnpm needs a curated patch for that version: overlay\pnpm\pnpm@^<ver^>.patch)
 echo   (the commit is derived from tag dsh-v^<version^>; pass -HarnessCommit only
 echo    if that version has no such tag, or to pin some other commit)
 echo Do NOT repeat -Target / -Overlay / -SkipSubmodule here: duplicate named

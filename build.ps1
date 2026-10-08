@@ -89,6 +89,19 @@
   显式指定时以参数为准，并与标签核对（不一致只告警，因为上游会前移同一版本的 commit）。
   仅在目标版本没有对应标签、或需要临时指向标签以外的 commit 时才用。
 
+.PARAMETER PnpmVersion
+  覆盖 pnpm 版本（可选）。**不指定时使用上游声明的版本**：完全不改写
+  <通道>/package.json 的 dependencies.pnpm，上游自带的
+  "pnpm@npm:<上游版本>": "patch:…/patches/pnpm@<上游版本>.patch" 原样生效。仅在 -Overlay
+  时生效；指定后把 dependencies.pnpm 改写为该版本，并把根 resolutions 的 pnpm 补丁条目
+  重指到同一版本、把 overlay\pnpm\pnpm@<版本>.patch 拷进 <src>\patches\。
+  ⚠️ 与 -ElectronVersion 的关键差别：pnpm 的补丁 resolution 键**是版本化的**
+  （"pnpm@npm:11.8.0"），换版本后原键不再匹配任何依赖 → 上游补丁会**静默失效**（Yarn 不
+  报错，node_modules 里就是未打补丁的原版）。所以指定该参数时**必须**同时提供该版本的
+  补丁 overlay\pnpm\pnpm@<版本>.patch；没有补丁时只告警、不重指 resolution（等于该版本的
+  --config.minimumReleaseAge=0 修复缺失）。
+  例：-PnpmVersion 11.28.5。
+
 .PARAMETER KeepTimestamps
   保留 Electron 官方 zip 的 1980-01-01 时间戳（可复现构建行为）。
   默认关闭：打包后会把 dist\win-unpacked 内文件时间戳规整为当前时间。
@@ -98,6 +111,7 @@
   .\build.ps1 -Target package-dir              # 解包打包（无覆盖层）
   .\build.ps1 -Overlay -Target package-dir     # 应用本地覆盖层（quick-build-overlay 默认）
   .\build.ps1 -Overlay -Target package-dir -ElectronVersion 45.0.0   # 临时换 Electron 版本
+  .\build.ps1 -Overlay -Target package-dir -PnpmVersion 11.28.5       # 临时换 pnpm 版本（需 overlay\pnpm\pnpm@11.28.5.patch）
   .\build.ps1 -Target package-dir -HarnessVersion 0.2.1-alpha.1   # 换 dsh 运行时版本（commit 由标签 dsh-v0.2.1-alpha.1 解析）
   .\build.ps1 -Target build                    # 编译
   .\build.ps1 -Target dist-win-portable
@@ -156,7 +170,16 @@ param(
   # 版本 == 上游声明 → 取上游 upstream.json 的 commit；否则 → 取标签 dsh-v<版本> 的 commit。
   # 显式给出时以参数为准，并与标签核对（不一致只告警：上游会前移同一版本的 commit）。
   [ValidatePattern('^(?:[0-9a-fA-F]{7,40})?$')]
-  [string]$HarnessCommit = ''
+  [string]$HarnessCommit = '',
+
+  # 覆盖层 pnpm 版本（仅在 -Overlay 时生效）。**未指定时使用上游声明的版本**：
+  # '' = 未指定 → 完全不改写 <通道>/package.json 的 dependencies.pnpm（构建上游原样，
+  # 上游自带的 patches/pnpm@<版本>.patch resolution 照旧生效）；指定 → 改写为该版本，
+  # 并把根 resolutions 的 pnpm 补丁条目重指到该版本（补丁取自 overlay\pnpm\pnpm@<版本>.patch）。
+  # 语义与 -ElectronVersion 一致；差别在于 pnpm 的补丁 resolution 键是版本化的，
+  # 换版本必须同时重指，否则补丁静默失效 —— 详见 Set-PnpmOverride。
+  [ValidatePattern('^(?:\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?)?$')]
+  [string]$PnpmVersion = ''
 )
 
 Set-StrictMode -Version Latest
@@ -221,6 +244,23 @@ $script:HarnessOverrideActive = $MyInvocation.BoundParameters.ContainsKey('Harne
   (-not [string]::IsNullOrWhiteSpace($HarnessVersion))
 $script:ResolvedRuntimeVersion = $null
 $script:ResolvedHarnessCommit = $null
+# 本地覆盖层：pnpm 目标版本（-PnpmVersion）。语义与 $script:ElectronOverride 完全一致：
+# 未指定（''）时不覆盖 —— 上游 dependencies.pnpm 与上游自己的
+# "pnpm@npm:<上游版本>": "patch:…" resolution 原样生效。
+# ⚠️ 与 electron 的**关键差别**：pnpm 的补丁挂在**版本化的 resolution 键**上
+# （"pnpm@npm:11.8.0"）。一旦把依赖换成别的版本，该键不再匹配任何依赖 → Yarn 不再打补丁，
+# 而且**不报错**（node_modules 里就是未打补丁的原版）。Desktop 依赖这个补丁：
+# provider 每次最终执行 pnpm 都加 --config.minimumReleaseAge=0，而 pnpm 11 对字符串 "0"
+# 按 truthy 处理（会把年龄门禁误启用）。所以指定 -PnpmVersion 时必须同时重指 resolution 并
+# 提供该版本的补丁（overlay\pnpm\pnpm@<版本>.patch），见 Set-PnpmOverride。
+$script:PnpmOverride = $PnpmVersion
+$script:PnpmVersionExplicit = $MyInvocation.BoundParameters.ContainsKey('PnpmVersion')
+$script:PnpmOverrideActive = $script:PnpmVersionExplicit -and
+  (-not [string]::IsNullOrWhiteSpace($PnpmVersion))
+# 逐版本策展的 pnpm 补丁存放处（包根仓库 overlay\pnpm\pnpm@<版本>.patch）。
+# 之所以不放进 overlay\patches\：那里是「对已跟踪文件打 git apply」的机制，而 pnpm 补丁是
+# Yarn 的 patch: 协议产物，必须原样落到 <src>\patches\ 供 resolutions 引用。
+$script:PnpmPatchSourceDir = Join-Path $script:Root 'overlay\pnpm'
 # 排除 beta 通道：不再安装 dsh-plugin-desktop-beta 的依赖、不参与任何编译，
 # 其 manifest 也不再被 AA 准备脚本读取/改写。设为 $false 可临时恢复 beta。
 $script:DisableBeta = $true
@@ -565,6 +605,9 @@ function Show-Environment {
     $elDesc = if ($script:ElectronOverrideActive) { "$($script:ElectronOverride)（-ElectronVersion 指定）" }
               else { '上游声明版本（未指定 -ElectronVersion，不覆盖）' }
     Write-Info "Electron    : $elDesc"
+    $pnpmDesc = if ($script:PnpmOverrideActive) { "$($script:PnpmOverride)（-PnpmVersion 指定）" }
+                else { '上游声明版本（未指定 -PnpmVersion，不覆盖）' }
+    Write-Info "pnpm        : $pnpmDesc"
   }
   $harnessDesc = if ($script:HarnessOverrideActive) { "$($script:ResolvedRuntimeVersion)（-HarnessVersion 指定，commit $($script:ResolvedHarnessCommit.Substring(0, [Math]::Min(12, $script:ResolvedHarnessCommit.Length)))）" }
                  else { "$($script:ResolvedRuntimeVersion)（上游 upstream.json 声明，未指定 -HarnessVersion，不固定）" }
@@ -881,9 +924,84 @@ function Set-ElectronOverride {
     Write-Info "electron 官方声明已与覆盖目标一致（$current），跳过版本覆盖。"
     return $false
   }
-  $fixed = [regex]::Replace($text, '("electron"\s*:\s*")([^"]+)(")', "`${1}$($script:ElectronOverride)`${3}", 1)
+  # 注意：这里**不传**[regex]::Replace 的第 4 个参数。看起来像 count 的那个位置实际是
+  # RegexOptions（传 1 = IgnoreCase），并非“只替换第一处” —— 于是 peerDependencies 与
+  # devDependencies 两处都会被改写（正是需要的结果：devDependencies 才决定实际安装的版本）。
+  # 显式写成“替换全部”，避免后人误以为只改了一处。
+  $fixed = [regex]::Replace($text, '("electron"\s*:\s*")([^"]+)(")', "`${1}$($script:ElectronOverride)`${3}")
   Set-Content -LiteralPath $pkgPath -Value $fixed -Encoding utf8 -NoNewline
   Write-WarnLine "覆盖层：$script:ChannelWsName electron $current → $($script:ElectronOverride)"
+  return $true
+}
+
+function Set-PnpmOverride {
+  # <channel>/package.json 的 dependencies.pnpm → $script:PnpmOverride，并把根 resolutions 的
+  # pnpm 补丁条目补到同一版本。
+  # **未指定 -PnpmVersion 时完全不改写**（上游声明 + 上游补丁 resolution 原样生效）；
+  # 上游声明已与覆盖目标一致时同样跳过。
+  # 指定了不同版本时，下面三件事必须同时成立，否则 age-gate 修复会**静默**消失：
+  #   1) 依赖版本 = 目标版本                                  ← 第 1 段
+  #   2) <src>\patches\pnpm@<目标>.patch 存在（从 overlay\pnpm\ 拷入）  ← 第 2 段
+  #   3) 根 resolutions 里有 "pnpm@npm:<目标>": "patch:…" 条目            ← 第 3 段
+  # 为什么 2) 3) 不能省：resolution 键是**版本化**的（"pnpm@npm:11.8.0"）。把依赖换成别的
+  # 版本后，原键不再匹配任何依赖 → Yarn 不再打补丁，**而且不报错** —— node_modules 里就是
+  # 未打补丁的原版，Desktop 的 --config.minimumReleaseAge=0（pnpm 11 对字符串 "0" 按 truthy
+  # 处理）缺陷随之复现。这属于「构建成功但定制没生效」，必须避免。
+  $pkgPath = Get-ChannelWsPath 'package.json'
+  if (-not (Test-Path -LiteralPath $pkgPath)) {
+    throw "通道 $script:Channel 的工作区不存在：$pkgPath。请先同步到最新 master（双通道目录结构）。"
+  }
+  $text = Get-Content -LiteralPath $pkgPath -Raw -Encoding utf8
+  # 只匹配 dependencies 里的 "pnpm": "<版本>"：模式要求键恰为 "pnpm"，
+  # exports 里的 "./pnpm"（引号前是斜杠）不会命中。
+  $pattern = '("pnpm"\s*:\s*")([^"]+)(")'
+  if ($text -notmatch $pattern) {
+    Write-WarnLine "覆盖层：$pkgPath 中未找到 pnpm 依赖声明，跳过。"
+    return $false
+  }
+  $current = $Matches[2]
+  if (-not $script:PnpmOverrideActive) {
+    Write-Info "pnpm 使用上游声明版本（$current）：未指定 -PnpmVersion，跳过版本覆盖。"
+    return $false
+  }
+  if ($current -eq $script:PnpmOverride) {
+    Write-Info "pnpm 上游声明已与覆盖目标一致（$current），跳过版本覆盖。"
+    return $false
+  }
+  $fixed = [regex]::Replace($text, $pattern, "`${1}$($script:PnpmOverride)`${3}")
+  Set-Content -LiteralPath $pkgPath -Value $fixed -Encoding utf8 -NoNewline
+  Write-WarnLine "覆盖层：$script:ChannelWsName pnpm $current → $($script:PnpmOverride)"
+
+  # --- 第 2 段：把该版本的策展补丁落到 <src>\patches\ ---
+  $patchName = "pnpm@$($script:PnpmOverride).patch"
+  $srcPatch = Join-Path $script:PnpmPatchSourceDir $patchName
+  if (-not (Test-Path -LiteralPath $srcPatch)) {
+    Write-WarnLine "覆盖层：缺少 $srcPatch —— 无法为 pnpm $($script:PnpmOverride) 重指 age-gate 补丁。"
+    Write-WarnLine "        ⇒ 该版本的 pnpm 将以**未打补丁的原版**打包（最小发布年龄缺陷可能复现）。"
+    Write-WarnLine "        ⇒ 补丁生成方法见 BUILD_GUIDE.md「pnpm 版本覆盖」：对该版本的 dist/pnpm.mjs 重新 diff。"
+    return $true
+  }
+  $dstPatch = Join-Path $script:Src "patches\$patchName"
+  Copy-Item -LiteralPath $srcPatch -Destination $dstPatch -Force
+  Write-Info "覆盖层：pnpm 补丁已就位 patches\$patchName"
+
+  # --- 第 3 段：补 resolutions 条目（已存在则不动；保留旧版本的条目） ---
+  $rootPkg = Join-Path $script:Src 'package.json'
+  $rootText = Get-Content -LiteralPath $rootPkg -Raw -Encoding utf8
+  if ($rootText -notmatch [regex]::Escape('"pnpm@npm:' + $script:PnpmOverride + '":')) {
+    $anchor = [regex]::Match($rootText, '(?<nl>\r?\n)(?<ind>[ \t]*)("pnpm@npm:[^"]+":\s*"patch:pnpm@npm%3A[^"]+#\./patches/pnpm@[^"]+\.patch",)')
+    if (-not $anchor.Success) {
+      throw "未在 $rootPkg 的 resolutions 中找到 pnpm 补丁条目，无法为 $($script:PnpmOverride) 补上 resolution。请检查上游是否改写了该条目。"
+    }
+    $insert = $anchor.Groups['nl'].Value + $anchor.Groups['ind'].Value +
+      '"pnpm@npm:' + $script:PnpmOverride + '": "patch:pnpm@npm%3A' + $script:PnpmOverride +
+      '#./patches/' + $patchName + '",'
+    $rootText = $rootText.Insert($anchor.Index + $anchor.Length, $insert)
+    Set-Content -LiteralPath $rootPkg -Value $rootText -Encoding utf8 -NoNewline
+    Write-WarnLine "覆盖层：根 resolutions 已补上 pnpm@npm:$($script:PnpmOverride) 的补丁条目（旧的保留）"
+  } else {
+    Write-Info "根 resolutions 已存在 pnpm@npm:$($script:PnpmOverride) 的补丁条目，保持不动。"
+  }
   return $true
 }
 
@@ -1963,6 +2081,14 @@ function Test-InstalledElectron {
   return (Get-JsonObject $pkg).version
 }
 
+function Test-InstalledPnpm {
+  # 返回当前通道 node_modules 里已安装的 pnpm 版本（不存在返回 $null）。
+  # 用途与 Test-InstalledElectron 相同：-SkipInstall 时判断覆盖目标是否需要补装。
+  $pkg = Get-ChannelWsPath 'node_modules\pnpm\package.json'
+  if (-not (Test-Path -LiteralPath $pkg)) { return $null }
+  return (Get-JsonObject $pkg).version
+}
+
 function Apply-SrcOverlay {
   # pull 后恢复 src 覆盖层：
   #   1) overlay\src\<basename> → 复制回仓库（新建文件）
@@ -2148,12 +2274,13 @@ function Export-AaVendorPublication {
 }
 
 function Invoke-ChannelOverlayPreInstall {
-  # 用户定制覆盖层（安装前，仅 -Overlay）：electron 版本 / .yarnrc.yml 门禁 / 图标
-  # / src 覆盖层（新建文件 + 修改补丁）/ AA 本机发布记录
+  # 用户定制覆盖层（安装前，仅 -Overlay）：electron 版本 / pnpm 版本 / .yarnrc.yml 门禁
+  # / 图标 / src 覆盖层（新建文件 + 修改补丁）/ AA 本机发布记录
   # （npmRebuild=false 与 afterAllArtifactBuild 移除属本机必需修复，另行无条件应用）
   Reset-OverlayTrackedFiles  # 确保工作树覆盖层文件与上游一致后再改（幂等）
   Restore-AaVendorPublication
   $null = Set-ElectronOverride
+  $null = Set-PnpmOverride
   Set-AgeGateConfig
   Copy-TrayIconAssets
   Apply-SrcOverlay
@@ -2647,6 +2774,10 @@ try {
     $installedElectron = Test-InstalledElectron
     if ($Overlay -and $script:ElectronOverrideActive -and $installedElectron -and $installedElectron -ne $script:ElectronOverride) {
       $needInstall += "electron 已装 $installedElectron ≠ 覆盖目标 $($script:ElectronOverride)"
+    }
+    $installedPnpm = Test-InstalledPnpm
+    if ($Overlay -and $script:PnpmOverrideActive -and $installedPnpm -and $installedPnpm -ne $script:PnpmOverride) {
+      $needInstall += "pnpm 已装 $installedPnpm ≠ 覆盖目标 $($script:PnpmOverride)"
     }
     $state = Read-BuildState
     $lastLockHash = $null

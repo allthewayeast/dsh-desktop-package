@@ -192,6 +192,8 @@ pwsh -File .\build-next.ps1 -Target package-dir -SkipSubmodule   # 等同 bat
 - dsh 运行时（deepseek-harness）**跟随上游 `upstream.json` stable 通道声明**（不固定）；
   需要换版本时传 `-HarnessVersion <版本>`（commit 自动由标签 `dsh-v<版本>` 解析，
   通常无需 `-HarnessCommit`，见 6.6）
+- pnpm **跟随上游 `dependencies.pnpm` 声明**（不改写）；需要换版本时传 `-PnpmVersion <版本>`，
+  但**必须同时提供该版本的补丁** `overlay/pnpm/pnpm@<版本>.patch`（原因见下节）
 - `.yarnrc.yml` 追加 `npmMinimalAgeGate: 0`（允许使用刚发布的版本）
 - 定制托盘 / 应用图标（源在仓库 `build/` 目录）
 - `overlay/src/*.ts` 复制为 `dsh-plugin-desktop` 新文件（`startup-config.ts` 及其测试）
@@ -212,22 +214,74 @@ pwsh -File .\build-next.ps1 -Target package-dir -SkipSubmodule   # 等同 bat
 2. **需要同时满足多版本的补丁要用 `git diff -U1`** 最小上下文导出，
    并加进 `NoAutoExportPatchFiles`，防止被自动导出覆盖回 `-U3` 版本。
 
-### 版本覆盖参数（`-ElectronVersion` / `-HarnessVersion`）
+### 版本覆盖参数（`-ElectronVersion` / `-HarnessVersion` / `-PnpmVersion`）
 
-两个版本都遵循同一条规则：**不指定 = 使用上游声明的版本，不改写任何文件；指定 = 覆盖**。
+三个版本都遵循同一条规则：**不指定 = 使用上游声明的版本，不改写任何文件；指定 = 覆盖**。
 
 | 参数 | 不指定时 | 指定时 | 作用范围 |
 |------|----------|--------|----------|
 | `-ElectronVersion <版本>` | 用上游 `<通道>/package.json` 里的 `devDependencies.electron`（**完全不改写**） | 改写为该版本；已装版本不一致时自动补装依赖（含 Electron 头文件缓存与 dist 解包） | 仅 `-Overlay` 生效 |
 | `-HarnessVersion <版本>` | 用上游 `upstream.json` stable 通道的 `sourceVersion` / `commit`（**不固定、不改写**） | 改写 `upstream.json`（commit / sourceVersion / runtimePackageVersion / runtimeSource）+ 当前通道工作区 `@deepseek-ai/dsh*` 依赖 + 根 `resolutions` | 与 `-Overlay` 无关 |
 | `-HarnessCommit <sha>` | 目标版本 == 上游声明 → 上游 `upstream.json` 的 `commit`；否则 → 标签 `dsh-v<版本>` 指向的 commit（见下） | 用指定 commit，并与标签核对（不一致只告警） | 通常**无需**指定；仅在版本无标签、或要指向标签以外的 commit 时用 |
+| `-PnpmVersion <版本>` | 用上游 `<通道>/package.json` 的 `dependencies.pnpm`（**完全不改写**），上游自带的 `"pnpm@npm:<版本>": "patch:…"` 条目原样生效 | 改写 `dependencies.pnpm` + 把 `overlay/pnpm/pnpm@<版本>.patch` 拷进 `dsh-desktop/patches/` + 在根 `resolutions` 补上该版本的补丁条目（**旧条目保留**） | 仅 `-Overlay` 生效；**该版本的补丁必须已策展**，缺补丁时只告警（见下） |
 
 ```powershell
-.\build.ps1 -Overlay -Target package-dir                              # 两个版本都随上游
+.\build.ps1 -Overlay -Target package-dir                              # 三个版本都随上游
 .\build.ps1 -Overlay -Target package-dir -ElectronVersion 45.0.0      # 只换 Electron
+.\build.ps1 -Overlay -Target package-dir -PnpmVersion 11.28.5         # 换 pnpm（需 overlay/pnpm/pnpm@11.28.5.patch）
 .\build.ps1 -Target package-dir -HarnessVersion 0.2.0-rc.2            # 与上游同版本 → 自动取上游 commit
 .\build.ps1 -Target package-dir -HarnessVersion 0.2.1-alpha.1         # 换版本 → commit 由标签 dsh-v0.2.1-alpha.1 解析
 ```
+
+#### pnpm 版本覆盖为什么必须带补丁（`-PnpmVersion`）
+
+`electron` 与 `pnpm` 的覆盖机制有一个**关键差别**，漏掉就会出现「构建成功但定制没生效」：
+
+| 对比项 | electron | pnpm |
+|---|---|---|
+| 上游补丁挂在哪 | （无同类机制） | 根 `resolutions` 的**版本化键**：`"pnpm@npm:11.8.0": "patch:pnpm@npm%3A11.8.0#./patches/pnpm@11.8.0.patch"` |
+| 换版本后原键 | —— | **不再匹配任何依赖** → Yarn 不打补丁，**而且不报错** |
+| 补丁作用 | —— | `dist/pnpm.mjs` 的年龄门禁修复（pnpm 11 把字符串 `"0"` 按 truthy 处理，而 Desktop 每次最终执行 pnpm 都会加 `--config.minimumReleaseAge=0`） |
+
+所以 `Set-PnpmOverride` 在改写版本时会把三件事一起做：改写 `dependencies.pnpm`、把
+`overlay/pnpm/pnpm@<版本>.patch` 拷进 `dsh-desktop/patches/`、在根 `resolutions` 里补上
+`"pnpm@npm:<版本>": "patch:pnpm@npm%3A<版本>#./patches/pnpm@<版本>.patch"`（旧版本条目保留，
+互不影响）。**没有对应版本的补丁时只告警、不重指**，并在日志里说明该版本的 pnpm 会以未打补丁的原版打包。
+
+**为新版本生成补丁**（改动集中在 3 处，且上游会重构函数位置，必须按新版本原文重新 diff）：
+
+```powershell
+npm pack pnpm@<版本> --pack-destination $env:TEMP     # 1) 取该版本的原始 dist/pnpm.mjs
+tar -xzf $env:TEMP\pnpm-<版本>.tgz -C $env:TEMP\pnpm-new
+# 2) 在 git 仓库里逐处改好，再导出（务必 LF 行尾、路径相对包根）
+git diff -- dist/pnpm.mjs > overlay\pnpm\pnpm@<版本>.patch
+```
+
+补丁必须命中这几处 —— `dsh-plugin-desktop/tests/package.spec.ts` 的断言正是按这些标记检查已安装运行时的：
+
+| # | 位置 | 原始代码 | 改成 |
+|---|------|----------|------|
+| 1 | `getPublishedByPolicy` | `publishedBy: opts3.minimumReleaseAge ? …` | 先 `const minimumReleaseAge = Number(opts3.minimumReleaseAge);`，再 `Number.isFinite(minimumReleaseAge) && minimumReleaseAge > 0 ? …` |
+| 2 | 年龄检查里 `ageCheckActive` / `cutoff` 所在函数（11.8.0 在 `createNpmResolutionVerifier`，**11.28.5 已重构进 `createVerifierSettings`**） | `const ageCheckActive = Boolean(opts3.minimumReleaseAge);` | `const configuredMinimumReleaseAge = Number(…);` + `const minimumReleaseAge = Number.isFinite(configuredMinimumReleaseAge) && configuredMinimumReleaseAge > 0 ? … : 0;` + `const ageCheckActive = minimumReleaseAge > 0;` |
+| 3 | `detectMinReleaseAgeViolation` | `if (Number.isNaN(ts) \|\| ts <= args.publishedBy.getTime())` | `const cutoff = args.publishedBy.getTime();` + `if (!Number.isFinite(ts) \|\| !Number.isFinite(cutoff) \|\| ts <= cutoff)`，并把 `reason` 里的 `args.publishedBy` 换成 `new Date(cutoff)` |
+
+**已策展的补丁**：
+
+| 补丁 | 对应 pnpm | 备注 |
+|---|---|---|
+| `overlay/pnpm/pnpm@11.28.5.patch` | 11.28.5（pnpm 11 线最新） | 3 处改动（上游把 11.8.0 补丁的 hunks 2/3 合并重构进了 `createVerifierSettings`）；已验证 `git apply --check` 通过、打了补丁的 `node dist/pnpm.mjs --version` 正常输出 |
+
+⚠️ **覆盖版本会让上游的「版本断言」测试失败**（与 `-ElectronVersion` 同一性质）：
+`dsh-plugin-desktop/tests/package.spec.ts` 把 `dependencies.pnpm`、锁文件条目、补丁路径写死为 `11.8.0`
+（同一文件也把 electron 写死为 `44.0.0`）。所以带 `-PnpmVersion` 时 `-Target check` / `-Target test`
+会在这几条断言上失败 —— 这是**有意保留**的：这些测试校验的是「上游声明的那一版」，覆盖属于本地构建开关。
+打包路径（`package-dir` / `dist-win*`）不跑这些测试，不受影响。补丁**内容**层面的断言（上面那 5 个标记）
+在覆盖版本下依然成立。
+
+⚠️ **别把 `npm latest` 当「最新」**：pnpm 的 `latest` 已经是 **12.x**，而 12 把引擎换成了**原生二进制**
+（`@pnpm/exe.<平台>`，win32-x64 解包 46.9 MB），`dist/pnpm.mjs` **不再存在** —— 补丁无处可打，
+`package.spec.ts` 与 `Set-PnpmDistPatch` 双双失效，且 `verify-packaged-runtime.ts` 对
+`node_modules/pnpm` 有 32 文件 / 32 MB 的解包预算。想要 12.x 必须另做适配，不要直接传 `-PnpmVersion 12.x`。
 
 #### commit 是怎么从版本解出来的（`-HarnessVersion` → commit）
 
@@ -368,6 +422,7 @@ logs\build-YYYYMMDD-HHMMSS.log
 | `-ElectronVersion` → `$script:ElectronOverride` | `build.ps1` | Electron 版本覆盖；**不指定 = 随上游** `devDependencies.electron`，与官方声明一致时跳过改写 |
 | `-HarnessVersion` → `$script:ResolvedRuntimeVersion` | `build.ps1` | dsh 运行时版本；**不指定 = 随上游** `upstream.json` stable 的 `sourceVersion` |
 | `-HarnessCommit` → `$script:ResolvedHarnessCommit` | `build.ps1` | 目标 `deepseek-harness` commit；未显式给时：版本 == 上游声明 → 取上游 `upstream.json` 的 `commit`，否则 → 取标签 `dsh-v<版本>` 的 commit（`Resolve-HarnessCommitFromTag`） |
+| `-PnpmVersion` → `$script:PnpmOverride` | `build.ps1` | pnpm 版本覆盖；**不指定 = 随上游** `dependencies.pnpm`。指定时**必须**同时有 `overlay/pnpm/pnpm@<版本>.patch`，否则 age-gate 补丁静默失效（`Set-PnpmOverride`） |
 | `$script:HarnessVersionOverride` / `$script:HarnessCommitOverride` | `build.ps1` | 命令行传入的覆盖值（解析前捕获；**勿与 `Resolved*` 混用**，见 6.6 命名铁律） |
 | `upstream.json` | `dsh-desktop\upstream.json` | 各通道的 `commit` / `sourceVersion` / `runtimeSource`。⚠️ **工作区那份可能已被上一次构建固定改写**，上游真身要看 `git show HEAD:upstream.json` |
 
