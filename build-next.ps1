@@ -19,6 +19,29 @@
     5. 不做图标处理（按需求）。
     6. 运行时跟随上游（不再钉 0.1.7-rc.2），deepseek-harness 子模块对齐上游 HEAD 的 gitlink。
 
+  overlay-next 现在只承担一件事：把 exe 同级的 startup.json 接进启动流程。
+    overlay-next\src\startup-config.ts        新文件：启动配置解析（网络/环境变量开关）
+    overlay-next\src\startup-config.spec.ts   新文件：配套单测
+    overlay-next\patches\main.ts.patch        接入 applyDesktopStartupConfig + 让 DSH_HOME 生效
+    overlay-next\startup.json                 运行时数据，构建后拷到 exe 同级
+  "让 DSH_HOME 生效"不是附加功能：startup.json 里配置的就是 DSH_HOME，而 next 原本只认
+  DSH_DESKTOP_NEXT_HOME，不补这段启动配置就落不到 home 上。
+
+  2026-10-14 起 ASAR 相关的策展全部撤掉，因为上游自己接过去了，且我们的旧做法会与新门禁冲突：
+    - 上游 dsh-desktop-next\package.json 现在自带 "asar": true + build.asarUnpack（含
+      bundled-connector / pnpm / node-bin / assets 的完整清单）→ 已无需我们重新启用 ASAR；
+    - 上游 scripts\verify-packaged.ts 现在**要求** app.asar 存在、且禁止并列的 resources\app
+      目录（afterPack 里 archivedPayload/auditNextPayload/sealNextPayload）→ 我们旧补丁
+      "兼容两种布局"的写法反而与该门禁矛盾；
+    - 上游 scripts\verify-fuses.ts 明确按"两个 archive fuse 全关"校验（注释：archive 由代码
+      签名封存），传 requiresAsar=false，与上游 fuses 配置一致 → 旧补丁把 fuses 打开会让这条
+      校验直接失败；
+    - LibreOffice 其他平台包、source map、.d.ts 等由上游 scripts\runtime-file-policy.ts +
+      auditNextPayload 负责剔除（含 "must not be packaged" 断言）→ 旧的 win.files 排除项
+      已多余，而且它有害：见下。
+  保留 afterAllArtifactBuild（上游 verify-fuses.ts）：它会用打包后的 exe 以 Node 模式真启动
+  一次 Host 做冒烟，是本仓库最强的产物验收，不要像以前那样删掉它。
+
 .PARAMETER Target
   构建目标。默认 package-dir（编译 + 解包目录，不打安装包）。
 
@@ -95,37 +118,36 @@ $script:OverlayFiles = @{
 }
 # 已跟踪文件的修改：overlay-next\patches\<basename>.patch
 $script:OverlayPatches = @(
-  'dsh-desktop-next/package.json'
   'dsh-desktop-next/src/main.ts'
-  'dsh-desktop-next/scripts/verify-packaged.ts'
-  'dsh-desktop-next/scripts/verify-fuses.ts'
 )
 
-# 只应用、不自动导出的补丁目标（与 build.ps1 的 NoAutoExportPatchFiles 同源）。
-# dsh-desktop-next\package.json 必然同时承受多处构建期注入：
-#   - 本脚本 Set-ElectronOverride  改写 electron 版本（-ElectronVersion）
-#   - 本脚本 Set-PackagingFixes    移除 build.afterAllArtifactBuild
-#   - build.ps1（stable）Set-AAVendorDependency 按 AA_WORKSPACES 动态遍历，
-#     把 @agents-anywhere/dsh-bridge-next 对齐到 vendor\agents-anywhere 的本机发布产物
-#     （该列表含 next）→ stable 的构建也会写这个文件
-# 于是 Export-Overlay 看到的“工作区 git diff”可能只含这些注入，导出即把
-# overlay-next\patches\package.json.patch 里手工维护的 ASAR 内容
-# （asar:{smartUnpack} + 两个 ASAR fuse + 三平台 asarUnpack）整份覆盖掉 ——
-# 产物会静默退回 resources\app\ 的散文件布局（build.ps1 侧已因此复发三次）。
-# 这里只应用、不自动导出；补丁内容在包根仓库手工维护并提交。
-$script:NoAutoExportPatchFiles = @(
-  'dsh-desktop-next/package.json'
-)
+# 注意：dsh-desktop-next\package.json **不再**需要覆盖层补丁（见文件头 2026-10-14 说明：
+# 上游已自带 asar + asarUnpack + 平台剔除策略）。同时它也是唯一会被构建期注入的文件
+# （本脚本的 -ElectronVersion、stable 侧 Set-AAVendorDependency 都会改写它），本来就不该
+# 自动导出。既然不再需要补丁，这里直接把该文件从 OverlayPatches 移除，避免"注入被当成
+# 策展内容导出"的老坑再次出现。
 
-# 产物核对：exe 同级 / 应用负载内必须具备的条目
+# 产物核对：应用负载（app.asar 或 resources\app）内必须具备的条目。
+# 与上游 scripts\verify-packaged.ts → verifyNextPayload() 的必查清单保持一致，外加
+# 官方 Web 前端入口（上游靠依赖闭包查它）。保持一致的好处：上游 afterPack 报错前，
+# 这里就能先给出更短的清单式诊断。
 $script:RequiredPayloadEntries = @(
   'lib/main.js'
   'lib/host.js'
   'lib/client.js'
+  'lib/preload-app.cjs'
+  'lib/preload-shell.cjs'
+  'lib/native-ui/index.html'
   'cordis.patch.yml'
   'host.cordis.patch.yml'
-  'startup-config.ts 集成点'
+  'scripts/node-bin/node'
+  'scripts/node-bin/node.cmd'
+  'assets/tray-iconTemplate.png'
+  'assets/tray-icon-blue.png'
+  'node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html'
 )
+# 覆盖层专属断言：只有我们的补丁会引入这些字符串。
+#   lib/main.js 必须含 startup-config 的集成点（否则 exe 同级的 startup.json 不会被读）
 $script:RequiredMarkers = @{
   'lib/main.js' = 'applyDesktopStartupConfig'
 }
@@ -236,24 +258,14 @@ function Ensure-Submodule {
 function Export-Overlay {
   # 把工作区里这些文件的本地改动导出成 overlay-next\patches，然后再 pull。
   # 这样"改了源码 → 跑本脚本"就能固化改动，且 pull 不会丢。
-  # 例外：$script:NoAutoExportPatchFiles 列出的文件只告警不导出（其工作区改动里
-  # 必然混有构建期注入，导出即毁掉手工维护的策展内容）。
+  # 现在列表里只有 main.ts：它是纯策展文件（工作区改动 = 我们的接线），可以安全导出。
+  # package.json 已不在列表里 —— 它的改动只会是构建期注入，导出会覆盖策展内容。
   if ($SkipPull) { return }
   Push-Location $script:Src
   try {
     $patchDir = Join-Path $script:OverlayDir 'patches'
     New-Item -ItemType Directory -Force -Path $patchDir | Out-Null
     foreach ($rel in $script:OverlayPatches) {
-      if ($script:NoAutoExportPatchFiles -contains $rel) {
-        # 只告警、不落盘：该文件的本地改动多半来自构建期注入，导出会覆盖策展补丁。
-        $prevNativeGuard = $PSNativeCommandUseErrorActionPreference
-        $PSNativeCommandUseErrorActionPreference = $false
-        try { $dirty = @(& git status --porcelain -- $rel) } finally { $PSNativeCommandUseErrorActionPreference = $prevNativeGuard }
-        if ($dirty.Count -gt 0) {
-          Write-WarnLine "覆盖层：$rel 有本地改动，但该补丁为手工维护（构建期会注入依赖版本 / electron 版本 / AA 产物）→ 已跳过自动导出。如需固化，请手工更新 overlay-next\patches\$([IO.Path]::GetFileName($rel)).patch 并提交到包根仓库。"
-        }
-        continue
-      }
       $prevNative = $PSNativeCommandUseErrorActionPreference
       $PSNativeCommandUseErrorActionPreference = $false
       try {
@@ -421,25 +433,85 @@ function Set-ElectronOverride {
   Write-WarnLine "覆盖层：electron $current → $ElectronVersion"
 }
 
-function Set-PackagingFixes {
-  # 与 stable 相同的 Windows 打包必需修复。
-  # 1) package.ts 的 dir 目标禁用原生重编译（本机没有完整编译环境）
-  $dirScript = Join-Path $script:WsDir 'scripts\package.ts'
-  if (Test-Path -LiteralPath $dirScript) {
-    $t = [System.IO.File]::ReadAllText($dirScript)
-    if ($t -notmatch 'npmRebuild' -and $t -match 'electron-builder') {
-      Write-Info 'package.ts 未显式设置 npmRebuild（已由 build.npmRebuild=false 覆盖）'
-    }
-  }
-  # 2) 移除 afterAllArtifactBuild（PR #829 事后校验钩子在本机会失败；它只在
-  #    dist:win 之类目标里跑，package-dir 不触发，但保持与 stable 一致更安全）
+function Test-PackagingPosture {
+  # 只读检查：next 的打包姿态由上游决定，我们只依赖其中几项。旧版这里会**改文件**
+  # （删掉 build.afterAllArtifactBuild 关掉上游的事后校验），见文件头说明：那会让上游
+  # 最强的产物验收从来不跑，已撤销。现在只在姿态变化时提前告警，避免构建跑到一半才炸在
+  # 难懂的地方。
   $pkgPath = Join-Path $script:WsDir 'package.json'
   $pkg = Get-JsonObject $pkgPath
-  if ($pkg.build.PSObject.Properties.Name -contains 'afterAllArtifactBuild') {
-    $pkg.build.PSObject.Properties.Remove('afterAllArtifactBuild')
-    Set-Content -LiteralPath $pkgPath -Value (ConvertTo-Json $pkg -Depth 100) -Encoding utf8 -NoNewline
-    Write-WarnLine '修复：已移除 build.afterAllArtifactBuild（禁用 PR #829 事后校验钩子）'
+  $build = $pkg.build
+
+  # ① ASAR 必须开着：上游 afterPack（verify-packaged.ts）要求 app.asar 存在、且禁止并列的
+  #    resources\app 目录；本脚本的产物核对也按归档读条目。
+  if ($build.asar -eq $false) {
+    Write-WarnLine '打包姿态：build.asar 被关掉 —— 上游 afterPack（要求 app.asar、禁止 resources\app）与本脚本的产物核对都会失败。'
+  } else {
+    Write-Info '打包姿态：asar 已启用（上游自带 asarUnpack 清单）'
   }
+
+  # ② npmRebuild：本机没有完整原生编译环境，必须保持 false。
+  if ($build.npmRebuild -ne $false) {
+    Write-WarnLine "打包姿态：build.npmRebuild = $($build.npmRebuild)（期望 false）—— 缺少原生编译环境时打包会失败。"
+  }
+
+  # ③ ★ 平台段 files 一旦出现，就会顶掉整份 app 文件白名单。
+  #    electron-builder 26 的 util\config\config.js normalizeFiles() 把顶层字符串数组折成
+  #    [{filter:[...]}] 的单个 FileSet；于是 fileMatcher.js getFileMatchers() 里
+  #    defaultMatcher 只剩平台段那些字符串，而 getMainFileMatchers() 只取 matchers[0]
+  #    （=defaultMatcher）。平台段若全是排除项 → containsOnlyIgnore() 成立 → 遍历器被前置
+  #    **/* → 白名单失效，包目录里没被默认规则排除的东西全都会进 app.asar。对 next 来说
+  #    这直接撞上游 auditNextPayload 的 stray root 断言（src/、tests/、.desktop-build 等）。
+  $platformFiles = @()
+  foreach ($key in 'mac', 'win', 'linux') {
+    if ($build.PSObject.Properties.Name -contains $key) {
+      $section = $build.$key
+      if ($section -and ($section.PSObject.Properties.Name -contains 'files')) { $platformFiles += $key }
+    }
+  }
+  if ($platformFiles.Count -gt 0) {
+    Write-WarnLine ("打包姿态：build." + ($platformFiles -join '/build.') + ' 声明了平台段 files —— 它会顶掉顶层白名单（matchers[0] 只取平台段），产物可能多出 src/、tests/、.desktop-build 等游离条目，并在 afterPack 的 auditNextPayload 处失败。排除项请写在顶层 build.files 里。')
+  }
+
+  # ④ afterAllArtifactBuild：上游 verify-fuses.ts 会用打包后的 exe 以 Node 模式真启动一次
+  #    Host（外加 fuse 与 runtime 校验），是本仓库最强的产物验收，不要删。
+  if ($build.PSObject.Properties.Name -contains 'afterAllArtifactBuild') {
+    Write-Info "打包姿态：afterAllArtifactBuild = $($build.afterAllArtifactBuild)（打包后会跑一次真实 Host 冒烟）"
+  } else {
+    Write-WarnLine '打包姿态：build 未声明 afterAllArtifactBuild —— 上游的 fuse / runtime / Host 冒烟验收不会执行。'
+  }
+}
+
+function Set-PayloadExclusions {
+  # 把上游 scripts\runtime-file-policy.ts（nextRuntimeFileExclusion）的"不得打包"策略落到
+  # electron-builder 的文件集上。该策略由 afterPack 的 auditNextPayload 强制（命中即失败），
+  # 所以文件集必须与它一致。本机构建遇到的两类：
+  #   ① LibreOffice 只允许目标平台/架构的引擎包。本机是 win32-x64，但 .yarnrc.yml 的
+  #      supportedArchitectures cpu 含 x64+arm64（为通用 macOS 准备），于是
+  #      @deepseek-ai/libreoffice-kit-win32-arm64 也被装进来 → 1470 个文件触发
+  #      "LibreOffice other platform must not be packaged"。
+  #   ② @koromix/koffi-win32-x64\win32_x64\koffi.lib 是链接期导入库，运行期不需要
+  #      → "Koffi import library must not be packaged"。
+  # 位置必须是**顶层** build.files：electron-builder 26 把顶层字符串数组归一化成单个
+  # {filter:[...]}（util\config\config.js normalizeFiles），而 app 遍历器只取 matchers[0]；
+  # 写成平台段 build.win.files 反而会顶掉整份白名单（见 Test-PackagingPosture ③）。
+  # 顶层排除项同时进入 node_modules 遍历器 —— 上游 beforePack 注入 node-pty 排除项用的正是同一位置。
+  $pkgPath = Join-Path $script:WsDir 'package.json'
+  $text = [System.IO.File]::ReadAllText($pkgPath)
+  $m = [regex]::Match($text, '(?s)("files"\s*:\s*\[)(.*?)(\r?\n\s*\])')
+  if (-not $m.Success) { Write-WarnLine '打包排除项：未找到 build.files 数组（上游格式变化？），跳过 —— 注意产物可能因此被 afterPack 的 auditNextPayload 拒绝。'; return }
+  $body = $m.Groups[2].Value
+  $wanted = @(
+    '!node_modules/@deepseek-ai/libreoffice-kit-win32-arm64/**'
+    '!node_modules/@koromix/koffi-win32-x64/win32_x64/koffi.lib'
+  )
+  $add = @($wanted | Where-Object { $body -notmatch [regex]::Escape('"' + $_ + '"') })
+  if ($add.Count -eq 0) { Write-Info '打包排除项：已就位（无需注入）'; return }
+  $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+  $addition = ($add | ForEach-Object { ",$nl      `"$_`"" }) -join ''
+  $text = $text.Substring(0, $m.Groups[2].Index) + $body + $addition + $text.Substring($m.Groups[2].Index + $body.Length)
+  [System.IO.File]::WriteAllText($pkgPath, $text)
+  Write-WarnLine "打包排除项：已注入 $($add.Count) 条（与 runtime-file-policy.ts 对齐）：$($add -join '、')"
 }
 
 function Set-MarketWorkspaceCheck {
@@ -637,10 +709,11 @@ function Publish-OverlayRuntimeAssets {
 }
 
 function Get-ArchiveHelper {
-  # @electron/asar 是 dsh-desktop-next 的 devDependency，只在该工作区的
-  # node_modules 下可解析。Node 按"脚本自身所在目录"逐级向上找 node_modules，
-  # 所以探针脚本必须写在工作区内部（放 overlay-next\ 下会 MODULE_NOT_FOUND），
-  # 这里落到 dist\ 下的临时文件，构建结束时清理。
+  # 探针用 @electron/asar 读归档条目表 / 读单个条目。该模块**不再**由 next 自己声明，
+  # 而是随 electron-builder 的依赖树进来，落地位置可能是 dsh-desktop-next\node_modules，
+  # 也可能是仓库根 dsh-desktop\node_modules（yarn workspaces 会提升）。Node 按"脚本自身
+  # 所在目录"逐级向上找 node_modules，两处都能被覆盖 —— 所以探针必须写在工作区内部
+  # （放 overlay-next\ 下会 MODULE_NOT_FOUND），这里落到 dist\ 下的临时文件，结束清理。
   $distDir = Join-Path $script:WsDir 'dist'
   New-Item -ItemType Directory -Force -Path $distDir | Out-Null
   $entry = Join-Path $distDir '.asar-probe.cjs'
@@ -648,13 +721,20 @@ function Get-ArchiveHelper {
   $code = @'
 // Read one payload entry, or list the archive entry table. Lives inside the
 // workspace so `require('@electron/asar')` resolves to the installed copy.
-const { listPackage, extractFile } = require('@electron/asar')
+let asar
+try {
+  asar = require('@electron/asar')
+} catch (error) {
+  process.stderr.write('asar-probe: cannot resolve @electron/asar (workspace dependencies missing?): '
+    + String(error && error.message ? error.message : error) + '\n')
+  process.exit(3)
+}
 const [, , mode, archive, arg] = process.argv
 if (mode === 'list') {
-  process.stdout.write(listPackage(archive, { isPack: false }).join('\n'))
+  process.stdout.write(asar.listPackage(archive, { isPack: false }).join('\n'))
 } else if (mode === 'read') {
   try {
-    process.stdout.write(extractFile(archive, arg).toString('utf8'))
+    process.stdout.write(asar.extractFile(archive, arg).toString('utf8'))
   } catch (error) {
     process.stderr.write(String(error && error.message ? error.message : error))
     process.exit(2)
@@ -674,10 +754,19 @@ function Invoke-ArchiveProbe {
   $prev = $PSNativeCommandUseErrorActionPreference
   $PSNativeCommandUseErrorActionPreference = $false
   try {
-    return @(& node $helper @Arguments 2>$null)
+    $stdout = @(& node $helper @Arguments 2>&1)
+    $code = $LASTEXITCODE
   } finally {
     $PSNativeCommandUseErrorActionPreference = $prev
   }
+  if ($code -ne 0) {
+    # read 失败 = 条目不存在（或不可读），由调用方按"缺条目"处理。
+    # 但 list 失败说明**探针本身跑不起来**（最典型：@electron/asar 解析不到）。这种情况
+    # 必须直接报出来，否则会被误报成"产物缺一堆条目"，把人引到错误的方向。
+    if ($Arguments[0] -eq 'read') { return @() }
+    throw "asar 探针执行失败 (exit $code)：$($stdout -join ' ')"
+  }
+  return $stdout
 }
 
 function Get-ArchiveEntries {
@@ -736,26 +825,28 @@ function Assert-OverlayArtifacts {
 
     # 3a) 必备条目
     $probe = if ($useArchive) { @(Get-ArchiveEntries $archive) } else { @() }
-    foreach ($item in @('lib/main.js', 'lib/host.js', 'lib/client.js', 'cordis.patch.yml', 'host.cordis.patch.yml')) {
+    foreach ($item in $script:RequiredPayloadEntries) {
       $present = if ($useArchive) { $probe -contains $item } else { Test-Path -LiteralPath (Join-Path $plain ($item -replace '/', '\')) }
       if (-not $present) { $missing.Add("负载条目 $item") }
     }
 
-    # 3b) startup-config 集成点必须真的打进去了
-    $marker = 'applyDesktopStartupConfig'
-    $found = $false
-    if ($useArchive) {
-      $snippet = Get-ArchiveFileText $archive 'lib/main.js'
-      $found = ($null -ne $snippet) -and $snippet.Contains($marker)
-    } else {
-      $mainJs = Join-Path $plain 'lib\main.js'
-      $found = (Test-Path -LiteralPath $mainJs) -and ((Select-String -Path $mainJs -Pattern $marker -List -ErrorAction SilentlyContinue) -ne $null)
-    }
-    if ($found) {
-      $rows.Add([pscustomobject]@{ 项目 = '补丁代码'; 结果 = 'OK'; 说明 = "$marker 已打包（$layoutName）" })
-    } else {
-      $rows.Add([pscustomobject]@{ 项目 = '补丁代码'; 结果 = '缺失'; 说明 = "$layoutName 的 lib/main.js 中没有 $marker" })
-      $missing.Add('补丁代码（startup-config 集成点）')
+    # 3b) 覆盖层集成点必须真的打进去了
+    foreach ($entry in $script:RequiredMarkers.Keys) {
+      $marker = $script:RequiredMarkers[$entry]
+      $found = $false
+      if ($useArchive) {
+        $snippet = Get-ArchiveFileText $archive $entry
+        $found = ($null -ne $snippet) -and $snippet.Contains($marker)
+      } else {
+        $target = Join-Path $plain ($entry -replace '/', '\')
+        $found = (Test-Path -LiteralPath $target) -and ((Select-String -Path $target -Pattern $marker -List -ErrorAction SilentlyContinue) -ne $null)
+      }
+      if ($found) {
+        $rows.Add([pscustomobject]@{ 项目 = "补丁代码 ($entry)"; 结果 = 'OK'; 说明 = "$marker 已打包（$layoutName）" })
+      } else {
+        $rows.Add([pscustomobject]@{ 项目 = "补丁代码 ($entry)"; 结果 = '缺失'; 说明 = "$layoutName 的 $entry 中没有 $marker" })
+        $missing.Add("补丁代码（$entry 的 $marker）")
+      }
     }
   }
 
@@ -814,10 +905,24 @@ runtime : $bannerRuntime（跟随上游）
   if (-not $NoProxy -and $Proxy) {
     $env:HTTP_PROXY = $Proxy; $env:HTTPS_PROXY = $Proxy
     $env:http_proxy = $Proxy; $env:https_proxy = $Proxy
-    Write-Info "已设置代理: $Proxy"
+    # Node 的原生 fetch（undici）**默认不认** HTTP_PROXY/HTTPS_PROXY —— Node 24 起需要
+    # NODE_USE_ENV_PROXY=1 才会读。而上游 scripts/primary-runtime.ts 下载运行时载荷用的
+    # 正是 fetch + AbortSignal.timeout（默认 300000ms），少了这个变量就是直连：
+    # 本机直连 github.com 不通、直连 nodejs.org 很慢，于是 package:dir 会在 300s 后以
+    # "DOMException [TimeoutError]" 失败（2026-10-14 实测对照：不设该变量时 github HEAD
+    # 19.5s 后 fetch failed、nodejs.org 直连 4.9s；设置后两者分别 4.4s / 3.4s 返回 200）。
+    $env:NODE_USE_ENV_PROXY = '1'
+    $env:ELECTRON_GET_USE_PROXY = '1'
+    if (-not $env:DSH_RESOURCE_DOWNLOAD_TIMEOUT_MS) {
+      # 上游那个 5 分钟上限在代理链路上偏紧（Python 载荷是上百 MB），给足余量。
+      # 显式设置过就不动，尊重调用方。
+      $env:DSH_RESOURCE_DOWNLOAD_TIMEOUT_MS = '900000'
+    }
+    Write-Info "已设置代理: $Proxy（NODE_USE_ENV_PROXY=1；运行时载荷下载超时 $($env:DSH_RESOURCE_DOWNLOAD_TIMEOUT_MS)ms，可用同名环境变量覆盖）"
   } elseif ($NoProxy) {
     Remove-Item Env:HTTP_PROXY -ErrorAction SilentlyContinue
     Remove-Item Env:HTTPS_PROXY -ErrorAction SilentlyContinue
+    $env:NODE_USE_ENV_PROXY = '0'
     Write-Info '已禁用代理（-NoProxy）'
   }
   Write-Info "日志: $script:LogPath"
@@ -833,10 +938,11 @@ runtime : $bannerRuntime（跟随上游）
   Invoke-Step '对齐 deepseek-harness 子模块' { Ensure-Submodule }
   Invoke-Step '选择工作区（加入 next / 排除 stable+beta）' { Set-WorkspaceSelection }
   Invoke-Step '应用 next 覆盖层（代码补丁）' { Apply-Overlay }
-  Invoke-Step '校验运行时版本并应用打包修复' {
+  Invoke-Step '校验运行时版本与打包姿态' {
     Test-NextRuntimeVersion
     Set-ElectronOverride
-    Set-PackagingFixes
+    Test-PackagingPosture
+    Set-PayloadExclusions
     Set-MarketWorkspaceCheck
     Set-AAWorkspaceCheck
   }

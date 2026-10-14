@@ -1,8 +1,8 @@
 diff --git a/dsh-desktop-next/src/main.ts b/dsh-desktop-next/src/main.ts
-index 9bc092ae6a..b581b49faf 100644
+index 8900529ea9..48923dd770 100644
 --- a/dsh-desktop-next/src/main.ts
 +++ b/dsh-desktop-next/src/main.ts
-@@ -23,6 +23,10 @@ import { createLanHttpsCertificate, lanHttpsCertificateDiagnostic } from './lan-
+@@ -24,6 +24,10 @@ import { createLanHttpsCertificate, lanHttpsCertificateDiagnostic } from './lan-
  import { desktopTerminalStateDirectory, openDesktopTerminal } from './desktop-terminal.ts'
  import { bundledPnpmEntry, createPackageRunner } from './extensions.ts'
  import { applyDesktopPackageAgePolicy } from './pnpm-policy.ts'
@@ -12,8 +12,8 @@ index 9bc092ae6a..b581b49faf 100644
 +} from './startup-config.ts'
  import { auxiliaryWindowChromeOptions, auxiliaryWindowHasCustomFrame } from '../../dsh-plugin-desktop-beta/src/auxiliary-window-options.ts'
  import { cleanupDisposableTree } from '../../dsh-plugin-desktop-beta/src/disposable-tree.ts'
- import { atomicJson, privateDirectory } from './private-files.ts'
-@@ -40,11 +44,33 @@ import { updateLabel } from './update-state.ts'
+ import { installEditingContextMenu } from '../../dsh-plugin-desktop-beta/src/context-menu.ts'
+@@ -46,11 +50,33 @@ import { DESKTOP_SHUTDOWN_TIMEOUT_MS } from '../../dsh-plugin-desktop-beta/src/s
  // Inherit the package policy across the Host and every runtime child process.
  applyDesktopPackageAgePolicy(process.env)
  

@@ -170,18 +170,58 @@ pwsh -File .\build-next.ps1 -Target package-dir -SkipSubmodule   # 等同 bat
 
 ### 覆盖层（overlay-next）
 
+overlay-next 只承担一件事：**把 exe 同级的 `startup.json` 接进启动流程**。
+
 | 文件 | 内容 |
 |------|------|
 | `overlay-next\patches\main.ts.patch` | 接入 `startup-config`（`applyDesktopStartupConfig`）+ 让 `DSH_HOME` 生效 |
-| `overlay-next\patches\package.json.patch` | 重新启用 ASAR（`smartUnpack` + fuses + `asarUnpack`） |
-| `overlay-next\patches\verify-packaged.ts.patch` | 产物门禁改为兼容 ASAR / 普通目录两种布局 |
-| `overlay-next\patches\verify-fuses.ts.patch` | fuse 校验按实际布局传 `isAsar` |
 | `overlay-next\src\startup-config.ts` | 新文件：exe 同级 `startup.json` 启动配置 |
 | `overlay-next\src\startup-config.spec.ts` | 新文件：配套单测 |
 | `overlay-next\startup.json` | 运行时数据文件，构建后拷到 exe 同级 |
 
+> 「让 `DSH_HOME` 生效」不是附加功能：`startup.json` 里配的就是 `DSH_HOME`，而 next 原本只认
+> `DSH_DESKTOP_NEXT_HOME`，不补这段，启动配置就落不到 home 上。
+
+**2026-10-14 起，ASAR 相关的三份补丁全部撤销**（原 `package.json.patch`、`verify-packaged.ts.patch`、
+`verify-fuses.ts.patch`）：上游自己接过去了，旧写法会与新门禁**直接冲突**。
+
+| 旧补丁 | 上游现状 | 为什么必须撤 |
+|--------|---------|-------------|
+| `package.json.patch`：`asar:{smartUnpack}` + 两个 ASAR fuse + 三平台 `asarUnpack` | 上游 `build.asar: true` + 完整公共 `asarUnpack`（bundled-connector / pnpm / node-bin / assets 等） | 已冗余；打开 `EnableEmbeddedAsarIntegrityValidation` / `OnlyLoadAppFromAsar` 会让上游 `verify-fuses.ts` 失败 —— 它显式按"两个 archive fuse 全关"校验（传 `requiresAsar=false`） |
+| `verify-packaged.ts.patch`：兼容 ASAR / 普通目录两种布局 | 上游改成**要求** `app.asar` 存在、**禁止**并列 `resources\app`（`archivedPayload` / `auditNextPayload` / `sealNextPayload`） | 旧补丁的"兼容两种布局"与这条硬门禁语义相反 |
+| `verify-fuses.ts.patch`：按实际布局传 `isAsar` | 上游自己按 asar 布局校验（`root = resources\app.asar`） | 参数语义已变 |
+| `package.json.patch` 里的 win 段排除项（arm64 LibreOffice 等） | 上游 `runtime-file-policy.ts` + `auditNextPayload` 负责，命中即构建失败 | 语义从"排除"变成"必须不存在"，得写在**顶层**文件集里才有效（见下节 `Set-PayloadExclusions`） |
+
 > 修改 next 工作区源码后跑 `quick-build-next.bat`，脚本会在 pull 前自动把改动导出回 `overlay-next\patches\`。
 > 导出规则与注意事项（最小上下文、构建脚本托管字段、幂等性）见故障排查第一节。
+> `dsh-desktop-next\package.json` **不在**导出列表里 —— 它只会被构建期注入（electron 版本、AA 产物、
+> 载荷排除项），导出等于把注入当成策展内容固化。
+
+### 打包姿态与产物门禁（next）
+
+next 的打包姿态由**上游**决定，脚本只做「按上游要求补齐 + 姿态漂移时提前告警」（步骤 `[06]` 的
+`Test-PackagingPosture` / `Set-PayloadExclusions`）。四件事值得记住：
+
+1. **ASAR 是上游开的。** `build.asar: true`，`files` 是显式白名单（`assets/**`、`build/app-icon.*`、
+   `cordis.patch.yml`、`host.cordis.patch.yml`、`lib/**`、`package.json`、`scripts/node-bin/**`）。
+   实测（`dist\builder-debug.yml` → `firstOrDefaultFilePatterns`）白名单被完整应用：`.desktop-build` /
+   `src` / `tests` / `dist` 都不在包里 —— 也就是**不需要**像 stable 那样再补排除项。
+2. **★ 不要给 next 加平台段 `files`。** electron-builder 26 的 `util\config\config.js` 里
+   `normalizeFiles()` 把顶层字符串数组归一化成单个 `{filter:[…]}` FileSet；而 `getFileMatchers()` 只把
+   **平台段**的字符串放进 `defaultMatcher`，`getMainFileMatchers()` 又只取 `matchers[0]`（=`defaultMatcher`）。
+   于是平台段一旦出现：① 顶层白名单被顶掉；② 平台段若全是排除项，`containsOnlyIgnore()` 成立 →
+   遍历器被前置 `**/*` → 包目录里没被默认规则排除的东西全进 asar。对 next 这直接撞上游
+   `auditNextPayload` 的 stray root 断言（`src`、`tests`、`.desktop-build` 会被逐一点名）。
+   上游 `prepare-pack.ts` 的注释也明说了这一点 —— 它把 node-pty 的排除项加进**顶层**文件集。
+3. **载荷排除项由 `Set-PayloadExclusions` 注入**（顶层 `build.files`）。依据是上游
+   `scripts\runtime-file-policy.ts` 的 `nextRuntimeFileExclusion()`，由 afterPack 的 `auditNextPayload()`
+   强制。当前两条：`!node_modules/@deepseek-ai/libreoffice-kit-win32-arm64/**`（`.yarnrc.yml` 的
+   `supportedArchitectures.cpu` 含 x64+arm64，为通用 macOS 准备，于是 Windows x64 上也会装 arm64 引擎包：
+   1470 个文件）、`!node_modules/@koromix/koffi-win32-x64/win32_x64/koffi.lib`（链接期导入库）。
+4. **`afterAllArtifactBuild` 必须留着。** 上游 `scripts\verify-fuses.ts` 会校验 fuse → 校验 sealed runtime
+   （`verifyNextRuntime`）→ 用打包后的 exe 以 Node 模式 import 归档里的模块 → **真启动一次 Host**
+   （`packaged-host-smoke.mjs`，300s 预算）。旧版脚本会把这一项从 `package.json` 删掉，导致这条最强的
+   验收从来没跑过；现已撤销。
 
 ## 覆盖层（Overlay）
 
@@ -772,6 +812,46 @@ Get-ChildItem dist\win-unpacked\resources\runtime -Recurse -File | Measure-Objec
 
 打包时 `dist\builder-debug.yml` 会记录实际生效的模式表——出现体积异常先看它的 `firstOrDefaultFilePatterns`。
 
+#### 2.5 `DOMException [TimeoutError]`：运行时载荷下载走了直连
+
+**症状**：`yarn package:dir` 跑到 `Preparing the win-x64 primary runtime …` 之后 ~300s 失败，栈里是
+`DOMException [TimeoutError]: The operation was aborted due to timeout`，位置在 `prepare-runtime.ts`
+→ `downloadPrimaryRuntimeAsset`。
+
+**根因**：上游用 `fetch(url, { signal: AbortSignal.timeout(DSH_RESOURCE_DOWNLOAD_TIMEOUT_MS ?? 300000) })`
+下载 Node / Python 载荷，而 **Node 的原生 fetch（undici）默认不认 `HTTP_PROXY` / `HTTPS_PROXY`** ——
+Node 24 起需要 `NODE_USE_ENV_PROXY=1` 才会读。少了它本机就是直连：github.com 不通、nodejs.org 很慢，
+必然撞上 300s 上限。
+
+**实测对照**（同机同代理）：
+
+| 环境 | `https://nodejs.org/dist/index.json` | `https://github.com/astral-sh/…` |
+|------|--------------------------------------|----------------------------------|
+| 有 `HTTPS_PROXY`、无 `NODE_USE_ENV_PROXY` | 200，4.95s（直连） | **FAIL TypeError: fetch failed，19.5s** |
+| 同上 + `NODE_USE_ENV_PROXY=1` | 200，3.38s（走代理） | 200，4.39s |
+
+**已修**：`build-next.ps1` 的代理分支现在同时设 `NODE_USE_ENV_PROXY=1`、`ELECTRON_GET_USE_PROXY=1`，
+并把 `DSH_RESOURCE_DOWNLOAD_TIMEOUT_MS` 默认抬到 900000（调用方显式设过就不动）。载荷缓存落在
+`dsh-desktop-next\.desktop-build\downloads\`（以 sha256 命名），命中的资产不会重下 ——
+失败重跑通常只补缺的那一个。
+
+#### 2.6 afterPack 的 payload audit 拒绝产物
+
+next 的 `afterPack`（`scripts\verify-packaged.ts`）依次做三件事：检查 `app.asar` 存在且没有并列的
+`resources\app`；`verifyNextPayload`（必备条目 + 依赖闭包）；`auditNextPayload`（**逐条**收集问题后
+一次性列出）。三类报错分别对应：
+
+| 报错 | 含义 | 处理 |
+|------|------|------|
+| `<root>: outside the declared application files` | asar 根出现白名单外的目录（`src`、`tests`、`.desktop-build`…） | 见上节 ②：不要加平台段 `files`，排除项一律写顶层 |
+| `<path>: <reason> must not be packaged` | 命中 `runtime-file-policy.ts`（LibreOffice 其他平台、source map、`.d.ts`、koffi 导入库、node-pty 其他平台…） | 由 `Set-PayloadExclusions` 注入顶层排除项；出现新类别时同步那里 |
+| `<path>: must be unpacked beside app.asar` / `native code is packed inside app.asar` | 原生模块、或子进程要按路径读的文件被打进了归档 | 加 `build.asarUnpack`（**不要**动 `asar` 开关） |
+
+**本机实测**（Electron 44.0.0 / dsh 0.2.1-alpha.2）：第一次跑命中 1470 个
+`@deepseek-ai/libreoffice-kit-win32-arm64/**` + 1 个 `@koromix/koffi-win32-x64/win32_x64/koffi.lib`；
+注入两条排除项后门禁放行，随后 `Verified the sealed Next payload … 18514 files` 与
+`Packaged Next Host booted from …app.asar`（真实 Host 冒烟）双双通过。
+
 ---
 
 ### 三、依赖 / 安装类问题
@@ -1073,7 +1153,8 @@ install 会输出 `YN0002`（market 未在自己 `peerDependencies` 里声明部
 
 - `build-next.ps1` - next 通道构建脚本（独立，理由见「DSH NEXT 通道」）
 - `quick-build-next.bat` - next 通道一键编译+解包
-- `overlay-next\` - next 覆盖层（`src\` 新文件 + `patches\` 补丁 + `startup.json`）
+- `overlay-next\` - next 覆盖层。**2026-10-14 起只含 `src\startup-config(.spec).ts` +
+  `patches\main.ts.patch` + `startup.json`**（ASAR 相关的三份补丁已撤销，理由见「覆盖层（overlay-next）」）
 
 ### 子模块 / 上游
 
