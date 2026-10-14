@@ -16,7 +16,12 @@ index d3c48aed9f..a88f66b7cf 100644
 +      "enableEmbeddedAsarIntegrityValidation": true,
 +      "onlyLoadAppFromAsar": true,
        "resetAdHocDarwinSignature": true,
-@@ -431,5 +433,20 @@
+@@ -396,3 +398,4 @@
+       "lib/**",
+       "package.json",
++      "!.desktop-build{,/**/*}",
+       "!node_modules/node-pty/build/**",
+@@ -431,5 +434,21 @@
 -      "asar": false
 +      "asarUnpack": [
 +        "build/app-icon-mac.png",
@@ -28,6 +33,7 @@ index d3c48aed9f..a88f66b7cf 100644
      "win": {
 -      "asar": false,
 +      "files": [
++        "!.desktop-build{,/**/*}",
 +        "!node_modules/@deepseek-ai/libreoffice-kit-win32-arm64/**"
 +      ],
 +      "asarUnpack": [
@@ -39,7 +45,7 @@ index d3c48aed9f..a88f66b7cf 100644
 +        "node_modules/@agents-anywhere/dsh-bridge-next/lib/bundled-connector/**"
 +      ],
        "compression": "normal",
-@@ -490,3 +507,10 @@
+@@ -490,3 +509,10 @@
        "syncDesktopName": true,
 -      "asar": false
 +      "asarUnpack": [

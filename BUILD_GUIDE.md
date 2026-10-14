@@ -713,6 +713,65 @@ Remove-Item fusecheck.mjs
 
 `OnlyLoadAppFromAsar` 打开意味着 Electron **拒绝**从 asar 之外加载应用——能正常启动就证明归档完整有效。再实机启动一次确认无 asar 相关报错。
 
+#### 2.4 app.asar 体积暴涨：`.desktop-build` 被打进包
+
+**症状**：`resources\app.asar` 从 ~251 MB 涨到 ~585 MB（+332.66 MB / +5,152 条），而产物能正常启动、看不出别的问题。触发点是上游 `47574b1a83` 引入 primary runtime：`build.win.extraResources` 现在从 `.desktop-build/runtime` 取随包载荷（`scripts/prepare-runtime.ts:37`），而这个暂存目录**就在包目录里**，于是被 app 目录遍历一并收进 asar（顺带把 15 个 sha256 命名的下载缓存也收了进去）。
+
+**为什么会一起进包（根因不在上游，在 electron-builder 的 `files` 归一化）**：
+
+1. `normalizeFiles()`（`app-builder-lib/out/util/config/config.js:91-125`）会把**公共** `build.files` 里的字符串折叠成**单个 FileSet 对象** `{ filter: [ …所有字符串… ] }`（`filter.push` 分支）。这是实测事实：`dist\builder-effective-config.yaml` 顶层的 `files:` 之下就是 `- filter: [...]` 形式。
+2. 折叠之后，公共 `files`（**连同其中的 `!` 排除**）只作用于那个独立 FileSet 匹配器，**不再进入 app 目录遍历器的模式表**；遍历器的模式表里只剩**平台段**（`build.win.files`）的字符串。
+3. 平台段若只剩「纯排除」，electron-builder 会给它前置 `**/*`（`fileMatcher.js:120-122`、`AppFileWalker.js:6-11`），于是包目录里**所有**未被默认规则排除的东西都进包。证据在 `dist\builder-debug.yml`：
+
+```yaml
+x64:
+  firstOrDefaultFilePatterns:      # ← app 目录遍历器真正使用的模式表
+    - '**/*'
+    - '!**/node_modules/**'
+    - '!build{,/**/*}'
+    - '!dist{,/**/*}'
+    - '!node_modules/@deepseek-ai/libreoffice-kit-win32-arm64/**'
+    # …只有默认排除，公共 files 的任何一条都不在这里
+```
+
+⇒ `src/`、`tests/`、`docs/`、`.desktop-build/` 一直都在包里，正是因为它们**根本不受公共 `files` 约束**；而 `!node_modules/node-pty/build/**` 这类公共排除「看起来生效」，是因为它同时被 `nodeModuleFilePatterns` 用到（node_modules 由另一套匹配器处理）。
+
+**修法**：排除必须写在**平台段**，只写公共 `files` 无效。
+
+```jsonc
+"win": {
+  "files": [
+    "!.desktop-build{,/**/*}",                                  // ← 真正生效的一条
+    "!node_modules/@deepseek-ai/libreoffice-kit-win32-arm64/**"
+  ]
+}
+```
+
+`{,/**/*}` 同时排除目录本身与其中内容（与上游自带的 `!.yarn{,/**/*}` 同款）；公共 `files` 里也保留了一条同名排除作双保险。**macOS / Linux 同理**，需各自在 `build.mac.files` / `build.linux.files` 加一条（本仓库目前只构建 Windows，故补丁只改了 `win`）。
+
+**实测（`build.ps1 -Overlay -Target package-dir`，Electron 44.7.2 / dsh 0.2.1-alpha.2 / pnpm 11.28.5）**：
+
+| 项 | 排除前 | 排除后 |
+|----|--------|--------|
+| `app.asar` | 613,845,711 B（585.41 MB） | **263,691,342 B（251.48 MB）** |
+| asar 条目数 | 33,038 | 27,886（−5,152，正好等于 `.desktop-build` 的文件数） |
+| `.desktop-build` 顶层目录 | 332.66 MB / 5,152 条 | **不在包内** |
+| `resources\runtime`（extraResources 载荷） | 6,135 文件 / 267,826,720 B | 同上，**逐字节相同** |
+| `resources\app.asar.unpacked` | 1,058 文件 / 381,040,706 B | 同上，**不变** |
+
+**验证（改完必做）**：
+
+```powershell
+cd dsh-desktop\dsh-plugin-desktop
+# 1) 体积应回落（约 250 MB，而不是 580+）
+(Get-Item dist\win-unpacked\resources\app.asar).Length
+# 2) asar 里不该再有 .desktop-build；载荷应在 resources\runtime
+node -e "const a=require('@electron/asar');const l=a.listPackage('dist/win-unpacked/resources/app.asar');console.log('entries',l.length,'desktop-build',l.filter(p=>p.includes('.desktop-build')).length)"
+Get-ChildItem dist\win-unpacked\resources\runtime -Recurse -File | Measure-Object Length -Sum
+```
+
+打包时 `dist\builder-debug.yml` 会记录实际生效的模式表——出现体积异常先看它的 `firstOrDefaultFilePatterns`。
+
 ---
 
 ### 三、依赖 / 安装类问题

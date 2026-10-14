@@ -1,8 +1,8 @@
 diff --git a/dsh-plugin-desktop/scripts/verify-packaged-runtime.ts b/dsh-plugin-desktop/scripts/verify-packaged-runtime.ts
-index 4b7b0764ec..6a49b53157 100644
+index e9c5b7fc08..9a6cc8a718 100644
 --- a/dsh-plugin-desktop/scripts/verify-packaged-runtime.ts
 +++ b/dsh-plugin-desktop/scripts/verify-packaged-runtime.ts
-@@ -71,8 +71,18 @@ const PNPM_RUNTIME_VERSION = packageVersion(PNPM_PACKAGE_ROOT)
+@@ -72,8 +72,18 @@ const PNPM_RUNTIME_VERSION = packageVersion(PNPM_PACKAGE_ROOT)
  /** Maximum physical file count accepted beside ASAR after smart unpack. */
  export const MAX_UNPACKED_RUNTIME_FILES = 1_500
  
@@ -23,7 +23,7 @@ index 4b7b0764ec..6a49b53157 100644
  
  /** Narrow ceiling for pnpm's smart-unpacked native-helper package root. */
  export const MAX_PNPM_SMART_UNPACK_FILES = 32
-@@ -93,10 +103,14 @@ export const ALLOWED_SMART_UNPACK_PACKAGE_ROOTS = [
+@@ -94,10 +104,14 @@ export const ALLOWED_SMART_UNPACK_PACKAGE_ROOTS = [
  export const ALLOWED_SMART_UNPACK_PACKAGE_PREFIXES = [
    'node_modules/@dataiku/uv-',
    'node_modules/@deepseek-ai/node-addon-system-',
@@ -38,7 +38,7 @@ index 4b7b0764ec..6a49b53157 100644
  ] as const
  
  /** Every generated JavaScript file shipped by the installed DSH CLI package. */
-@@ -852,13 +866,30 @@ export function reportUnpackedRuntime(summary: UnpackedRuntimeSummary): void {
+@@ -853,13 +867,30 @@ export function reportUnpackedRuntime(summary: UnpackedRuntimeSummary): void {
    process.stdout.write(`dsh-plugin-desktop: packaged runtime inventory: ${formatUnpackedRuntimeSummary(summary)}\n`)
  }
  

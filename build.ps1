@@ -311,6 +311,16 @@ $script:SrcPatchFiles = @(
   #     重新锚定（上游又改了同一区域时）：在 dsh-desktop 的临时 worktree 里把 package.json
   #        改成预期结果 → git diff -U1 → 手工删掉压在易变行上的上下文并按实际内容重算
   #        hunk 头 → 用 git apply --check 套用后再与预期结果**逐字节比对**双重验证。
+  #     ③ 【排除目录必须写进平台段，写公共 files 无效】本补丁同时排除了 .desktop-build
+  #        （上游 primary-runtime 的暂存目录，位于包目录内；不排除会让 app.asar 多 332 MB）。
+  #        这条排除**必须在 build.win.files 里**：electron-builder 的 normalizeFiles()
+  #        （config.js:91-125）会把公共 build.files 的字符串折叠成单个 {filter:[...]} 对象，
+  #        于是公共列表（含其中的 `!` 排除）不进 app 目录遍历器的模式表；遍历器只看平台段，
+  #        且当其只剩纯排除时会前置 `**/*`（fileMatcher.js:120-122 / AppFileWalker.js:6-11），
+  #        结果整个包目录都进归档。实测证据：dist\builder-debug.yml 的
+  #        firstOrDefaultFilePatterns = `**/*` + 默认排除（无公共 files 任何一条）。
+  #        公共 files 里保留同名排除作双保险；mac/linux 若日后要打包，需各加一条。
+  #        详见 BUILD_GUIDE「2.4 app.asar 体积暴涨」。
   # 历史坑（已复发三次）：该文件的本地改动里必然混入构建期注入 —— Set-RuntimeVersionPinned
   # 改写 @deepseek-ai/dsh* 依赖版本串，Invoke-RequiredWinFixes 移除 afterAllArtifactBuild
   # 并补 npmRebuild。过去每次带 -Overlay 的构建都会把这份“工作区 git diff”（= 纯注入）
