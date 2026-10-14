@@ -299,6 +299,18 @@ $script:SrcPatchFiles = @(
   # 物理解出，spawn 无法进入 asar 归档）。补丁**只含 ASAR 相关改动**：electron
   # 版本与 afterAllArtifactBuild 钩子由 Set-ElectronOverride /
   # Set-AllArtifactVerifyDisabled 单独管理，不能写进补丁（否则会互相打架）。
+  #   【本文件的补丁写法两条铁律（2026-10 实测，违反代价高）】
+  #     ① hunk 不能以「新增行」结尾 —— 必须以一行上下文结尾。实测：同一段 pre-image，
+  #        「以 + 行收尾」的 hunk 会被 git apply 判成 patch does not apply，补上一行尾部
+  #        上下文立刻可套；而以「删除行」开头是允许的。重排键序/挑上下文时务必留尾部上下文。
+  #     ② 上下文别压在「上游爱改的行」上。mac 的 x64ArchFiles 行与 win 的 extraResources
+  #        块都是上游高频改动点：上游插入 primary-runtime（47574b1a83）时正好改到这两处，
+  #        本补丁因此整份失配、[04] 中止。现改为把 win 的 files/asarUnpack 插在 "win": { 之后、
+  #        "compression" 之前（键序无关），尾部上下文就落在稳定的 "compression": "normal", 上；
+  #        mac 段只留 `},` 与 "win": { 作尾部上下文，完全不引用上述两处。
+  #     重新锚定（上游又改了同一区域时）：在 dsh-desktop 的临时 worktree 里把 package.json
+  #        改成预期结果 → git diff -U1 → 手工删掉压在易变行上的上下文并按实际内容重算
+  #        hunk 头 → 用 git apply --check 套用后再与预期结果**逐字节比对**双重验证。
   # 历史坑（已复发三次）：该文件的本地改动里必然混入构建期注入 —— Set-RuntimeVersionPinned
   # 改写 @deepseek-ai/dsh* 依赖版本串，Invoke-RequiredWinFixes 移除 afterAllArtifactBuild
   # 并补 npmRebuild。过去每次带 -Overlay 的构建都会把这份“工作区 git diff”（= 纯注入）
@@ -715,11 +727,48 @@ function Clear-ReadOnlyAssets {
   }
 }
 
-# 打包环境准备（仅网络受限的机器需要，幂等）：
-#   @electron/rebuild 需要 Electron 头文件，其硬编码从 www.electronjs.org 下载（本机不通），
-#   改为从 npmmirror 预置到 ~/.electron-gyp/<version>，node-gyp 命中缓存即不再联网。
+# 打包环境准备（幂等）：
+#   @electron/rebuild 需要 Electron 头文件，node-gyp 默认从 www.electronjs.org 下载（本机不通），
+#   这里预置到 ~/.electron-gyp/<version>，node-gyp 命中缓存即不再联网。
 #   注意：package:dir / dist:* 均已用 npmRebuild=false 跳过原生重编译（node-pty 走预编译
-#   二进制），此步骤仅在确实需要重编译原生模块时兜底。
+#   二进制），此步骤只在确实需要现场重编译原生模块时才起作用 ——
+#   因此**任何失败一律只告警、不中止构建**（原来一处 404 就整单失败）。
+#   源顺序的依据（2026-10 实测）：Electron 发新版后 npmmirror 常滞后数小时到数天
+#   （44.7.2 发布 8 小时后 /mirrors/ 与 /-/binary/ 双双 404），而官方
+#   artifacts.electronjs.org 即时可用；npmmirror 同步到位时国内更快，故作为备选。
+#   版式差异：官方是 /v<ver>/…，npmmirror 是 /<ver>/…。
+$script:ElectronHeaderSources = @(
+  @{ Name = 'artifacts.electronjs.org'; Base = 'https://artifacts.electronjs.org/headers/dist'; Dir = 'v{0}' },
+  @{ Name = 'npmmirror.com'; Base = 'https://npmmirror.com/mirrors/electron'; Dir = '{0}' },
+  @{ Name = 'registry.npmmirror.com'; Base = 'https://registry.npmmirror.com/-/binary/electron'; Dir = '{0}' }
+)
+# Electron 发行包（dist）镜像。Dir 是 mirror 之后的版本目录模板 —— npmmirror 的版式是
+#   <ver>/（不带 v），GitHub release 的版式是 v<ver>/；写错就是 404（实测踩过）。
+#   先 HEAD 探出真正含目标版本的镜像，再把 ELECTRON_MIRROR 与 ELECTRON_CUSTOM_DIR 一起设好。
+$script:ElectronDistMirrors = @(
+  @{ Name = 'npmmirror'; Mirror = 'https://npmmirror.com/mirrors/electron/'; Dir = '{0}' },
+  @{ Name = 'github'; Mirror = 'https://github.com/electron/electron/releases/download/'; Dir = 'v{0}' }
+)
+
+# 依次向各源要一个文件；全部失败返回 $false（调用方决定是否致命，本流程一律不致命）。
+function Get-ElectronFile {
+  param([string]$Version, [string]$Relative, [string]$OutFile, [int]$TimeoutSec = 300)
+  foreach ($s in $script:ElectronHeaderSources) {
+    $url = "$($s.Base)/$($s.Dir -f $Version)/$Relative"
+    try {
+      Invoke-WebRequest -Uri $url -OutFile $OutFile -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
+      if ((Test-Path -LiteralPath $OutFile) -and (Get-Item -LiteralPath $OutFile).Length -gt 0) {
+        Write-Info "Electron 资源：已从 $($s.Name) 获取 $Relative"
+        return $true
+      }
+    } catch {
+      $msg = ($_.Exception.Message -replace '\s+', ' ')
+      Write-Info "Electron 资源：$($s.Name) 取 $Relative 失败（$msg）"
+    }
+  }
+  return $false
+}
+
 function Prepare-PackagingEnvironment {
   $electronPkg = Get-ChannelWsPath 'node_modules\electron\package.json'
   if (-not (Test-Path -LiteralPath $electronPkg)) {
@@ -729,22 +778,38 @@ function Prepare-PackagingEnvironment {
   $electronVersion = (Get-JsonObject $electronPkg).version
 
   # Electron 头文件缓存（@electron/rebuild 的 node-gyp devDir）
-  $gypDir = Join-Path $HOME '.electron-gyp'
-  $devDir = Join-Path $gypDir $electronVersion
+  $devDir = Join-Path (Join-Path $HOME '.electron-gyp') $electronVersion
   $configGypi = Join-Path $devDir 'include\node\config.gypi'
   $nodeLib = Join-Path $devDir 'x64\node.lib'
   if (-not (Test-Path -LiteralPath $configGypi) -or -not (Test-Path -LiteralPath $nodeLib)) {
-    Write-WarnLine "缺少 Electron $electronVersion 头文件缓存，正在从 npmmirror 准备 $devDir ..."
+    Write-WarnLine "缺少 Electron $electronVersion 头文件缓存，按源列表准备 $devDir ..."
     New-Item -ItemType Directory -Force -Path $devDir | Out-Null
-    $tar = Join-Path $env:TEMP "node-v$electronVersion-headers.tar.gz"
-    Invoke-WebRequest -Uri "https://npmmirror.com/mirrors/electron/$electronVersion/node-v$electronVersion-headers.tar.gz" `
-      -OutFile $tar -UseBasicParsing -TimeoutSec 180
-    tar -xzf $tar -C $devDir --strip-components=1
-    New-Item -ItemType Directory -Force -Path (Join-Path $devDir 'x64') | Out-Null
-    Invoke-WebRequest -Uri "https://npmmirror.com/mirrors/electron/$electronVersion/win-x64/node.lib" `
-      -OutFile (Join-Path $devDir 'x64\node.lib') -UseBasicParsing -TimeoutSec 60
-    Set-Content -LiteralPath (Join-Path $devDir 'installVersion') -Value '11' -NoNewline -Encoding ascii
-    Write-Ok "Electron 头文件缓存已就绪: $devDir"
+    try {
+      $tarName = "node-v$electronVersion-headers.tar.gz"
+      if (-not (Test-Path -LiteralPath $configGypi)) {
+        $tar = Join-Path $env:TEMP $tarName
+        if (Get-ElectronFile -Version $electronVersion -Relative $tarName -OutFile $tar) {
+          tar -xzf $tar -C $devDir --strip-components=1
+        }
+      }
+      if (-not (Test-Path -LiteralPath $nodeLib)) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $devDir 'x64') | Out-Null
+        [void](Get-ElectronFile -Version $electronVersion -Relative 'win-x64/node.lib' -OutFile $nodeLib -TimeoutSec 120)
+      }
+      if (Test-Path -LiteralPath $configGypi) {
+        Set-Content -LiteralPath (Join-Path $devDir 'installVersion') -Value '11' -NoNewline -Encoding ascii
+        Write-Ok "Electron 头文件缓存已就绪: $devDir"
+      } else {
+        Write-WarnLine "Electron $electronVersion 头文件缓存仍缺失（各源均无该版本）。该步骤只是兜底："
+        Write-WarnLine '  package:dir/dist:* 已用 npmRebuild=false 跳过原生重编译，缺它不中止构建；'
+        Write-WarnLine '  仅在确实要现场重编译原生模块时才需要，可等 npmmirror 同步该版本后重跑。'
+      }
+      if (-not (Test-Path -LiteralPath $nodeLib)) {
+        Write-WarnLine '缺少 x64\node.lib（同上，只影响现场重编译，打包不受影响）。'
+      }
+    } catch {
+      Write-WarnLine "Electron 头文件准备出错（不中止构建）：$($_.Exception.Message)"
+    }
   }
 
   Ensure-ElectronDist
@@ -752,27 +817,88 @@ function Prepare-PackagingEnvironment {
 
 # electron-builder 现在优先使用本地 node_modules\electron\dist，而 .yarnrc.yml 的
 # enableScripts:false 让 electron 的 postinstall 不执行 → dist 缺失 → 打包报
-# "The specified electronDist does not exist"。这里按需运行 electron 自带 install.js
-# （优先复用 @electron/get 缓存，缺失时走 ELECTRON_MIRROR 镜像）。
+# "The specified electronDist does not exist"。这里按需补齐 dist：
+#   ① 先 HEAD 探出真正含该版本的镜像并设为 ELECTRON_MIRROR，再跑 electron 自带
+#      install.js —— 新版本 npmmirror 常滞后（44.7.2 发布 8 小时后仍 404），
+#      不探测就会空跑一次 157 MB 的下载并留下半个 dist；
+#   ② install.js 之后仍无 dist 时，直接用 Invoke-WebRequest 下载 zip 并解包兜底
+#      （不依赖 @electron/get 自身是否支持代理；HTTPS_PROXY 由主流程设置）。
 function Ensure-ElectronDist {
   $elDir = Get-ChannelWsPath 'node_modules\electron'
   $installer = Join-Path $elDir 'install.js'
   if (-not (Test-Path -LiteralPath $installer)) { return }
   $distDir = Join-Path $elDir 'dist'
-  if (Test-Path -LiteralPath $distDir) {
+  $exePath = Join-Path $distDir 'electron.exe'
+  if (Test-Path -LiteralPath $exePath) {
     Write-Info "electron dist 已就绪：$distDir"
     return
   }
+  $version = (Get-JsonObject (Join-Path $elDir 'package.json')).version
+  $archTag = if ("$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)".ToUpperInvariant() -like '*ARM64*') { 'arm64' } else { 'x64' }
+  $zipName = "electron-v$version-win32-$archTag.zip"
+
+  # ① 探镜像（HEAD，只读不下载）
+  $mirror = $null
+  foreach ($m in $script:ElectronDistMirrors) {
+    $probeUrl = "$($m.Mirror)$($m.Dir -f $version)/$zipName"
+    try {
+      $r = Invoke-WebRequest -Uri $probeUrl -Method Head -UseBasicParsing -TimeoutSec 45 -ErrorAction Stop
+      if ([int]$r.StatusCode -eq 200) {
+        $mirror = $m
+        Write-Info "electron dist 镜像已确认含 $version：$($m.Name)"
+        break
+      }
+    } catch {
+      Write-Info "electron dist 镜像 $($m.Name) 未确认（$(($_.Exception.Message -replace '\s+', ' '))）"
+    }
+  }
+  if ($mirror) {
+    $env:ELECTRON_MIRROR = $mirror.Mirror
+    $env:ELECTRON_CUSTOM_DIR = ($mirror.Dir -f $version)
+  } else {
+    Write-WarnLine "没有镜像被确认含 $version 的 $zipName，按现有 ELECTRON_MIRROR 继续尝试。"
+  }
+
   Write-WarnLine "缺少 $distDir，正在运行 electron install.js 解包（复用缓存/镜像）..."
   Push-Location $elDir
   try {
-    & node install.js
-    if ($LASTEXITCODE -ne 0) { Write-WarnLine "electron install.js 退出码 $LASTEXITCODE" }
+    # @electron/get v5 用 Node 的 fetch：Node 24 起才认 NODE_USE_ENV_PROXY，
+    # 不设它就等于不走 HTTPS_PROXY（本机直连 GitHub 是被挡的）。
+    $env:NODE_USE_ENV_PROXY = '1'
+    $env:ELECTRON_GET_USE_PROXY = '1'
+    # 脚本顶部 $PSNativeCommandUseErrorActionPreference=$true：install.js 非零退出会
+    # 直接抛成致命错误、跳过下面的兜底，所以这里必须先临时关掉（与 git apply 同一坑）。
+    $prevNative = $PSNativeCommandUseErrorActionPreference
+    $PSNativeCommandUseErrorActionPreference = $false
+    try {
+      & node install.js
+      if ($LASTEXITCODE -ne 0) { Write-WarnLine "electron install.js 退出码 $LASTEXITCODE" }
+    } finally {
+      $PSNativeCommandUseErrorActionPreference = $prevNative
+    }
   } finally {
     Pop-Location
   }
-  if (Test-Path -LiteralPath $distDir) {
+
+  # ② 兜底：自己下载 + 解包（不依赖 @electron/get 自身支持代理；HTTPS_PROXY 由主流程设置）
+  if (-not (Test-Path -LiteralPath $exePath) -and $mirror) {
+    $url = "$($mirror.Mirror)$($mirror.Dir -f $version)/$zipName"
+    try {
+      $zip = Join-Path $env:TEMP $zipName
+      Write-WarnLine "install.js 未产出 dist，改为直接下载并解包：$url"
+      Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 1800
+      New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+      Expand-Archive -LiteralPath $zip -DestinationPath $distDir -Force
+      Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+    } catch {
+      Write-WarnLine "electron dist 直接下载/解包失败：$($_.Exception.Message)"
+    }
+  }
+
+  if (Test-Path -LiteralPath $exePath) {
     Write-Ok "electron dist 已就绪：$distDir"
+  } elseif (Test-Path -LiteralPath $distDir) {
+    Write-WarnLine "electron dist 目录存在但未找到 electron.exe：$distDir"
   } else {
     Write-WarnLine 'electron dist 仍缺失，electron-builder 打包会失败。'
   }

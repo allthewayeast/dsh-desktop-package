@@ -516,8 +516,11 @@ function Invoke-Workspace {
 function Ensure-ElectronDist {
   # .yarnrc.yml 的 enableScripts:false 让 electron 的 postinstall 不执行，于是
   # node_modules\electron\dist 缺失，而 electron-builder 现在优先用这个本地目录，
-  # 报 "The specified electronDist does not exist"。这里按需跑 electron 自带的
-  # install.js（优先复用 @electron/get 缓存，缺失时走 ELECTRON_MIRROR 镜像）。
+  # 报 "The specified electronDist does not exist"。这里按需补齐 dist：
+  #   ① 先 HEAD 探出真正含该版本的镜像再设为 ELECTRON_MIRROR —— Electron 发新版后
+  #      npmmirror 常有滞后（44.7.2 发布 8 小时后仍 404），不探测就会空跑一次大下载；
+  #   ② install.js 之后仍无 electron.exe 时，自己下载 zip 并解包兜底。
+  #   版式差异：npmmirror 是 <ver>/，GitHub release 是 v<ver>/（写错即 404）。
   $elDir = Join-Path $script:WsDir 'node_modules\electron'
   $installer = Join-Path $elDir 'install.js'
   if (-not (Test-Path -LiteralPath $installer)) {
@@ -525,20 +528,77 @@ function Ensure-ElectronDist {
     return
   }
   $distDir = Join-Path $elDir 'dist'
-  if (Test-Path -LiteralPath $distDir) {
+  $exePath = Join-Path $distDir 'electron.exe'
+  if (Test-Path -LiteralPath $exePath) {
     Write-Info "electron dist 已就绪：$distDir"
     return
   }
+  $version = (Get-JsonObject (Join-Path $elDir 'package.json')).version
+  $archTag = if ("$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)".ToUpperInvariant() -like '*ARM64*') { 'arm64' } else { 'x64' }
+  $zipName = "electron-v$version-win32-$archTag.zip"
+  $mirrors = @(
+    @{ Name = 'npmmirror'; Mirror = 'https://npmmirror.com/mirrors/electron/'; Dir = '{0}' },
+    @{ Name = 'github'; Mirror = 'https://github.com/electron/electron/releases/download/'; Dir = 'v{0}' }
+  )
+
+  $mirror = $null
+  foreach ($m in $mirrors) {
+    $probeUrl = "$($m.Mirror)$($m.Dir -f $version)/$zipName"
+    try {
+      $r = Invoke-WebRequest -Uri $probeUrl -Method Head -UseBasicParsing -TimeoutSec 45 -ErrorAction Stop
+      if ([int]$r.StatusCode -eq 200) {
+        $mirror = $m
+        Write-Info "electron dist 镜像已确认含 $version：$($m.Name)"
+        break
+      }
+    } catch {
+      Write-Info "electron dist 镜像 $($m.Name) 未确认（$(($_.Exception.Message -replace '\s+', ' '))）"
+    }
+  }
+  if ($mirror) {
+    $env:ELECTRON_MIRROR = $mirror.Mirror
+    $env:ELECTRON_CUSTOM_DIR = ($mirror.Dir -f $version)
+  } else {
+    Write-WarnLine "没有镜像被确认含 $version 的 $zipName，按现有 ELECTRON_MIRROR 继续尝试。"
+  }
+
   Write-WarnLine "缺少 $distDir，正在运行 electron install.js 解包（复用缓存/镜像）..."
   Push-Location $elDir
   try {
-    & node install.js
-    if ($LASTEXITCODE -ne 0) { Write-WarnLine "electron install.js 退出码 $LASTEXITCODE" }
+    # @electron/get v5 用 Node 的 fetch：Node 24+ 配 NODE_USE_ENV_PROXY 才会认 HTTPS_PROXY。
+    $env:NODE_USE_ENV_PROXY = '1'
+    $env:ELECTRON_GET_USE_PROXY = '1'
+    # 非零退出不能被 $PSNativeCommandUseErrorActionPreference 抛成致命错误，否则到不了兜底。
+    $prevNative = $PSNativeCommandUseErrorActionPreference
+    $PSNativeCommandUseErrorActionPreference = $false
+    try {
+      & node install.js
+      if ($LASTEXITCODE -ne 0) { Write-WarnLine "electron install.js 退出码 $LASTEXITCODE" }
+    } finally {
+      $PSNativeCommandUseErrorActionPreference = $prevNative
+    }
   } finally {
     Pop-Location
   }
-  if (Test-Path -LiteralPath $distDir) {
+
+  if (-not (Test-Path -LiteralPath $exePath) -and $mirror) {
+    $url = "$($mirror.Mirror)$($mirror.Dir -f $version)/$zipName"
+    try {
+      $zip = Join-Path $env:TEMP $zipName
+      Write-WarnLine "install.js 未产出 dist，改为直接下载并解包：$url"
+      Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 1800
+      New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+      Expand-Archive -LiteralPath $zip -DestinationPath $distDir -Force
+      Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+    } catch {
+      Write-WarnLine "electron dist 直接下载/解包失败：$($_.Exception.Message)"
+    }
+  }
+
+  if (Test-Path -LiteralPath $exePath) {
     Write-Ok "electron dist 已就绪：$distDir"
+  } elseif (Test-Path -LiteralPath $distDir) {
+    Write-WarnLine "electron dist 目录存在但未找到 electron.exe：$distDir"
   } else {
     Write-WarnLine 'electron dist 仍缺失，electron-builder 打包会失败。'
   }

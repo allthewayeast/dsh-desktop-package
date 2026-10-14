@@ -524,6 +524,45 @@ git diff -U1 -- <file> > overlay\patches\<file>.patch
 >
 > 改完必须**两个阶段都验证**：`[05]` 依赖安装和 `[07]` market:prepare 都要通过。
 
+#### 1.2.1 hunk 形态的两条铁律（2026-10 实测，`package.json` 覆盖层踩过）
+
+上游每次改到补丁附近都会让 `git apply` 失配、`[04]` 直接中止。下面两条能把这类失配压到最低。
+
+**铁律①：hunk 不能以「新增行」结尾，必须以一行上下文结尾。** 同一段 pre-image，`-U1` 生成后再手工裁掉尾部上下文的 hunk 会被判成 `patch does not apply`；补回一行尾部上下文即可套用。**以删除行开头是允许的**（不需要前导上下文）。
+
+实测（同一份 `dsh-plugin-desktop/package.json`、同一段改动，只变 hunk 形态）：
+
+| hunk 形态 | 结果 |
+|---|---|
+| 有前导上下文 + 有尾部上下文（标准 `-U3` / `-U1`） | ✅ 可套用 |
+| **无**前导上下文 + 有尾部上下文 | ✅ 可套用 |
+| 无前导上下文 + **无**尾部上下文 | ❌ `patch does not apply` |
+| 有前导上下文 + **无**尾部上下文 | ❌ `patch does not apply` |
+
+**铁律②：别把上下文压在「上游爱改的行」上。** `dsh-plugin-desktop/package.json` 里 `mac.x64ArchFiles` 与 `win.extraResources` 是高频改动点：上游插入 primary-runtime（`47574b1a83`）时正好改了这两处，把整份补丁顶掉。现在的构造是：
+
+- `build.asar` / `electronFuses`：上下文用 `productName`、`afterPack`、`resetAdHocDarwinSignature` 这类稳定行；
+- `mac.asarUnpack`：不引用 `x64ArchFiles`，尾部上下文用 `},` 与 `"win": {`；
+- `win`：把 `files` / `asarUnpack` 插在 `"win": {` 之后、`"compression"` 之前（**JSON 键序无关**），尾部上下文因此落在稳定的 `"compression": "normal",` 上；
+- `linux.asarUnpack`：上下文用 `syncDesktopName`。
+
+**重新锚定的标准动作**（上游又改到同一区域时）：
+
+```powershell
+cd dsh-desktop
+git worktree add ..\..\Temp\YMZ\patchcheck HEAD --detach     # 用干净 HEAD，别污染工作区
+# 1) 在 worktree 里把目标文件改成「预期结果」（脚本化替换，每处都断言命中恰好 1 次）
+# 2) git diff -U1 -- <file> 导出候选补丁
+# 3) 删掉压在易变行上的上下文，并按实际内容重算 hunk 头（删了前导上下文，起始行号 +N）
+# 4) 双重验证：git apply --check 必须 exit 0；套用后与「预期结果」**逐字节比对**（md5 相同）
+# 5) 再按构建顺序把三个补丁依次套到干净树上，确认彼此不打架
+git worktree remove ..\..\Temp\YMZ\patchcheck --force
+```
+
+> ⚠️ 手工重组补丁时计数极易写错，报错是 `corrupt patch at line N`。算法：pre 行数 = 上下文行 + `-` 行，post 行数 = 上下文行 + `+` 行。改完必须跑第 4 步。
+>
+> 另一个会误导排查的坑：用 `>` / `Tee-Object` 导出补丁会写成 **CRLF**。构建侧 `Apply-SrcOverlay` 会自动 CRLF→LF，所以**构建照样能过**；但你手工 `git apply --check` 会报 `patch does not apply`——看着像内容不对，其实只是行尾。导出时用 `[IO.File]::WriteAllText` 写 LF。
+
 #### 1.3 补丁不要包含构建脚本托管的字段
 
 导出补丁时，工作区里可能已经带有**构建脚本自己注入**的改动（不是你的定制）。这些必须从补丁里剔除，否则补丁会和脚本互相打架。
@@ -598,20 +637,35 @@ git -C dsh-desktop\deepseek-harness show <new-ref>:<path> | Select-String '<补�
 
 ### 二、打包 / 门禁类问题
 
-#### 2.1 electron dist 缺失
+#### 2.1 electron dist 缺失 / 新版 Electron 取不到头文件
 
-```text
-The specified electronDist does not exist: ...\node_modules\electron\dist
-```
+两种表现、同一个根因：**Electron 刚发新版时 npmmirror 还没有**。实测：44.7.2 于 2026-10-14 01:27 发布，8 小时后 `/mirrors/electron/` 与 `/-/binary/electron/` 双双 404（连 `win-x64/node.lib` 都没有），而脚本原先只认 npmmirror。
 
-原因：`.yarnrc.yml` 的 `enableScripts:false` 让 electron 的 postinstall 不执行，`dist` 没被解包；而 electron-builder 优先用这个本地目录。
+| 报错 | 出现位置 |
+|------|---------|
+| `响应状态代码未指示成功: 404 (Not Found)` 取头文件时 | `Prepare-PackagingEnvironment` |
+| `HTTPError: Response code 404 (Not Found) for https://cdn.npmmirror.com/binaries/electron/…` | `Ensure-ElectronDist` → `install.js` |
+| `The specified electronDist does not exist: …\node_modules\electron\dist` | 打包阶段（dist 没补上） |
 
-两个脚本都内置了 `Ensure-ElectronDist`（按需跑 electron 自带 `install.js`，复用 `@electron/get` 缓存，缺失时走 `ELECTRON_MIRROR`）。若仍失败：
+现在 `build.ps1` 的行为（两个通道的 `Ensure-ElectronDist` 同源）：
+
+1. **头文件多源回退**：`artifacts.electronjs.org/headers/dist/v<ver>/`（官方，新版本即时可用）→ `npmmirror.com/mirrors/electron/<ver>/` → `registry.npmmirror.com/-/binary/electron/<ver>/`；`node-v<ver>-headers.tar.gz` 与 `win-x64/node.lib` 各自取。**全部失败只告警、不中止构建**——这一步只是「打包前要现场重编译原生模块」的兜底，而 `package:dir` / `dist:*` 都已用 `npmRebuild=false` 跳过重编译。
+2. **dist 镜像先探测再使用**：对 `electron-v<ver>-win32-x64.zip` 发 HEAD，确认真有该版本才把 `ELECTRON_MIRROR` / `ELECTRON_CUSTOM_DIR` 设过去（不探测的话，npmmirror 上必然空跑一次 157 MB 的下载）。**版式差异是坑：npmmirror 是 `<ver>/`，GitHub 是 `v<ver>/`。**
+3. **代理**：`@electron/get` v5 走 Node 的 `fetch`，只有 Node 24+ 配 `NODE_USE_ENV_PROXY=1` 才会认 `HTTPS_PROXY`（本机直连 GitHub 是被挡的）；脚本已设该变量。
+4. **兜底**：`install.js` 之后仍无 `electron.exe`，脚本自己用 `Invoke-WebRequest` 下载 zip 并 `Expand-Archive` 到 `node_modules\electron\dist`（不依赖 `@electron/get` 的代理支持）。
+
+手工排查（任一通道）：
 
 ```powershell
-cd dsh-desktop\dsh-desktop-next\node_modules\electron
-node install.js
+# 头文件是否就位
+Test-Path "$HOME\.electron-gyp\<ver>\include\node\config.gypi"
+# dist 是否就位
+Test-Path dsh-desktop\dsh-plugin-desktop\node_modules\electron\dist\electron.exe
+# 手工补 dist
+cd dsh-desktop\dsh-plugin-desktop\node_modules\electron; node install.js
 ```
+
+> **结论性建议：** 在 Electron 刚发布几小时内就用 `-ElectronVersion` 追新版，上述问题会全部命中（成败取决于本机能否直连官方源、代理是否可用）。不急就等 npmmirror 同步（通常 1–2 天）再切。
 
 #### 2.2 afterPack 门禁拒绝产物
 

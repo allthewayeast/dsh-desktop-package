@@ -1,29 +1,22 @@
 diff --git a/dsh-plugin-desktop/package.json b/dsh-plugin-desktop/package.json
-index b12655507a..0e57abd0d6 100644
+index d3c48aed9f..a88f66b7cf 100644
 --- a/dsh-plugin-desktop/package.json
 +++ b/dsh-plugin-desktop/package.json
-@@ -358,12 +358,14 @@
-   "build": {
-     "appId": "ai.deepseek.dsh.desktop",
+@@ -371,3 +371,5 @@
      "productName": "DSH Desktop",
 -    "asar": false,
 +    "asar": {
 +      "smartUnpack": true
 +    },
      "afterPack": "./scripts/verify-packaged-runtime.ts",
-     "afterAllArtifactBuild": "./scripts/verify-electron-fuses.ts",
+@@ -375,4 +377,4 @@
      "electronFuses": {
 -      "enableEmbeddedAsarIntegrityValidation": false,
 -      "onlyLoadAppFromAsar": false,
 +      "enableEmbeddedAsarIntegrityValidation": true,
 +      "onlyLoadAppFromAsar": true,
        "resetAdHocDarwinSignature": true,
-       "runAsNode": true
-     },
-@@ -407,11 +409,26 @@
-         "\\.(?:pak|dat|wasm)$"
-       ],
-       "x64ArchFiles": "**/node_modules/{@dataiku/uv-darwin-*/**,@deepseek-ai/node-addon-system-darwin-*/**,node-pty/prebuilds/darwin-*/**,fs-ext/prebuilds/darwin-*/**,node-addon-require-builtin-darwin-*/**,@vscode/ripgrep-darwin-*/**,@img/sharp-darwin-*/**,@img/sharp-libvips-darwin-*/**,@koromix/koffi-darwin-*/**,@deepseek-ai/libreoffice-kit-darwin-*/**,sherpa-onnx-darwin-*/**}",
+@@ -431,5 +433,20 @@
 -      "asar": false
 +      "asarUnpack": [
 +        "build/app-icon-mac.png",
@@ -34,7 +27,6 @@ index b12655507a..0e57abd0d6 100644
      },
      "win": {
 -      "asar": false,
-       "compression": "normal",
 +      "files": [
 +        "!node_modules/@deepseek-ai/libreoffice-kit-win32-arm64/**"
 +      ],
@@ -46,12 +38,8 @@ index b12655507a..0e57abd0d6 100644
 +        "build/tray-icon-blue@2x.png",
 +        "node_modules/@agents-anywhere/dsh-bridge-next/lib/bundled-connector/**"
 +      ],
-       "target": [
-         {
-           "target": "nsis",
-@@ -461,7 +478,14 @@
-       "maintainer": "DeepSeek <dsh-desktop@deepseek.com>",
-       "executableName": "dsh-desktop",
+       "compression": "normal",
+@@ -490,3 +507,10 @@
        "syncDesktopName": true,
 -      "asar": false
 +      "asarUnpack": [
@@ -63,5 +51,3 @@ index b12655507a..0e57abd0d6 100644
 +        "node_modules/@agents-anywhere/dsh-bridge-next/lib/bundled-connector/**"
 +      ]
      },
-     "deb": {
-       "packageName": "dsh-desktop",
