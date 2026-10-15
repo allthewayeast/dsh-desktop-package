@@ -529,9 +529,29 @@ function Set-MarketWorkspaceCheck {
   $keep = @($declared | Where-Object { $script:ExcludedWorkspaces -notcontains $_ })
   if ($keep.Count -eq 0) { Write-WarnLine 'dshmarket 校验工作区收缩后为空，跳过。'; return }
   $keepList = ($keep | ForEach-Object { "'$_'" }) -join ', '
-  $replacement = "export const MARKET_WORKSPACES_EXCLUDED = ['$((($script:ExcludedWorkspaces | ForEach-Object { "'$_'" }) -join ', '))']`nexport const MARKET_WORKSPACES = [$keepList]"
+  # 注意（2026-10-15 修复）：内层表达式已经产出带引号的字面量（'dsh-plugin-desktop'），
+  # 所以这里**不能再套一层引号** —— 旧写法 `['$(… )']` 会写出 `[''dsh-plugin-desktop'']`，
+  # 那是 JS 语法错误；因为本次构建并不 import 这个文件（next 通道走的是工作区级
+  # package:dir），错误会潜伏到下一次别的入口调用 `yarn market:prepare` 时才炸
+  # （实测：stable 通道 package:dir 的第一步 market:prepare 直接 SyntaxError 退出）。
+  $replacement = "export const MARKET_WORKSPACES_EXCLUDED = [$((($script:ExcludedWorkspaces | ForEach-Object { "'$_'" }) -join ', '))]`nexport const MARKET_WORKSPACES = [$keepList]"
+  $original = $text
   $text = $text.Remove($anchor.Index, $anchor.Length).Insert($anchor.Index, $replacement)
   [System.IO.File]::WriteAllText($marketPath, $text)
+  # 自检：注入结果必须是合法 JS，否则回滚为上游原样（宁可收缩失效也不要留下语法错误）。
+  $prevNativeCheck = $PSNativeCommandUseErrorActionPreference
+  $PSNativeCommandUseErrorActionPreference = $false
+  try {
+    $syntax = @(& node --check $marketPath 2>&1)
+    $syntaxCode = $LASTEXITCODE
+  } finally {
+    $PSNativeCommandUseErrorActionPreference = $prevNativeCheck
+  }
+  if ($syntaxCode -ne 0) {
+    [System.IO.File]::WriteAllText($marketPath, $original)
+    Write-WarnLine "dshmarket 校验工作区：注入后语法校验失败，已回滚为上游原样 —— $($syntax -join ' ')"
+    return
+  }
   Write-WarnLine "dshmarket 校验工作区已收缩为 [$keepList]"
 }
 

@@ -1655,6 +1655,65 @@ function Get-HarnessLineSiblingWorkspace {
   return $null
 }
 
+# ---- 运行时载荷层：随 harness「线」变化、与产品身份无关的文件（-HarnessVersion 跨线时必须一起迁移）----
+# scripts/prepare-runtime.ts 与 scripts/primary-runtime.ts 编码的是「这条 harness 线期望什么样
+# 的随包载荷」：Office 资源清单（门禁）、载荷组装方式、载荷摘要格式、冒烟参数。它们**不是**
+# 产品变体差异，上游为每条线各维护一份（stable = rc.2 线，beta / next = alpha.x 线）。
+#
+# 实测（2026-10-15，dsh 0.2.1-alpha.3）：alpha.3 把 Office 载荷从「Python 校验器
+# check_office.py + 3 个技能」改成「7 个技能 + LibreOffice sidecar」——
+# @deepseek-ai/dsh-skill-office@0.2.1-alpha.3 的 assets 里已经没有 scripts\ 目录，而 stable
+# 工作区的门禁仍在要求它 ⇒ package:dir 在 [08] 必然失败：
+#   Desktop runtime: missing x64 Office checker: …\office-skills\scripts\check_office.py
+# 同版本的兄弟工作区 dsh-plugin-desktop-beta 里这几处已经是新形态（7 个技能；冒烟不再把
+# check_office.py 传给 smoke.py；载荷组装改用 copyPrimaryRuntime；载荷摘要 format 6 → 7），
+# 照抄即可 —— 这也正是上游在该线上实际发布的代码。
+#
+# 迁移方式：与「和 $v 同线的兄弟通道工作区」逐文件比对后覆盖（幂等：内容相同即跳过）。
+# 不写成 overlay\patches\：补丁得压在随上游高频改动的行上、每次上游一动就要重新锚定
+# （见 package.json.patch 的历史），而这里的状态本来就随线走，照抄兄弟工作区最省事且自愈。
+$script:RuntimeLinePayloadFiles = @(
+  'scripts/prepare-runtime.ts'
+  'scripts/primary-runtime.ts'
+  'tests/prepare-runtime.spec.ts'
+  'tests/primary-runtime.spec.ts'
+)
+
+function Set-RuntimeLineMigration {
+  param(
+    [Parameter(Mandatory = $true)][string]$Version,
+    $Sibling = $null
+  )
+  $own = Get-UpstreamStableChannel
+  $ownVersion = if ($own) { [string]$own.sourceVersion } else { $null }
+  if ($ownVersion -and $Version -eq $ownVersion) {
+    Write-Info "运行时载荷层：$Version 就是本通道所属的 harness 线（$ownVersion）→ 无需迁移"
+    return
+  }
+  if (-not $Sibling) {
+    Write-WarnLine "运行时载荷层迁移：上游 upstream.json 里找不到与 $Version 同线的兄弟通道工作区 → 跳过。" +
+      '（若该线改了随包载荷的形态，[08] 会以 “missing …” 直接失败，可据此识别并人工处理）'
+    return
+  }
+  $migrated = @()
+  foreach ($rel in $script:RuntimeLinePayloadFiles) {
+    $tail = $rel -replace '/', [IO.Path]::DirectorySeparatorChar
+    $srcFile = Join-Path $script:Src (Join-Path $Sibling.Name $tail)
+    $dstFile = Join-Path $script:Src (Join-Path $script:ChannelWsName $tail)
+    if (-not (Test-Path -LiteralPath $srcFile) -or -not (Test-Path -LiteralPath $dstFile)) { continue }
+    $srcHash = (Get-FileHash -LiteralPath $srcFile -Algorithm SHA256).Hash
+    $dstHash = (Get-FileHash -LiteralPath $dstFile -Algorithm SHA256).Hash
+    if ($srcHash -eq $dstHash) { continue }
+    Copy-Item -LiteralPath $srcFile -Destination $dstFile -Force
+    $migrated += $rel
+  }
+  if ($migrated.Count -gt 0) {
+    Write-WarnLine "运行时载荷层迁移（$($Sibling.Name) 线 → $($script:ChannelWsName)，dsh $Version）：已对齐 $($migrated.Count) 个文件 —— $($migrated -join '、')"
+  } else {
+    Write-Info "运行时载荷层：已与 $($Sibling.Name) 线一致（无需迁移）"
+  }
+}
+
 # 固定是否已**真正落到工作区**：upstream.json 里写着目标版本，不等于依赖也改过了。
 # 旧版本脚本只改写 @deepseek-ai/dsh* 而漏掉伴随包，这时 0c) 的「声明已一致 → 跳过」
 # 会让这个半成品**永远无法自愈**（实测：stable 被固定到 0.2.1-alpha.1 之后，
@@ -1893,6 +1952,11 @@ function Set-RuntimeVersionPinned {
       "（@deepseek-ai/cordis*、@deepseek-ai/schemastery 等）迁移。若这些包停在上一条线的版本，" +
       "Yarn 会嵌套安装第二份副本，类型门禁可能以 TS6200 失败。"
   }
+
+  # 2c) 运行时载荷层迁移（跨线时）：见 Set-RuntimeLineMigration 的说明。必须与 2)/2b) 同步 ——
+  #     否则把工作区固定到另一条线之后，随包载荷的门禁仍按上一条线的形态校验，[08] 必然失败。
+  #     本函数会跑两次（[03] 与 [05] Invoke-RequiredWinFixes 内），实现是幂等的。
+  Set-RuntimeLineMigration -Version $v -Sibling $sibling
 
   # 3) 根 package.json resolutions：删掉旧 stable 通道的 dsh 条目（@npm:$v / @npm:^$v，
   #    保留其他版本如 beta 的 rc.1），再从 manifest 重建指向 vendor/$v 的条目。

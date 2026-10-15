@@ -410,6 +410,50 @@ Get-ChildItem $ws -Recurse -Directory -Filter '@deepseek-ai' |
 > 的 `dependencies` 仍指向 `0.2.0-rc.2`）。这些不进入 `tsc` 的全局脚本冲突，实测不阻塞门禁；
 > 上面的自查命令可以确认它们的存在与规模。
 
+#### 跨线固定还要迁移「运行时载荷层」（漏了它 `[08]` 必以 `missing …` 失败）
+
+同一件事还有第二层：`scripts/prepare-runtime.ts` 与 `scripts/primary-runtime.ts` 编码的是
+**这条 harness 线期望什么样的随包载荷** —— Office 资源清单（门禁）、载荷组装方式、载荷摘要
+格式、冒烟参数。它们**不是**产品变体差异，上游同样为每条线各维护一份，所以跨线固定时必须
+一起迁移（步骤 **2c**，`Set-RuntimeLineMigration`）。
+
+实测（2026-10-15，dsh `0.2.1-alpha.3`）：
+
+| 对比项 | rc.2 线（stable 工作区） | alpha.3 线（beta 工作区 = 本次目标） |
+|---|---|---|
+| Office 载荷形态 | `@deepseek-ai/dsh-skill-office` 的 `assets\scripts\check_office.py`（Python 校验器）+ 3 个技能 | 7 个技能 + LibreOffice sidecar（**assets 里已无 `scripts\` 目录**） |
+| 门禁要求 | `scripts/check_office.py` + `office-docx/pptx/xlsx` | `office`、`office-docx`、`office-pptx`、`office-xlsx`、`office-render`、`office-recalculate`、`office-export-pdf` |
+| 载荷组装 | `cp(output, destination, { recursive: true, dereference: true })` | `copyPrimaryRuntime(output, destination, manifest)` |
+| 载荷摘要 | `format: 6` | `format: 7` |
+| 载荷冒烟 | 给 `smoke.py` 追加 `office-skills\scripts\check_office.py` | 不再传该路径 |
+
+于是「stable 工作区 + alpha.3 运行时」这个组合在 `[08]` 必然失败（原始报错）：
+
+```
+Preparing the win-x64 primary runtime (Python 3.12.14, Node 24.21.0) for 2.0.17
+Error: Desktop runtime: missing x64 Office checker:
+  …\dsh-plugin-desktop\.desktop-build\runtime\x64\office-skills\scripts\check_office.py
+    at requireFile (scripts/prepare-runtime.ts:131)
+    at verifyDesktopRuntimeTree (scripts/prepare-runtime.ts:166)
+```
+
+**修法**：`-HarnessVersion` 跨线时，把下列 4 个文件从「与该版本同线的兄弟通道工作区」逐文件
+比对后覆盖。三个保护条件：内容相同即跳过（幂等，本函数在 `[03]` 与 `[05]` 各跑一次）；
+`$v` 就是本通道所属的线时不迁移；上游 `upstream.json` 里找不到同线兄弟工作区时只告警。
+
+| 文件 | 随线变化的内容 |
+|---|---|
+| `scripts/prepare-runtime.ts` | Office 资源清单（门禁） |
+| `scripts/primary-runtime.ts` | 载荷组装、摘要格式、冒烟参数 |
+| `tests/prepare-runtime.spec.ts`、`tests/primary-runtime.spec.ts` | 与上面两者配套的夹具与断言（`-Target test` 用；`build` 不 typecheck 它们） |
+
+之所以**不做成 `overlay\patches\`**：这几处正好压在上游高频改动的行上，每换一条线就要重新
+锚定（维护史见 `package.json.patch`）；而它们的状态本来就随线走 —— 照抄兄弟工作区既自愈，
+又不需要维护补丁，且迁移的正是上游在该线上实际发布的代码。
+
+> 排查提示：跨线固定后若 `[08]` 报 `Desktop runtime: missing …`，先看 `[03]`/`[05]` 有没有
+> 打印「运行时载荷层迁移」；若打印的是「找不到与 … 同线的兄弟通道工作区」，说明上游还没把
+> 该版本纳入 `upstream.json` 的通道表，需要人工对照兄弟工作区处理。
 
 **实测值（2026-10-04，随上游刷新，仅供参考）**：stable 通道 = dsh `0.2.0-rc.2` @ `639ed01539`；
 上游 `devDependencies.electron` = **`44.0.0`**（不是 44.5.1 —— 44.5.1 是历次 `-ElectronVersion 44.5.1`
