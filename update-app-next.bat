@@ -19,7 +19,7 @@ del /f /q "%distDir%\version"
 rename "%distDir%\locales\en-US.pak.bak" "en-US.pak"
 rename "%distDir%\locales\zh-CN.pak.bak" "zh-CN.pak"
 
-robocopy "%distDir%" "X:\App\DSH-Next" /mir /xf "startup.json"
+robocopy "%distDir%" "X:\App\DSH-Next" /mir /xf "startup.json" "*arm64*" /xd "*arm64*"
 
 echo The dist\win-unpacked directory will now be deleted.
 echo   - Close any running program / terminal window first
