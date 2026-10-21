@@ -180,11 +180,33 @@ $script:OverlayDir = Join-Path $script:Root 'overlay-next'
 $script:OverlayFiles = @{
   'dsh-desktop-next/src/startup-config.ts'      = 'startup-config.ts'
   'dsh-desktop-next/tests/startup-config.spec.ts' = 'startup-config.spec.ts'
+  # 主窗口位置/大小持久化：上游没有这个模块，main.ts 补丁里 import './window-state.ts'。
+  # ⚠️ 它**只能**以「新建文件」交付：dsh-desktop\ 是被本仓库 gitignore 的独立仓库，
+  #    写在那边的文件既不进本仓库、换机器/重新克隆后也不存在 —— 那样补丁会剩下一句
+  #    指向空处的 import（TS2307），构建直接失败。2026-10-21 复盘时就是这样差点漏推。
+  'dsh-desktop-next/src/window-state.ts'         = 'window-state.ts'
+  'dsh-desktop-next/tests/window-state.spec.ts'  = 'window-state.spec.ts'
 }
 # 已跟踪文件的修改：overlay-next\patches\<basename>.patch
 $script:OverlayPatches = @(
   'dsh-desktop-next/src/main.ts'
+  # 主窗口几何回归用例：main.ts 的窗口状态接线需要假 Electron 提供窗口几何 API
+  # （isMaximized/maximize/getNormalBounds/screen），否则每个主窗口用例都会中断。
+  'dsh-desktop-next/tests/main-lifecycle.spec.ts'
 )
+# 二进制资源：把本仓库 build\ 里的托盘图标覆盖到 next 的 assets\。
+#   为什么必须走这一步：它们是 **git 跟踪文件**，[01]/[02] 拉源码时的 checkout --force 会把
+#   手工替换的版本无条件抹掉（2026-10-21 实测：手改 deploy 目录 → 部署一次就回到旧图）；
+#   而 PNG 既进不了 git patch，也不适合 base64 塞进补丁。所以每次构建在覆盖层里按字节重放。
+#   目标 = 运行时真正读取的路径（lib/main.js: unpackedPath(join(root,'assets',
+#   platform==='darwin' ? 'tray-iconTemplate.png' : 'tray-icon-blue.png'))）。
+$script:OverlayAssets = [ordered]@{
+  # 目标（工作区相对路径）                              = 源（相对本仓库根）
+  'dsh-desktop-next/assets/tray-icon-blue.png'          = 'build/tray-icon-blue.png'
+  'dsh-desktop-next/assets/tray-icon-blue@1.25x.png'    = 'build/tray-icon-blue@1.25x.png'
+  'dsh-desktop-next/assets/tray-icon-blue@1.5x.png'     = 'build/tray-icon-blue@1.5x.png'
+  'dsh-desktop-next/assets/tray-icon-blue@2x.png'       = 'build/tray-icon-blue@2x.png'
+}
 
 # 注意：dsh-desktop-next\package.json **不再**需要覆盖层补丁（见文件头 2026-10-14 说明：
 # 上游已自带 asar + asarUnpack + 平台剔除策略）。同时它也是唯一会被构建期注入的文件
@@ -414,6 +436,27 @@ function Apply-Overlay {
       & git apply $patch
       if ($LASTEXITCODE -ne 0) { throw "git apply 失败：$(Split-Path -Leaf $patch) (exit $LASTEXITCODE)" }
       Write-WarnLine "覆盖层：已应用补丁 $(Split-Path -Leaf $patch)"
+    }
+
+    # 3) 二进制资源：按字节覆盖（PNG 不能走 patch）
+    #    ⚠️ 局部变量一律用 $icon* 前缀：PowerShell 变量名不区分大小写，脚本级 $script:Src
+    #    与一个裸 $src 同名会让赋值互相覆盖（本文件 2026-10-21 已在 $Target/$target 上踩过
+    #    一次同类坑），这里刻意避开。
+    foreach ($rel in $script:OverlayAssets.Keys) {
+      $iconSrcRel = $script:OverlayAssets[$rel]
+      $iconSrc = Join-Path $script:Root ($iconSrcRel -replace '/', [IO.Path]::DirectorySeparatorChar)
+      $iconDst = Join-Path $script:Src ($rel -replace '/', [IO.Path]::DirectorySeparatorChar)
+      if (-not (Test-Path -LiteralPath $iconSrc)) {
+        throw "覆盖层缺少资源文件：$iconSrc（托盘图标源应放在本仓库 build\ 下）"
+      }
+      if ((Test-Path -LiteralPath $iconDst) -and
+        ((Get-FileHash -LiteralPath $iconSrc -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $iconDst -Algorithm SHA256).Hash)) {
+        Write-Info "覆盖层：$(Split-Path -Leaf $iconDst) 已是 build\ 那一份（跳过）"
+        continue
+      }
+      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $iconDst) | Out-Null
+      Copy-Item -LiteralPath $iconSrc -Destination $iconDst -Force
+      Write-WarnLine "覆盖层：已用 $iconSrcRel 替换 $rel（$((Get-Item -LiteralPath $iconSrc).Length) B）"
     }
     Write-Ok '覆盖层已应用（next 通道）'
   } finally {

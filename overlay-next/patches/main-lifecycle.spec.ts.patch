@@ -1,0 +1,65 @@
+diff --git a/dsh-desktop-next/tests/main-lifecycle.spec.ts b/dsh-desktop-next/tests/main-lifecycle.spec.ts
+index f1c0ccf7dc..0d2401298c 100644
+--- a/dsh-desktop-next/tests/main-lifecycle.spec.ts
++++ b/dsh-desktop-next/tests/main-lifecycle.spec.ts
+@@ -86,8 +86,13 @@ vi.mock('electron', async () => {
+       fixture.windows.push(this)
+     }
+     destroyed = false
++    maximized = false
+     isDestroyed() { return this.destroyed }
+     isMinimized() { return false }
++    isMaximized() { return this.maximized }
++    isFullScreen() { return false }
++    maximize() { this.maximized = true; this.emit('maximize') }
++    getNormalBounds() { return { x: 0, y: 0, width: this.size.width, height: this.size.height } }
+     isFocused() { return false }
+     show() { this.visible = true }
+     hide() { this.visible = false }
+@@ -126,6 +131,8 @@ vi.mock('electron', async () => {
+     // Templates stay plain arrays for tray assertions; the popup spy is non-enumerable.
+     Menu: { buildFromTemplate: (items: any) => Object.defineProperty(items, 'popup', { value: (options: unknown) => fixture.popup(items, options), configurable: true }), setApplicationMenu() {} },
+     protocol: { registerSchemesAsPrivileged() {}, handle() {} },
++    screen: { getAllDisplays: () => [{ workArea: { x: 0, y: 0, width: 1920, height: 1080 } }],
++      getPrimaryDisplay: () => ({ workArea: { x: 0, y: 0, width: 1920, height: 1080 } }) },
+     session: { defaultSession: { webRequest: { onBeforeSendHeaders() {} }, setPermissionCheckHandler() {}, setPermissionRequestHandler() {}, setDisplayMediaRequestHandler() {}, on() {} } },
+     systemPreferences: { getMediaAccessStatus: () => 'not-determined', askForMediaAccess: vi.fn(async () => false), isTrustedAccessibilityClient: () => false },
+     desktopCapturer: { getSources: vi.fn(async () => []) },
+@@ -1219,3 +1226,37 @@ it('disables and re-enables a Profile bundle from recovery without running the p
+     expect(fixture.plugin).not.toHaveBeenCalled()
+   } finally { process.argv.splice(0, process.argv.length, ...argv); vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true }) }
+ })
++
++it('restores the saved main-window rectangle and re-maximizes a maximized session', async () => {
++  const home = mkdtempSync(join(tmpdir(), 'next-window-restore-'))
++  vi.stubEnv('DSH_DESKTOP_NEXT_HOME', home)
++  const userData = join(home, 'electron-user-data')
++  mkdirSync(userData, { recursive: true })
++  writeFileSync(join(userData, 'main-window-state.json'),
++    JSON.stringify({ version: 1, bounds: { x: 120, y: 80, width: 1600, height: 1000 }, maximized: true }))
++  try {
++    await import('../src/main.ts')
++    await vi.waitFor(() => expect(fixture.windows).toHaveLength(1))
++    // The fixture reports a 1920x1080 work area, so the saved rectangle fits as-is.
++    expect(fixture.windows[0].options).toMatchObject({ x: 120, y: 80, width: 1600, height: 1000 })
++    expect(fixture.windows[0].maximized).toBe(true)
++  } finally { vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true }) }
++})
++
++it('writes the main-window rectangle back after a resize so the next launch restores it', async () => {
++  const home = mkdtempSync(join(tmpdir(), 'next-window-save-'))
++  vi.stubEnv('DSH_DESKTOP_NEXT_HOME', home)
++  const statePath = join(home, 'electron-user-data', 'main-window-state.json')
++  try {
++    await import('../src/main.ts')
++    await vi.waitFor(() => expect(fixture.windows).toHaveLength(1))
++    const main = fixture.windows[0]
++    vi.useFakeTimers({ shouldClearNativeTimers: true })
++    main.setSize(1440, 900)
++    main.emit('resize')
++    vi.advanceTimersByTime(1000)
++    vi.useRealTimers()
++    expect(JSON.parse(readFileSync(statePath, 'utf8')))
++      .toMatchObject({ version: 1, maximized: false, bounds: { width: 1440, height: 900 } })
++  } finally { vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true }) }
++})
