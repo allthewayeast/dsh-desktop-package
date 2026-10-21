@@ -140,8 +140,12 @@ REM 一键：编译 + 打包到 dsh-desktop-next\dist\win-unpacked（不打 ZIP�
 quick-build-next.bat
 
 REM 透传参数
-quick-build-next.bat -ElectronVersion 44.4.5
+quick-build-next.bat -ElectronVersion 44.9.2
+quick-build-next.bat -HarnessVersion 0.2.1-rc.2 -PnpmVersion 11.28.5
 quick-build-next.bat -SkipPull
+
+REM 先看参数到底改了什么（不安装、不编译，秒级返回）
+quick-build-next.bat -Preview -ElectronVersion 44.9.2 -PnpmVersion 11.28.5
 ```
 
 或直接用 PowerShell：
@@ -149,6 +153,7 @@ quick-build-next.bat -SkipPull
 ```powershell
 pwsh -File .\build-next.ps1 -Target package-dir
 pwsh -File .\build-next.ps1 -Target package-dir -SkipSubmodule   # 等同 bat
+pwsh -File .\build-next.ps1 -Preview                             # 只做注入，打印 diff 后退出
 ```
 
 ### 为什么单独一个脚本
@@ -222,6 +227,103 @@ next 的打包姿态由**上游**决定，脚本只做「按上游要求补齐 +
    （`verifyNextRuntime`）→ 用打包后的 exe 以 Node 模式 import 归档里的模块 → **真启动一次 Host**
    （`packaged-host-smoke.mjs`，300s 预算）。旧版脚本会把这一项从 `package.json` 删掉，导致这条最强的
    验收从来没跑过；现已撤销。
+
+### 版本覆盖参数（next）
+
+三个参数与 stable（`build.ps1`）**同名同语义**：`''` = 未指定 = 完全跟随上游、一个字都不改；
+显式指定 = 改写并按需接线配套补丁。步骤编号见构建日志（`[08]` 那一组）。
+
+| 参数 | 改哪里 | 未指定（默认） | 指定时的硬性前提 |
+|------|--------|----------------|------------------|
+| `-ElectronVersion` | `dsh-desktop-next\package.json` 的 `devDependencies.electron` | 上游声明（当前 44.0.0） | ① 该版本在 npmmirror / GitHub 上可下载（`Ensure-ElectronDist` 会先 HEAD 探测镜像）；② **必须在 dsh 原生 addon 的支持表里**（见下节，当前只有 43.0.0 / 44.0.0 / 44.7.0 / 45.0.0-alpha.6） |
+| `-HarnessVersion` | next 的 `@deepseek-ai/dsh*` 依赖、伴随包（`@deepseek-ai/cordis*` / `schemastery`）与**根 `resolutions`** | 上游声明（当前 `0.2.1-rc.2`） | `vendor\dsh-runtime\<版本>\manifest.json` **必须已存在**（否则直接失败并列出现有版本）；commit 由 `-HarnessCommit` > `upstream.json` 同线通道 > 标签 `dsh-v<版本>` 解析 |
+| `-PnpmVersion` | next 的 `dependencies.pnpm` + 根 `resolutions` 的 pnpm 补丁条目 | 上游声明（当前 11.8.0） | `overlay\pnpm\pnpm@<版本>.patch` 必须存在（否则告警：该版本会以**未打补丁的原版**打包） |
+| `-Preview` | — | 关 | 只做「拉源码 → 解析/固定版本 → 应用覆盖层 → 注入」，打印 `git diff --stat` 与关键注入值后退出 |
+
+**pnpm 为什么必须「换版本 + 落补丁 + 重指 resolution」三件一起做**：Yarn 的补丁挂在**版本化键**
+`"pnpm@npm:11.8.0": "patch:…"` 上。只改依赖版本，该键就不再匹配任何依赖 → **不报错**，但补丁静默失效，
+Desktop 的 `--config.minimumReleaseAge=0` 修复随之丢失（pnpm 11 把字符串 `"0"` 按 truthy 处理）。
+构建在 install 之后会核对一次（`Test-InstalledOverrides`）：版本不对、或 `dist/pnpm.mjs` 里没有
+`Number.isFinite(minimumReleaseAge)` 标记，都会**以失败收场**，不会「构建成功但定制没生效」。
+
+**`-HarnessVersion` 的两条注意事项**（都是实测结论）：
+
+1. **根 `resolutions` 只加不删。** beta 工作区（next 直接 `import` 它的 `src`）仍在用旧版本的条目，
+   删掉会让 beta 退到 registry 解析 —— 这点与 stable 不同（stable 只有一个消费方，可以整段重建）。
+2. **跨线固定是有代价的。** 目标版本若不是 next 上游声明的那条线（当前 next 与 stable/beta 同在
+   `0.2.1-rc.2` 线），会出现三件事：① next 与 beta 各自引用不同线的 dsh，`import beta/src` 处的类型
+   可能对不上（典型 `TS2717` / `TS2344` / `TS6200`）；② 目标线若在 `upstream.json` 里没有同线兄弟
+   通道，伴随包（cordis / schemastery）**无处抄版本**，脚本会明确点名保留原样；③ 目标 manifest 里
+   没有的同名包会保持原版本（脚本会列出来）。所以**推荐只在上游自己声明的版本之间切换**。
+
+### Electron 版本支持表（node-addon-require-builtin）
+
+`-ElectronVersion` **不是想给什么就给什么**。dsh 宿主在 Electron 里 `require` Node 内置模块，靠的是预编译
+原生 addon `node-addon-require-builtin-win32-<arch>\prebuilt\*.node`，它按 **V8 指纹白名单**放行：
+
+```text
+node-addon-require-builtin unsupported: Unsupported/no-context
+  (unsupported Electron runtime fingerprint: Node 24.22.0, V8 15.2.124.43-electron.0
+   (supported Electron versions: 43.0.0, 44.0.0, 44.7.0, 45.0.0-alpha.6))
+```
+
+当前（addon `0.1.9`，随 dsh `0.2.1-rc.2`）白名单就这四个。表里没有的版本，**编译、打包、afterPack 全部
+通过**，只有 `afterAllArtifactBuild` 的「打包后真启动一次 Host」会失败（`exit 1`），也即：不看这条冒烟
+就完全发现不了 —— 2026-10-21 实测 `-ElectronVersion 44.9.2` 就是这样失败的（168s 的打包白跑）。
+
+脚本因此加了一道**快速守卫**（`Test-ElectronAddonSupport`，紧跟 install 之后）：从已安装的 addon 二进制
+里读出白名单，`-ElectronVersion` 不在表里就**立刻失败**（`package-dir` 目标）并给出推荐值；其它目标只告警。
+
+> ⚠️ **stable 通道没有这道保险。** `build.ps1` 会删掉 `build.afterAllArtifactBuild`（`Set-AllArtifactVerifyDisabled`，
+> 历史原因：本机 rcedit 阶段的修复），所以 stable 用 44.9.2 之类的版本会是「构建成功、启动失败」。
+> 要在 stable 上换 Electron 版本，先用下面这条命令自己核一遍白名单。
+
+```powershell
+# 读 addon 二进制里编译进去的支持版本表（明文串）
+grep -a -o -E "(4[0-9]|5[0-9])\.[0-9]+\.[0-9]+(-alpha\.[0-9]+)?" `
+  "dsh-desktop\dsh-desktop-next\node_modules\node-addon-require-builtin-win32-x64-msvc\prebuilt\*.node" | sort -u
+```
+
+### exe 的版本资源（ProductVersion / FileVersion）
+
+`dsh-desktop-next\package.json` 的版本是**带预发布的 semver**（如 `2.0.19-next`），而 Windows 版本
+资源要的是四段数字。electron-builder 的 `winPackager.signAndEditResources()` 这样取值：
+
+```text
+fileVersion    = appInfo.shortVersion || appInfo.buildVersion     ← 本仓库两者都没有 → 直接用 "2.0.19-next"
+productVersion = appInfo.shortVersionWindows || getVersionInWeirdWindowsForm()   ← 这条算出来是 "2.0.19.0"
+```
+
+后果（实测 `X:\App\DSH-Next\DSH NEXT.exe`）：字符串 `FileVersion` 变成 `2.0.19-next`，而
+**VS_FIXEDFILEINFO 里的数字段退化成 `2.0.0.0`** —— 任务管理器、`FileVersionRaw`、部分安装器读的正是
+这个数字段，所以「版本显示 2.0.0.0」。
+
+修法：`Set-WindowsVersionInfo` 在 `build` 段注入 `"buildVersion": "<major>.<minor>.<patch>.0"`
+（`appInfo.buildVersion` 优先于 `version`），于是四段数字与字符串值一致，ProductVersion / FileVersion
+都是 `2.0.19.0`。这一步**总是执行**（不依赖任何参数），并且会在打包后由 `Assert-OverlayArtifacts`
+逐项断言 —— 对不上就直接让构建失败，而不是等装到机器上才发现：
+
+```text
+产物核对：
+  主程序 exe      OK    DSH NEXT.exe · 235 MB
+  版本资源        OK    FileVersion/ProductVersion = 2.0.19.0（数字段与字符串值一致）
+```
+
+手工核验：
+
+```powershell
+(Get-Item 'X:\App\DSH-Next\DSH NEXT.exe').VersionInfo |
+  Select-Object FileVersion, FileVersionRaw, ProductVersion, ProductVersionRaw
+```
+
+> 顺带记录一个已知的上游痕迹：`CompanyName` 仍是 Electron 的默认值 `GitHub, Inc.`（`appInfo.companyName`
+> 取 `package.json` 的 `author.name`，上游没写）。要改就补 `author` 或 `build.copyright`，与版本资源是
+> 两件事。
+
+> 还有一个上游自带的旁路要留意：设置环境变量 `DSH_NEXT_BUILD_VERSION=x.y.z-next`（更新演练用）时，
+> 上游 `scripts\package.ts` 会额外传 `--config.buildVersion=<该字符串>`，**命令行配置优先级高于
+> package.json**，于是注入值被覆盖、exe 的数字段又退回 `2.0.0.0`。演练本来只是验更新链路，不需要
+> 版本资源正确；但别把它当成「补丁没生效」。
 
 ## 覆盖层（Overlay）
 

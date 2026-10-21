@@ -52,7 +52,26 @@
   跳过 deepseek-harness 子模块对齐（与 quick-build-overlay.bat 同名参数语义一致）。
 
 .PARAMETER ElectronVersion
-  Electron 目标版本。默认沿用上游声明，不覆盖。
+  Electron 目标版本（改写 next 工作区 devDependencies.electron）。**未指定时沿用上游声明**，
+  构建上游原样；语义与 build.ps1 的同名参数一致。
+
+.PARAMETER HarnessVersion
+  dsh 运行时（deepseek-harness）目标版本。**未指定时沿用上游声明**（next 工作区自己声明的
+  @deepseek-ai/dsh 版本），不改写任何依赖。指定时把 next 工作区的 @deepseek-ai/dsh* 依赖、
+  伴随包（@deepseek-ai/cordis* / schemastery 等）与根 resolutions 固定到该版本；该版本的
+  vendor\dsh-runtime\<版本>\manifest.json 必须已存在（缺则直接失败，见 Resolve-HarnessVersion）。
+
+.PARAMETER HarnessCommit
+  -HarnessVersion 对应的 deepseek-harness commit。**通常无需指定**：版本有同线通道时取
+  upstream.json 的 commit，否则取标签 dsh-v<版本>。显式给出时以参数为准（与标签不一致只告警）。
+
+.PARAMETER PnpmVersion
+  pnpm 目标版本（改写 next 工作区 dependencies.pnpm，并把根 resolutions 的 pnpm 补丁条目
+  重指到该版本；补丁取自 overlay\pnpm\pnpm@<版本>.patch）。**未指定时沿用上游声明**。
+
+.PARAMETER Preview
+  只做「拉源码 + 解析 / 固定版本 + 应用覆盖层 + 注入」，打印改动摘要后退出，**不安装、
+  不编译**。用于在跑一次 6 分钟构建之前先看参数到底改了什么。
 
 .PARAMETER KeepGoing
   出错继续，最后汇总。
@@ -60,6 +79,8 @@
 .EXAMPLE
   pwsh -File .\build-next.ps1
   pwsh -File .\build-next.ps1 -Target package-dir -SkipSubmodule -ElectronVersion 44.4.5
+  pwsh -File .\build-next.ps1 -HarnessVersion 0.2.1-rc.2 -PnpmVersion 11.28.5
+  pwsh -File .\build-next.ps1 -Preview -ElectronVersion 44.9.2 -PnpmVersion 11.28.5
 #>
 [CmdletBinding()]
 param(
@@ -69,10 +90,25 @@ param(
   [switch]$SkipPull,
   [switch]$SkipSubmodule,
   [switch]$SkipInstall,
+  [switch]$Preview,
   [switch]$KeepGoing,
   [switch]$NoProxy,
   [string]$Proxy = 'http://127.0.0.1:15715',
-  [string]$ElectronVersion
+
+  # --- 三个版本覆盖参数：语义与 build.ps1 完全一致（'' = 未指定 = 跟随上游，不改写）---
+  # ValidatePattern 允许空串（= 未指定），并挡住把 "-ElectronVersion 44" 这类半截版本号
+  # 悄悄写进 package.json（_yarn install_ 会以一个很难读的解析错误收场）。
+  [ValidatePattern('^(?:\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?)?$')]
+  [string]$ElectronVersion = '',
+
+  [ValidatePattern('^(?:\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?)?$')]
+  [string]$HarnessVersion = '',
+
+  [ValidatePattern('^(?:[0-9a-fA-F]{7,40})?$')]
+  [string]$HarnessCommit = '',
+
+  [ValidatePattern('^(?:\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?)?$')]
+  [string]$PnpmVersion = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -92,11 +128,40 @@ $script:WsDir = Join-Path $script:Src $script:WsName
 # 运行时：跟随上游（不再硬钉 0.1.7-rc.2）
 # next 的 dsh 运行时由上游决定，三处必须一致：next 工作区声明的 @deepseek-ai/dsh 版本、
 # 根 package.json 的 resolutions 里该版本 → file:vendor/dsh-runtime/<ver>/... 的映射、
-# vendor\dsh-runtime\<ver> 目录本身。本脚本只校验并报告，不改写依赖串。
+# vendor\dsh-runtime\<ver> 目录本身。未指定 -HarnessVersion 时本脚本只校验并报告，
+# 不改写依赖串；指定时才固定到该版本（见 Resolve-HarnessVersion / Set-HarnessVersionPinned）。
 # 2026-09-29：上游把 next/beta 一律升到 0.2.0-rc.1，而旧代码仍把 next 的依赖串改写成
 # 0.1.7-rc.2；resolutions 的键是带版本的（@deepseek-ai/dsh@npm:0.2.0-rc.1），降版本后
 # 不再匹配 → install 会绕过 vendored 产物退到 npm 解析，且与按 0.2.0-rc.1 peer 构建的
 # AA 产物（vendor\agents-anywhere）不一致。stable 通道仍由 build.ps1 钉 0.1.7-rc.2。
+$script:HarnessRepository = 'https://github.com/deepseek-ai/deepseek-harness.git'
+
+# ---------------- 版本覆盖参数（与 build.ps1 同款语义）----------------
+# 三个参数都是「'' = 未指定 = 完全跟随上游、一个字都不改」。把「是否显式指定」单独记成
+# *Active 布尔值，是为了区分「参数写成空串」与「参数根本没传」—— 后者才是跟随上游。
+$script:ElectronOverride = $ElectronVersion
+$script:ElectronOverrideActive = $MyInvocation.BoundParameters.ContainsKey('ElectronVersion') -and
+  (-not [string]::IsNullOrWhiteSpace($ElectronVersion))
+
+# ⚠️ 命名铁律（从 build.ps1 抄来的教训）：解析结果必须叫 $script:ResolvedRuntimeVersion /
+# $script:ResolvedHarnessCommit，**绝不能写回 $script:HarnessVersion / $script:HarnessCommit**
+# —— PowerShell 里参数就是脚本作用域变量，写回同名变量会把用户传的参数静默覆盖掉。
+$script:HarnessVersionOverride = $HarnessVersion
+$script:HarnessCommitOverride = $HarnessCommit
+$script:HarnessOverrideActive = $MyInvocation.BoundParameters.ContainsKey('HarnessVersion') -and
+  (-not [string]::IsNullOrWhiteSpace($HarnessVersion))
+$script:ResolvedRuntimeVersion = $null      # Resolve-HarnessVersion 写入
+$script:ResolvedHarnessCommit = $null
+$script:DeclaredRuntimeVersion = $null      # next 工作区自己声明的版本（上游权威来源）
+
+$script:PnpmOverride = $PnpmVersion
+$script:PnpmOverrideActive = $MyInvocation.BoundParameters.ContainsKey('PnpmVersion') -and
+  (-not [string]::IsNullOrWhiteSpace($PnpmVersion))
+# pnpm 补丁的存放处：与 stable 共用 overlay\pnpm\（补丁本身是按版本策展的，与通道无关）。
+# 不用 overlay-next\patches\：那里是「对已跟踪文件 git apply」的机制，而 pnpm 补丁是 Yarn
+# patch: 协议的产物，必须原样落到 <src>\patches\ 供根 resolutions 引用。
+$script:PnpmPatchSourceDir = Join-Path $script:Root 'overlay\pnpm'
+
 
 # 本脚本不构建的工作区（只让它们不参与编译/打包），但其中有些仍需安装依赖：
 #   - dsh-plugin-desktop（stable）：next 完全不引用，排除即可。
@@ -244,13 +309,26 @@ function Ensure-Submodule {
     Write-WarnLine '未读到上游记录的 deepseek-harness gitlink（上游结构变化？），跳过子模块核对。'
     return
   }
+  # -HarnessVersion 生效时以解析出的 commit 为准（否则子模块会停在「上游声明那条线」上，
+  # 与本次固定的运行时版本不一致 —— 只有需要重新生成 vendor 产物时才会真正用到子模块，
+  # 但这种不一致最容易在事后排查时误导人）。
+  if ($script:HarnessOverrideActive -and $script:ResolvedHarnessCommit) {
+    if ($script:ResolvedHarnessCommit -ne $expected) {
+      Write-WarnLine "子模块：按 -HarnessVersion $($script:ResolvedRuntimeVersion) 对齐到 $($script:ResolvedHarnessCommit.Substring(0,10))（上游 gitlink 是 $($expected.Substring(0,10))）"
+    }
+    $expected = $script:ResolvedHarnessCommit
+  }
   $actual = (& git -C $sub rev-parse HEAD).Trim()
   if ($actual -ne $expected) {
-    Write-Info "对齐 deepseek-harness 到上游记录 $($expected.Substring(0,10)) ..."
+    Write-Info "对齐 deepseek-harness 到 $(if ($script:HarnessOverrideActive -and $script:ResolvedHarnessCommit -eq $expected) { "-HarnessVersion 指定的" } else { '上游记录的' }) $($expected.Substring(0,10)) ..."
     & git -C $sub checkout --force $expected 2>&1 | ForEach-Object { Write-Log $_ }
     if ($LASTEXITCODE -ne 0) { throw "子模块 checkout 失败 (exit $LASTEXITCODE)" }
   }
-  Write-Ok "deepseek-harness = $($expected.Substring(0,10))（跟随上游 gitlink）"
+  if ($script:HarnessOverrideActive -and $script:ResolvedHarnessCommit -eq $expected) {
+    Write-Ok "deepseek-harness = $($expected.Substring(0,10))（按 -HarnessVersion $($script:ResolvedRuntimeVersion) 对齐）"
+  } else {
+    Write-Ok "deepseek-harness = $($expected.Substring(0,10))（跟随上游 gitlink）"
+  }
 }
 
 # ---------------- 覆盖层 ----------------
@@ -372,65 +450,630 @@ function Get-NextDeclaredRuntime {
   return $null
 }
 
-function Test-NextRuntimeVersion {
-  # 只校验、不改写：next 的运行时跟随上游（2026-09-29 起上游为 0.2.0-rc.1）。
-  # 旧实现把 next 的 @deepseek-ai/dsh* 依赖串改写成硬钉的 0.1.7-rc.2，与上游根
-  # resolutions 的带版本键（@deepseek-ai/dsh@npm:0.2.0-rc.1 → file:vendor/...）不再
-  # 匹配，install 会绕过 vendored 产物退到 npm 解析，也与按 0.2.0-rc.1 peer 构建的
-  # AA 产物不一致。这里改成三处一致性校验，缺一处只告警（上游可能重构）。
+# ---------------- 运行时版本（-HarnessVersion / -HarnessCommit）----------------
+
+function Get-UpstreamChannelByRuntimeVersion {
+  # 在 upstream.json 里找「声明了这个运行时版本」的通道（stable / beta …）。
+  # 用途：-HarnessVersion 的目标版本若正好是上游某条线，commit 直接取 upstream.json，
+  # 不必去打远端查标签。返回 @{ Name; Commit; Package } 或 $null。
+  param([Parameter(Mandatory)][string]$Version)
+  $upPath = Join-Path $script:Src 'upstream.json'
+  if (-not (Test-Path -LiteralPath $upPath)) { return $null }
+  $up = Get-JsonObject $upPath
+  if (-not ($up.PSObject.Properties.Name -contains 'channels')) { return $null }
+  foreach ($chName in @($up.channels.PSObject.Properties.Name)) {
+    $ch = $up.channels.PSObject.Properties[$chName].Value
+    if (-not $ch) { continue }
+    if ([string]$ch.sourceVersion -ne $Version) { continue }
+    $commit = ''
+    if ($ch.PSObject.Properties.Name -contains 'commit') { $commit = [string]$ch.commit }
+    $pkg = ''
+    if ($ch.PSObject.Properties.Name -contains 'package') { $pkg = [string]$ch.package }
+    return @{ Name = $chName; Commit = $commit; Package = $pkg }
+  }
+  return $null
+}
+
+function Resolve-HarnessCommitFromTag {
+  # 版本 → commit：查 deepseek-harness 的标签 dsh-v<版本>。
+  #   1) 本地子模块优先（离线、无网络开销）；2) 远端 ls-remote 兜底。
+  # 解析不出来返回 $null，由调用方决定报错还是告警。
+  param([Parameter(Mandatory)][string]$Version)
+  $tag = "dsh-v$Version"
+  # 探测期间关掉「原生命令非零退出即终止」：标签不存在 / 远端不可达都是**预期内失败**，
+  # 不关掉的话 git 的非零退出会直接抛成终止性错误，下面的降级逻辑根本没机会跑。
+  $prevNative = $PSNativeCommandUseErrorActionPreference
+  $PSNativeCommandUseErrorActionPreference = $false
+  $prevPrompt = $env:GIT_TERMINAL_PROMPT
+  $env:GIT_TERMINAL_PROMPT = '0'
+  try {
+    $harnessPath = Join-Path $script:Src 'deepseek-harness'
+    if (Test-Path -LiteralPath (Join-Path $harnessPath '.git')) {
+      # ^{commit} 让注释标签也解到 commit；--quiet 让标签缺失时不打噪音到 stderr。
+      $local = @(& git -C $harnessPath rev-parse --verify --quiet "refs/tags/$tag^{commit}" 2>$null)
+      if ($LASTEXITCODE -eq 0 -and $local.Count -gt 0) {
+        $shaLocal = ([string]$local[0]).Trim()
+        if ($shaLocal) { return $shaLocal }
+      }
+    }
+    # 注释标签会同时列出 <标签> 与 <标签>^{} 两行，^{} 指向 commit，优先取它。
+    $remote = @(& git ls-remote --tags $script:HarnessRepository "refs/tags/$tag" "refs/tags/$tag^{}" 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $remote.Count -eq 0) { return $null }
+    $peeled = @($remote | Where-Object { $_ -match '\^\{\}\s*$' })
+    $line = if ($peeled.Count -gt 0) { [string]$peeled[0] } else { [string]$remote[0] }
+    $sha = ($line -split '\s+')[0]
+    if ($sha -match '^[0-9a-fA-F]{7,40}$') { return $sha }
+    return $null
+  } finally {
+    $PSNativeCommandUseErrorActionPreference = $prevNative
+    $env:GIT_TERMINAL_PROMPT = $prevPrompt
+  }
+}
+
+function Resolve-HarnessVersion {
+  # 决定本次构建用的 dsh 运行时版本（源码同步之后、任何依赖安装 / 覆盖层之前调用）。
+  #   -HarnessVersion 未指定 → 跟随上游：next 工作区声明的 @deepseek-ai/dsh 版本，不改写。
+  #   -HarnessVersion 指定   → 固定到该版本。commit 取值优先级：
+  #       1) -HarnessCommit 显式给出（与标签核对，不一致只告警 —— 上游会前移同一版本的 commit）
+  #       2) 该版本正好是 upstream.json 某条通道的 sourceVersion → 用它的 commit
+  #       3) 标签 dsh-v<版本>（Resolve-HarnessCommitFromTag，本地子模块优先、远端兜底）
+  #   显式指定的版本必须已有 vendor\dsh-runtime\<版本>\manifest.json：否则固定出来的是
+  #   「依赖指向不存在的产物」的半成品，install 会以一个很难读的解析错误收场 —— 这里提前拦住。
   $declared = Get-NextDeclaredRuntime
-  if (-not $declared) {
-    Write-WarnLine '未读到 next 工作区的 @deepseek-ai/dsh 声明（上游格式变化？），跳过运行时校验。'
+  $script:DeclaredRuntimeVersion = $declared
+
+  if (-not $script:HarnessOverrideActive) {
+    $script:ResolvedRuntimeVersion = $declared
+    $script:ResolvedHarnessCommit = $null
+    if ($declared) {
+      $ch = Get-UpstreamChannelByRuntimeVersion -Version $declared
+      if ($ch -and $ch.Commit) { $script:ResolvedHarnessCommit = $ch.Commit }
+      $short = if ($script:ResolvedHarnessCommit) { $script:ResolvedHarnessCommit.Substring(0, [Math]::Min(12, $script:ResolvedHarnessCommit.Length)) } else { '(上游未声明 commit)' }
+      Write-Info "dsh 运行时：沿用上游声明 $declared（commit $short）—— 未指定 -HarnessVersion，不改写依赖。"
+    } else {
+      Write-WarnLine '未读到 next 工作区的 @deepseek-ai/dsh 声明（上游格式变化？），跳过运行时版本解析（-HarnessVersion 仍可用）。'
+    }
     return
   }
 
-  # ① vendored 运行时目录
-  $manifest = Join-Path $script:Src "vendor\dsh-runtime\$declared\manifest.json"
-  if (Test-Path -LiteralPath $manifest) {
-    Write-Info "运行时：next 声明 $declared，vendor\dsh-runtime\$declared 已就位"
+  $v = $script:HarnessVersionOverride
+  $manifestPath = Join-Path $script:Src ("vendor\dsh-runtime\$v\manifest.json")
+  if (-not (Test-Path -LiteralPath $manifestPath)) {
+    $vendored = @()
+    $dir = Join-Path $script:Src 'vendor\dsh-runtime'
+    if (Test-Path -LiteralPath $dir) { $vendored = @(Get-ChildItem -LiteralPath $dir -Directory | ForEach-Object { $_.Name }) }
+    throw "运行时版本 $v 的 vendor 产物缺失：$manifestPath（已 vendored 的版本：$($vendored -join '、')）。" +
+      '先运行 yarn upstream:prepare-runtime 生成该版本的 vendor/dsh-runtime，或换一个已 vendored 的版本。'
+  }
+
+  $c = $script:HarnessCommitOverride
+  $explicitCommit = -not [string]::IsNullOrWhiteSpace($script:HarnessCommitOverride)
+  if (-not $c) {
+    $ch = Get-UpstreamChannelByRuntimeVersion -Version $v
+    if ($ch -and $ch.Commit) {
+      $c = $ch.Commit
+      Write-Info "dsh 运行时：-HarnessVersion $v 是 upstream.json 的 $($ch.Name) 通道 → commit 取上游 $($c.Substring(0, [Math]::Min(12, $c.Length)))"
+    }
+  }
+  if (-not $c) {
+    $c = Resolve-HarnessCommitFromTag -Version $v
+    if (-not $c) {
+      throw "-HarnessVersion $v 未能解析出 deepseek-harness commit：upstream.json 没有该版本，标签 dsh-v$v 在本地子模块与远端 $($script:HarnessRepository) 也没查到。" +
+        '请核对版本号拼写，或用 -HarnessCommit <sha> 显式指定。'
+    }
+    Write-Ok "dsh 运行时：-HarnessVersion $v → commit 取自标签 dsh-v$v：$($c.Substring(0, [Math]::Min(12, $c.Length)))"
+  }
+  if ($explicitCommit) {
+    $tagSha = Resolve-HarnessCommitFromTag -Version $v
+    if ($tagSha -and $tagSha -ne $c) {
+      Write-WarnLine "dsh 运行时：-HarnessCommit $($c.Substring(0, [Math]::Min(12, $c.Length))) 与标签 dsh-v$v（$($tagSha.Substring(0, [Math]::Min(12, $tagSha.Length)))）不一致 —— 按参数值为准。"
+    }
+  }
+
+  $script:ResolvedRuntimeVersion = $v
+  $script:ResolvedHarnessCommit = $c
+  if ($declared -and $declared -ne $v) {
+    Write-WarnLine "dsh 运行时：next 工作区原本声明 $declared，本次按参数固定到 $v（依赖与会随之改写）。"
+  }
+  Write-Ok "dsh 运行时已解析：$v @ $($c.Substring(0, [Math]::Min(12, $c.Length)))"
+}
+
+function Get-HarnessLineSiblingWorkspace {
+  # 上游为每条 harness 线各维护一个通道工作区（upstream.json 的 channels.*.package）。
+  # 它的 package.json 就是该线配套依赖的权威版本表 —— 除了 @deepseek-ai/dsh*，还包括
+  # @deepseek-ai/cordis*、@deepseek-ai/schemastery 这类**伴随包**（名字里没有 dsh，同样
+  # 随 harness 线走）。返回 @{ Name = <工作区目录名>; Pkg = <package.json 对象> }；
+  # 找不到（该版本不是上游任何通道的线）返回 $null。
+  param([Parameter(Mandatory)][string]$Version)
+  $upPath = Join-Path $script:Src 'upstream.json'
+  if (-not (Test-Path -LiteralPath $upPath)) { return $null }
+  $up = Get-JsonObject $upPath
+  if (-not ($up.PSObject.Properties.Name -contains 'channels')) { return $null }
+  foreach ($chName in @($up.channels.PSObject.Properties.Name)) {
+    $ch = $up.channels.PSObject.Properties[$chName].Value
+    if (-not $ch) { continue }
+    if ([string]$ch.sourceVersion -ne $Version) { continue }
+    $cand = ''
+    if ($ch.PSObject.Properties.Name -contains 'package') { $cand = [string]$ch.package }
+    if (-not $cand -or $cand -eq $script:WsName) { continue }
+    $candPkgPath = Join-Path $script:Src (Join-Path $cand 'package.json')
+    if (-not (Test-Path -LiteralPath $candPkgPath)) { continue }
+    return @{ Name = $cand; Pkg = (Get-JsonObject $candPkgPath) }
+  }
+  return $null
+}
+
+function Set-HarnessVersionPinned {
+  # 把 next 通道固定到 $script:ResolvedRuntimeVersion。三件事必须同时成立，否则 install 会
+  # 静默绕过 vendored 产物：
+  #   1) next 工作区的 @deepseek-ai/dsh* 依赖 = 目标版本   ← 决定性的一处（devDependencies 才决定安装）
+  #   2) 伴随包（cordis / schemastery …）也随这条线走      ← 否则 Yarn 嵌套安装第二份副本 → TS6200
+  #   3) 根 resolutions 有 "<包>@npm:<目标版本>" → file:vendor/dsh-runtime/<目标版本>/<tgz>
+  # 第 3 步**只加不删**：beta 通道（next 直接 import 它的 src）仍在用旧版本的条目，
+  # 删掉会让 beta 退到 registry 解析 —— 这一点与 stable（只有一个消费方）不同。
+  $v = $script:ResolvedRuntimeVersion
+  if (-not $v) { Write-WarnLine '未解析到运行时版本，跳过固定。'; return }
+  if (-not $script:HarnessOverrideActive) {
+    Write-Info "运行时版本跟随上游：dsh $v（不改写工作区依赖 / 根 resolutions）"
+    return
+  }
+  $manifestPath = Join-Path $script:Src ("vendor\dsh-runtime\$v\manifest.json")
+  if (-not (Test-Path -LiteralPath $manifestPath)) { throw "运行时版本 $v 的 vendor manifest 缺失：$manifestPath" }
+  $manifest = Get-JsonObject $manifestPath
+  $entryByName = @{}
+  foreach ($p in @($manifest.packages)) { $entryByName[[string]$p.name] = [string]$p.filename }
+  if ($entryByName.Count -eq 0) { throw "运行时 manifest 为空：$manifestPath" }
+
+  $declared = $script:DeclaredRuntimeVersion
+  if ($declared -eq $v) {
+    # 目标就是 next 自己声明的版本：依赖无需改写。但仍核对根 resolutions 真的映射到
+    # vendored 产物 —— 缺映射时 install 会退到 npm 解析（构建“成功”但装的不是本仓库产物）。
+    $rootPkgPath = Join-Path $script:Src 'package.json'
+    $rootText = [System.IO.File]::ReadAllText($rootPkgPath)
+    $missing = @($entryByName.Keys | Where-Object { -not $rootText.Contains('"' + $_ + '@npm:' + $v + '"') })
+    if ($missing.Count -gt 0) {
+      Write-WarnLine "运行时固定：$v 与 next 声明一致（依赖无需改），但根 resolutions 缺 $($missing.Count) 条映射（install 可能退到 npm）：$(@($missing)[0]) 等"
+    } else {
+      Write-Ok "运行时固定：$v 与 next 声明的版本一致 —— 依赖与根 resolutions 均无需改写。"
+    }
+    return
+  }
+
+  # 1) 工作区依赖改写（**文本级**：保持上游原有排版，diff 只显示真正变化的行）
+  #    为什么不走 ConvertTo-Json：它会把整份文件重排、并用 CRLF 写回，于是 git diff 变成
+  #    “每行都变”，既掩盖真实改动，也会让后续按行锚定的注入（build 段的 appId / files 数组）
+  #    失配 —— 2026-10-21 实测踩到过一次（buildVersion 注入因为行尾是 \r 而静默跳过）。
+  $pkgPath = Join-Path $script:WsDir 'package.json'
+  $text = [System.IO.File]::ReadAllText($pkgPath)
+  $rewritten = New-Object System.Collections.Generic.List[string]
+  # 只改「版本号形态」的值（[\^~]?\d 开头）：file: / workspace: / link: 之类的引用不动。
+  foreach ($name in @($entryByName.Keys)) {
+    $pattern = '("' + [regex]::Escape($name) + '"\s*:\s*")[\^~]?\d[^"]*(")'
+    $candidate = [regex]::Replace($text, $pattern, "`${1}$v`${2}")
+    if ($candidate -ne $text) {
+      $rewritten.Add($name)
+      $text = $candidate
+    }
+  }
+
+  # 2) 伴随依赖：照抄「与 $v 同线的兄弟通道工作区」里同名包的版本，不动其余依赖。
+  $sibling = Get-HarnessLineSiblingWorkspace -Version $v
+  if ($sibling) {
+    foreach ($field in @('dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies')) {
+      $sibProp = $sibling.Pkg.PSObject.Properties[$field]
+      if (-not $sibProp -or $null -eq $sibProp.Value) { continue }
+      foreach ($name in @($sibProp.Value.PSObject.Properties.Name)) {
+        if (-not $name.StartsWith('@deepseek-ai/')) { continue }
+        if ($name -eq '@deepseek-ai/dsh' -or $name.StartsWith('@deepseek-ai/dsh-')) { continue }  # 已由 1) 处理
+        $sibVal = $sibProp.Value.$name
+        if ($sibVal -isnot [string] -or -not $sibVal) { continue }
+        $pattern = '("' + [regex]::Escape($name) + '"\s*:\s*")[^"]*(")'
+        $candidate = [regex]::Replace($text, $pattern, "`${1}$sibVal`${2}")
+        if ($candidate -ne $text) {
+          Write-WarnLine "伴随依赖迁移（$($sibling.Name) 线）：$name → $sibVal"
+          $rewritten.Add($name)
+          $text = $candidate
+        }
+      }
+    }
   } else {
-    Write-WarnLine "运行时：vendor\dsh-runtime\$declared\manifest.json 缺失（install 会退到 npm 解析）"
+    # 没有同线兄弟工作区 = 上游只声明了别的线的通道（upstream.json 只有 stable / beta）。
+    # 伴随包的版本这时无处可抄，只能保持原样 —— 明确点名，别让人以为“固定成功”了。
+    $companions = @()
+    $before = [System.IO.File]::ReadAllText($pkgPath) | ConvertFrom-Json
+    foreach ($field in @('dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies')) {
+      $prop = $before.PSObject.Properties[$field]
+      if (-not $prop -or $null -eq $prop.Value) { continue }
+      foreach ($name in @($prop.Value.PSObject.Properties.Name)) {
+        if (-not $name.StartsWith('@deepseek-ai/')) { continue }
+        if ($name -eq '@deepseek-ai/dsh' -or $name.StartsWith('@deepseek-ai/dsh-')) { continue }
+        $companions += "$name=$($prop.Value.$name)"
+      }
+    }
+    Write-WarnLine "运行时固定：upstream.json 里没有与 $v 同线的其他通道工作区 → 伴随依赖无法抄版本，保持原样：" +
+      "$($companions -join '、')（若这些版本不属于 $v 那条线，Yarn 会嵌套安装第二份副本，类型门禁可能以 TS6200 失败）"
+  }
+
+  if ($rewritten.Count -gt 0) {
+    [System.IO.File]::WriteAllText($pkgPath, $text)
+    Write-WarnLine "运行时版本固定：$($script:WsName)\package.json 的 $($rewritten.Count) 个 @deepseek-ai/* 依赖 → $v"
+  }
+
+  # 2b) 目标版本的 manifest 里没有的同名包会**保持原版本**。跨线固定时这很致命（install 会
+  #     去 registry 拉那个包，或干脆解析失败），所以明确列出来，而不是让人事后猜。
+  $leftover = @()
+  try {
+    $after = [System.IO.File]::ReadAllText($pkgPath) | ConvertFrom-Json
+    foreach ($field in @('dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies')) {
+      $prop = $after.PSObject.Properties[$field]
+      if (-not $prop -or $null -eq $prop.Value) { continue }
+      foreach ($name in @($prop.Value.PSObject.Properties.Name)) {
+        $isDsh = ($name -eq '@deepseek-ai/dsh') -or $name.StartsWith('@deepseek-ai/dsh-')
+        if ($isDsh -and -not $entryByName.ContainsKey($name)) { $leftover += "$name=$($prop.Value.$name)" }
+      }
+    }
+  } catch {
+    throw "改写后的 $pkgPath 不是合法 JSON：$($_.Exception.Message)"
+  }
+  if ($leftover.Count -gt 0) {
+    Write-WarnLine "运行时固定：next 声明的 $($leftover.Count) 个 @deepseek-ai/dsh* 包在 $v 的 manifest 里不存在，保持原版本：$($leftover -join '、')"
+    Write-WarnLine '        ⇒ 跨线固定时这些包会去 registry 解析（或直接解析失败）。若要用这条线，先确认上游在同线上确实有这些包。'
+  }
+
+  # 3) 根 resolutions：为该版本补 @npm:<v> / @npm:^<v> 两条。**只加不删**：beta 通道
+  #    （next 直接 import 它的 src）仍在用旧版本的条目，删掉会让 beta 退到 registry 解析 ——
+  #    这一点与 stable（只有一个消费方）不同。文本插入而非 JSON 重写，理由同 1)。
+  $rootPkgPath = Join-Path $script:Src 'package.json'
+  $rootText = [System.IO.File]::ReadAllText($rootPkgPath)
+  $vendorRelative = "vendor/dsh-runtime/$v"
+  $anchor = [regex]::Match($rootText, '(?m)^(?<ind>[ \t]*)"@deepseek-ai/dsh[^"]*@npm:[^"]+"\s*:')
+  if (-not $anchor.Success) {
+    throw "未在根 package.json 的 resolutions 中找到 @deepseek-ai/dsh 映射行（上游格式变化？），无法为 $v 补 resolutions：$rootPkgPath"
+  }
+  $nl = if ($rootText.Contains("`r`n")) { "`r`n" } else { "`n" }
+  $ind = $anchor.Groups['ind'].Value
+  $insert = New-Object System.Text.StringBuilder
+  $added = 0; $present = 0; $patched = 0
+  foreach ($name in @($entryByName.Keys | Sort-Object)) {
+    $file = $entryByName[$name]
+    $unscoped = $name.Substring('@deepseek-ai/'.Length)
+    $patchRel = "patches/$unscoped@$v.patch"
+    $patchPath = Join-Path $script:Src ($patchRel -replace '/', [IO.Path]::DirectorySeparatorChar)
+    $fileSpec = "file:$vendorRelative/$file"
+    $val = if (Test-Path -LiteralPath $patchPath) {
+      $patched++
+      "patch:$name@$($fileSpec -replace ':', '%3A')#./$patchRel"
+    } else { $fileSpec }
+    foreach ($sel in @("$name@npm:$v", "$name@npm:^$v")) {
+      if ($rootText.Contains('"' + $sel + '"')) { $present++; continue }
+      [void]$insert.Append("$ind`"$sel`": `"$val`",$nl")
+      $added++
+    }
+  }
+  if ($added -gt 0) {
+    $rootText = $rootText.Insert($anchor.Index, $insert.ToString())
+    [System.IO.File]::WriteAllText($rootPkgPath, $rootText)
+    try { $null = [System.IO.File]::ReadAllText($rootPkgPath) | ConvertFrom-Json }
+    catch { throw "改写后的根 package.json 不是合法 JSON：$($_.Exception.Message)" }
+  }
+  Write-Ok "运行时版本已固定：dsh $v（$($entryByName.Count) 个包；resolutions 新增 $added 条、已存在 $present 条，其中 $patched 个包带版本补丁）"
+}
+
+function Test-NextRuntimeVersion {
+  # 三处一致性校验（只读）：① vendor 产物 ② 根 resolutions 映射 ③ 与 upstream.json 通道声明对照。
+  # -HarnessVersion 生效时校验的是**目标版本**，且跳过 ③（那一步只在“跟随上游”时才有意义）。
+  $v = $script:ResolvedRuntimeVersion
+  if (-not $v) { $v = Get-NextDeclaredRuntime }
+  if (-not $v) {
+    Write-WarnLine '未读到运行时版本（上游格式变化？），跳过运行时校验。'
+    return
+  }
+  $source = if ($script:HarnessOverrideActive) { '-HarnessVersion 指定' } else { 'next 工作区声明' }
+
+  # ① vendored 运行时目录
+  $manifest = Join-Path $script:Src ("vendor\dsh-runtime\$v\manifest.json")
+  if (Test-Path -LiteralPath $manifest) {
+    Write-Info "运行时：$source $v，vendor\dsh-runtime\$v 已就位"
+  } else {
+    Write-WarnLine "运行时：vendor\dsh-runtime\$v\manifest.json 缺失（install 会退到 npm 解析）"
   }
 
   # ② 根 resolutions 是否把该版本映射到 vendored 产物
   $rootPkgPath = Join-Path $script:Src 'package.json'
   if (Test-Path -LiteralPath $rootPkgPath) {
     $rootText = Get-Content -LiteralPath $rootPkgPath -Raw -Encoding utf8
-    $key = '"@deepseek-ai/dsh@npm:' + $declared + '"'
+    $key = '"@deepseek-ai/dsh@npm:' + $v + '"'
     if ($rootText.Contains($key)) {
-      Write-Info "运行时：根 resolutions 已把 @deepseek-ai/dsh@npm:$declared 指向 vendored 产物"
+      Write-Info "运行时：根 resolutions 已把 @deepseek-ai/dsh@npm:$v 指向 vendored 产物"
     } else {
-      Write-WarnLine "运行时：根 resolutions 没有 @deepseek-ai/dsh@npm:$declared 的映射（install 可能走 npm）"
+      Write-WarnLine "运行时：根 resolutions 没有 @deepseek-ai/dsh@npm:$v 的映射（install 可能走 npm）"
     }
   }
 
-  # ③ 与 upstream.json 的通道声明对照（只为发现上游自身不一致）
-  $upPath = Join-Path $script:Src 'upstream.json'
-  if (Test-Path -LiteralPath $upPath) {
-    $up = Get-JsonObject $upPath
-    if ($up.channels.PSObject.Properties.Name -notcontains 'next') {
-      Write-Info '运行时：upstream.json 无 next 通道条目（上游未把 next 纳入通道表），以工作区声明为准'
-    }
-    $betaVer = $null
-    if ($up.channels.beta) { $betaVer = $up.channels.beta.sourceVersion }
-    if ($betaVer -and $betaVer -ne $declared) {
-      Write-WarnLine "运行时：next 声明 $declared，而 upstream.json 的 beta 通道是 $betaVer（上游 desktop 家族版本不一致，请确认是否预期）"
+  # ③ 与 upstream.json 的通道声明对照（只为发现上游自身不一致；固定版本时不适用）
+  if (-not $script:HarnessOverrideActive) {
+    $upPath = Join-Path $script:Src 'upstream.json'
+    if (Test-Path -LiteralPath $upPath) {
+      $up = Get-JsonObject $upPath
+      if ($up.channels.PSObject.Properties.Name -notcontains 'next') {
+        Write-Info '运行时：upstream.json 无 next 通道条目（上游未把 next 纳入通道表），以工作区声明为准'
+      }
+      $betaVer = $null
+      if ($up.channels.beta) { $betaVer = $up.channels.beta.sourceVersion }
+      if ($betaVer -and $betaVer -ne $v) {
+        Write-WarnLine "运行时：next 声明 $v，而 upstream.json 的 beta 通道是 $betaVer（上游 desktop 家族版本不一致，请确认是否预期）"
+      }
     }
   }
 
-  Write-Ok "运行时已按上游确定：$declared（本脚本不改写依赖版本）"
+  Write-Ok "运行时已确定：dsh $v（$source）"
 }
 
+# ---------------- 覆盖参数：electron / pnpm 版本 ----------------
+
 function Set-ElectronOverride {
-  if (-not $ElectronVersion) { Write-Info '未指定 -ElectronVersion，沿用上游声明。'; return }
+  # next 工作区 devDependencies.electron → $script:ElectronOverride。
+  # **未指定 -ElectronVersion 时完全不改写**（构建上游原样）；上游声明已与目标一致时同样跳过。
   $pkgPath = Join-Path $script:WsDir 'package.json'
   $text = [System.IO.File]::ReadAllText($pkgPath)
-  if ($text -notmatch '("electron"\s*:\s*")([^"]+)(")') { Write-WarnLine '未找到 electron 依赖声明，跳过覆盖。'; return }
+  if ($text -notmatch '("electron"\s*:\s*")([^"]+)(")') {
+    Write-WarnLine '覆盖层：next\package.json 中未找到 electron 声明，跳过版本覆盖。'
+    return
+  }
   $current = $Matches[2]
-  if ($current -eq $ElectronVersion) { Write-Info "electron 已是 $ElectronVersion"; return }
-  $fixed = [regex]::Replace($text, '("electron"\s*:\s*")[^"]+(")', "`${1}$ElectronVersion`${2}", 1)
+  if (-not $script:ElectronOverrideActive) {
+    Write-Info "electron 使用上游声明版本（$current）：未指定 -ElectronVersion，跳过版本覆盖。"
+    return
+  }
+  if ($current -eq $script:ElectronOverride) {
+    Write-Info "electron 上游声明已与覆盖目标一致（$current），跳过版本覆盖。"
+    return
+  }
+  # 注意：这里**不传**[regex]::Replace 的第 4 个参数。看着像“只替换第一处（count=1）”的那个
+  # 位置实际是 RegexOptions（传 1 = IgnoreCase）—— 旧写法会连同 peerDependencies 一起改写
+  # （恰好是需要的：devDependencies 才决定实际安装的版本）。显式写成“替换全部”。
+  $fixed = [regex]::Replace($text, '("electron"\s*:\s*")([^"]+)(")', "`${1}$($script:ElectronOverride)`${3}")
   [System.IO.File]::WriteAllText($pkgPath, $fixed)
-  Write-WarnLine "覆盖层：electron $current → $ElectronVersion"
+  Write-WarnLine "覆盖层：next electron $current → $($script:ElectronOverride)"
+}
+
+function Set-PnpmOverride {
+  # next 工作区 dependencies.pnpm → $script:PnpmOverride，并把根 resolutions 的 pnpm 补丁条目
+  # 补到同一版本。**未指定 -PnpmVersion 时完全不改写**；上游声明已一致时同样跳过。
+  # 指定了不同版本时，下面三件事必须同时成立，否则 age-gate 修复会**静默**消失：
+  #   1) 依赖版本 = 目标版本                                    ← 第 1 段
+  #   2) <src>\patches\pnpm@<目标>.patch 存在（从 overlay\pnpm\ 拷入）  ← 第 2 段
+  #   3) 根 resolutions 里有 "pnpm@npm:<目标>": "patch:…" 条目            ← 第 3 段
+  # 为什么 2) 3) 不能省：resolution 键是**版本化**的（"pnpm@npm:11.8.0"）。把依赖换成别的版本后，
+  # 原键不再匹配任何依赖 → Yarn 不再打补丁，**而且不报错** —— node_modules 里就是未打补丁的
+  # 原版，Desktop 的 --config.minimumReleaseAge=0 缺陷随之复现（pnpm 11 把字符串 "0" 按 truthy
+  # 处理）。这属于「构建成功但定制没生效」，必须避免。
+  $pkgPath = Join-Path $script:WsDir 'package.json'
+  $text = [System.IO.File]::ReadAllText($pkgPath)
+  # 只匹配键恰为 "pnpm" 的条目：exports 里的 "./pnpm"（引号前是斜杠）不会命中。
+  $pattern = '("pnpm"\s*:\s*")([^"]+)(")'
+  if ($text -notmatch $pattern) {
+    Write-WarnLine '覆盖层：next\package.json 中未找到 pnpm 依赖声明，跳过版本覆盖。'
+    return
+  }
+  $current = $Matches[2]
+  if (-not $script:PnpmOverrideActive) {
+    Write-Info "pnpm 使用上游声明版本（$current）：未指定 -PnpmVersion，跳过版本覆盖。"
+    return
+  }
+  if ($current -eq $script:PnpmOverride) {
+    Write-Info "pnpm 上游声明已与覆盖目标一致（$current），跳过版本覆盖。"
+    return
+  }
+  $fixed = [regex]::Replace($text, $pattern, "`${1}$($script:PnpmOverride)`${3}")
+  [System.IO.File]::WriteAllText($pkgPath, $fixed)
+  Write-WarnLine "覆盖层：next pnpm $current → $($script:PnpmOverride)"
+
+  # --- 第 2 段：把该版本的策展补丁落到 <src>\patches\ ---
+  $patchName = "pnpm@$($script:PnpmOverride).patch"
+  $srcPatch = Join-Path $script:PnpmPatchSourceDir $patchName
+  if (-not (Test-Path -LiteralPath $srcPatch)) {
+    Write-WarnLine "覆盖层：缺少 $srcPatch —— 无法为 pnpm $($script:PnpmOverride) 重指 age-gate 补丁。"
+    Write-WarnLine "        ⇒ 该版本的 pnpm 将以**未打补丁的原版**打包（最小发布年龄缺陷可能复现）。"
+    Write-WarnLine '        ⇒ 补丁生成方法见 BUILD_GUIDE.md「pnpm 版本覆盖」：对该版本的 dist/pnpm.mjs 重新 diff。'
+    return
+  }
+  $dstPatch = Join-Path $script:Src "patches\$patchName"
+  Copy-Item -LiteralPath $srcPatch -Destination $dstPatch -Force
+  Write-Info "覆盖层：pnpm 补丁已就位 patches\$patchName"
+
+  # --- 第 3 段：补 resolutions 条目（已存在则不动；保留旧版本的条目） ---
+  $rootPkg = Join-Path $script:Src 'package.json'
+  $rootText = Get-Content -LiteralPath $rootPkg -Raw -Encoding utf8
+  if ($rootText -notmatch [regex]::Escape('"pnpm@npm:' + $script:PnpmOverride + '":')) {
+    $anchor = [regex]::Match($rootText, '(?<nl>\r?\n)(?<ind>[ \t]*)("pnpm@npm:[^"]+":\s*"patch:pnpm@npm%3A[^"]+#\./patches/pnpm@[^"]+\.patch",)')
+    if (-not $anchor.Success) {
+      throw "未在根 package.json 的 resolutions 中找到 pnpm 补丁条目，无法为 $($script:PnpmOverride) 补上 resolution。请检查上游是否改写了该条目。"
+    }
+    $insert = $anchor.Groups['nl'].Value + $anchor.Groups['ind'].Value +
+      '"pnpm@npm:' + $script:PnpmOverride + '": "patch:pnpm@npm%3A' + $script:PnpmOverride +
+      '#./patches/' + $patchName + '",'
+    $rootText = $rootText.Insert($anchor.Index + $anchor.Length, $insert)
+    Set-Content -LiteralPath $rootPkg -Value $rootText -Encoding utf8 -NoNewline
+    Write-WarnLine "覆盖层：根 resolutions 已补上 pnpm@npm:$($script:PnpmOverride) 的补丁条目（旧的保留）"
+  } else {
+    Write-Info "根 resolutions 已存在 pnpm@npm:$($script:PnpmOverride) 的补丁条目，保持不动。"
+  }
+}
+
+# ---------------- Windows 版本资源（ProductVersion / FileVersion）----------------
+
+function Get-WindowsVersionQuad {
+  # semver → Windows 四段数字版本（x.y.z.0）。electron-builder 的
+  # AppInfo.getVersionInWeirdWindowsForm() 就是这么算的（缺省段补 0，buildNumber 取配置文件里的
+  # 或 0），这里复刻同一规则，好让注入值与 electron-builder 自己算出来的 ProductVersion 一致。
+  param([Parameter(Mandatory)][string]$Version)
+  $m = [regex]::Match($Version, '^(\d+)\.(\d+)\.(\d+)')
+  if (-not $m.Success) { return $null }
+  return "$($m.Groups[1].Value).$($m.Groups[2].Value).$($m.Groups[3].Value).0"
+}
+
+function Set-WindowsVersionInfo {
+  # exe 的版本资源由 electron-builder 的 winPackager.signAndEditResources() 写入：
+  #   fileVersion    = appInfo.shortVersion || appInfo.buildVersion
+  #   productVersion = appInfo.shortVersionWindows || appInfo.getVersionInWeirdWindowsForm()
+  # 本仓库的版本是**带预发布的 semver**（"2.0.19-next"）：
+  #   · productVersion 走 getVersionInWeirdWindowsForm → "2.0.19.0"（正确）
+  #   · fileVersion 却没有 shortVersion/buildVersion 可用 → 直接把 "2.0.19-next" 塞给
+  #     resedit.setFileVersion()：字符串值变成 "2.0.19-next"，而**数字段（VS_FIXEDFILEINFO）
+  #     退化成 2.0.0.0** —— 任务管理器 / FileVersionRaw / 部分安装器读的就是这个数字段。
+  # 实测（X:\App\DSH-Next\DSH NEXT.exe）：
+  #   FileVersion="2.0.19-next"  FileVersionRaw=2.0.0.0  ProductVersion="2.0.19.0"
+  # 修法：给 build 段注入 buildVersion = <major>.<minor>.<patch>.0（electron-builder 的
+  # 公开配置项，appInfo.buildVersion 优先于 version）。注入后两个字段都是 2.0.19.0，
+  # 数字段与字符串值一致。
+  # 为什么写在 build 段而不是 package.json 顶层 shortVersion：payload 的 package.json 是
+  # 工作区那份的逐字拷贝（scripts/prepare-payload.ts 第 230 行），两处都能到 appInfo —— 但
+  # build 段是 electron-builder 自己的配置，不受“manifest 转换”影响，且与 Set-PayloadExclusions
+  # / Set-ElectronOverride 注入的是同一个文件、同一种机制，好定位。
+  $pkgPath = Join-Path $script:WsDir 'package.json'
+  $text = [System.IO.File]::ReadAllText($pkgPath)
+  $vm = [regex]::Match($text, '(?m)^\s*"version"\s*:\s*"([^"]+)"')
+  if (-not $vm.Success) { Write-WarnLine '版本信息：未找到 package.json 的 version 字段，跳过（exe 版本资源将沿用上游形态）。'; return }
+  $semver = $vm.Groups[1].Value
+  $quad = Get-WindowsVersionQuad -Version $semver
+  if (-not $quad) {
+    Write-WarnLine "版本信息：version '$semver' 不是 x.y.z 形态，跳过注入（exe 版本资源将沿用上游形态）。"
+    return
+  }
+
+  $existing = [regex]::Match($text, '(?m)^(?<ind>[ \t]*)"buildVersion"\s*:\s*"(?<val>[^"]*)"')
+  if ($existing.Success) {
+    if ($existing.Groups['val'].Value -eq $quad) {
+      Write-Info "版本信息：build.buildVersion 已是 $quad（与 version $semver 对齐）"
+      return
+    }
+    $old = $existing.Groups['val'].Value
+    $text = $text.Remove($existing.Groups['val'].Index, $existing.Groups['val'].Length).Insert($existing.Groups['val'].Index, $quad)
+    [System.IO.File]::WriteAllText($pkgPath, $text)
+    Write-WarnLine "版本信息：build.buildVersion $old → $quad"
+    return
+  }
+
+  # 插到 build 段的 "appId" 行之后（该行在 next\package.json 里唯一且必在 build 段内）。
+  # 行尾用 [ \t]*\r?$ 而不是 [ \t]*$：...\r 存在时 $ 只匹配到 \n 之前，普通 $ 会漏掉这一行。
+  $anchor = [regex]::Match($text, '(?m)^(?<ind>[ \t]*)"appId"\s*:\s*"[^"]*",[ \t]*\r?$')
+  if (-not $anchor.Success) {
+    Write-WarnLine '版本信息：build 段没有 appId 可作锚点（上游格式变化？），跳过注入。'
+    return
+  }
+  $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+  $ind = $anchor.Groups['ind'].Value
+  $insertAt = $anchor.Index + $anchor.Length
+  $text = $text.Insert($insertAt, "$nl$ind`"buildVersion`": `"$quad`",")
+  [System.IO.File]::WriteAllText($pkgPath, $text)
+  Write-WarnLine "版本信息：build.buildVersion = $quad（由 version $semver 推出；让 exe 的 ProductVersion/FileVersion 都是 $quad）"
+}
+
+# ---------------- 安装后核对（覆盖参数最容易“成功但没换版本”）----------------
+
+function Test-InstalledElectron {
+  # next 工作区（找不到再看仓库根，Yarn 可能提升）里已安装的 electron 版本
+  foreach ($p in @((Join-Path $script:WsDir 'node_modules\electron\package.json'),
+                   (Join-Path $script:Src 'node_modules\electron\package.json'))) {
+    if (Test-Path -LiteralPath $p) { return (Get-JsonObject $p).version }
+  }
+  return $null
+}
+
+function Test-InstalledPnpm {
+  foreach ($p in @((Join-Path $script:WsDir 'node_modules\pnpm\package.json'),
+                   (Join-Path $script:Src 'node_modules\pnpm\package.json'))) {
+    if (Test-Path -LiteralPath $p) { return (Get-JsonObject $p).version }
+  }
+  return $null
+}
+
+function Test-ElectronAddonSupport {
+  # dsh 宿主用 node-addon-require-builtin 在 Electron 里 require Node 内置模块，而这个 addon 是
+  # **按 V8 指纹**白名单放行的预编译二进制：表里没有的 Electron 版本，打包后的 Host 一启动就抛
+  #   node-addon-require-builtin unsupported: Unsupported/no-context
+  #   (unsupported Electron runtime fingerprint: Node 24.22.0, V8 15.2.124.43-electron.0
+  #    (supported Electron versions: 43.0.0, 44.0.0, 44.7.0, 45.0.0-alpha.6))
+  # 2026-10-21 实测：-ElectronVersion 44.9.2 就是这样在 afterAllArtifactBuild 的 Host 冒烟里失败的 ——
+  # 编译、打包、afterPack 全部通过，只有最后那条最强验收能看出来。所以这里提前判定：
+  # 白名单是从 addon 二进制里读出来的（版本号以明文串排列），读不到就只告警不拦。
+  if (-not $script:ElectronOverrideActive) { return }
+  $archTag = if ("$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)".ToUpperInvariant() -like '*ARM64*') { 'arm64' } else { 'x64' }
+  $dir = Join-Path $script:WsDir "node_modules\node-addon-require-builtin-win32-$archTag-msvc\prebuilt"
+  if (-not (Test-Path -LiteralPath $dir)) {
+    Write-Info "electron 支持表：未找到 node-addon-require-builtin（win32-$archTag-msvc），跳过指纹核对。"
+    return
+  }
+  $bin = Get-ChildItem -LiteralPath $dir -Filter '*.node' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $bin) { Write-Info 'electron 支持表：prebuilt 目录下没有 .node，跳过指纹核对。'; return }
+  $bytes = [System.IO.File]::ReadAllBytes($bin.FullName)
+  $text = [System.Text.Encoding]::Latin1.GetString($bytes)
+  $versions = @([regex]::Matches($text, '(?<![\d.])([45][0-9]\.\d+\.\d+(?:-alpha\.\d+)?)(?![\d.])') |
+    ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+  if ($versions.Count -lt 2) {
+    Write-WarnLine "electron 支持表：从 $($bin.Name) 里只读到 $($versions.Count) 个版本号，跳过指纹核对（避免误拦）。"
+    return
+  }
+  # ⚠️ 变量名必须避开 $Target：PowerShell 不区分大小写，$target 与脚本参数 $Target 是同一个
+  # 变量 —— 2026-10-21 实测踩到：写了 $target = <electron 版本>，把 $Target（package-dir）
+  # 覆盖成版本号，导致下面的 throw 分支永远不成立，守卫只告警不拦。
+  $electronTarget = $script:ElectronOverride
+  if ($versions -contains $electronTarget) {
+    Write-Ok "electron $electronTarget 在 dsh 原生 addon 的支持表里（$($versions -join '、')）"
+    return
+  }
+  # 建议值取「支持表里最高的稳定版」——按字符串排序会把 45.0.0-alpha.6 排到最后，误导人去用 alpha。
+  $stableSupported = @($versions | Where-Object { $_ -notmatch '-' } |
+      Sort-Object -Property @{ Expression = { [version]$_ } } -Descending)
+  $hint = if ($stableSupported.Count -gt 0) { "（推荐 -ElectronVersion $($stableSupported[0])）" } else { '' }
+  $message = "electron $electronTarget 不在 dsh 原生 addon（node-addon-require-builtin）的支持表里：$($versions -join '、')$hint。" +
+    '这种组合编译 / 打包都会“成功”，但打包后的 Host 一启动就抛 "node-addon-require-builtin unsupported: Unsupported/no-context"' +
+    '（afterAllArtifactBuild 的 Host 冒烟会失败）。'
+  if ($Target -eq 'package-dir') { throw $message }
+  Write-WarnLine $message
+}
+
+function Test-InstalledOverrides {
+  # 覆盖参数最典型的失败形态是「构建成功但版本没换」：install 没跑、锁文件没变、或者
+  # pnpm 的版本化 resolution 没重指（补丁静默失效）。装完立刻核对，把它变成显式失败，
+  # 而不是等到用户看见 exe 里还是旧版本才发现。
+  $problems = New-Object System.Collections.Generic.List[string]
+  if ($script:ElectronOverrideActive) {
+    $got = Test-InstalledElectron
+    if ($got -eq $script:ElectronOverride) {
+      Write-Ok "已安装 electron $got（= -ElectronVersion 目标）"
+    } else {
+      $problems.Add("electron 已安装 '$got' ≠ 目标 '$($script:ElectronOverride)'")
+    }
+  }
+  if ($script:PnpmOverrideActive) {
+    $got = Test-InstalledPnpm
+    if ($got -ne $script:PnpmOverride) {
+      $problems.Add("pnpm 已安装 '$got' ≠ 目标 '$($script:PnpmOverride)'")
+    } else {
+      Write-Ok "已安装 pnpm $got（= -PnpmVersion 目标）"
+      # 补丁是否真的打上了：resolution 是版本化键，写错就静默退回原版。
+      $specs = @(
+        (Join-Path $script:WsDir 'node_modules\pnpm\dist\pnpm.mjs'),
+        (Join-Path $script:Src 'node_modules\pnpm\dist\pnpm.mjs')
+      )
+      $mjs = $specs | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+      if ($mjs) {
+        if ([System.IO.File]::ReadAllText($mjs).Contains('Number.isFinite(minimumReleaseAge)')) {
+          Write-Ok 'pnpm age-gate 补丁已生效（dist/pnpm.mjs 含 Number.isFinite(minimumReleaseAge)）'
+        } else {
+          $problems.Add("pnpm $got 的 dist/pnpm.mjs 里没有 age-gate 补丁标记（根 resolutions 是否重指了该版本？）")
+        }
+      } else {
+        Write-WarnLine '未找到 node_modules/pnpm/dist/pnpm.mjs（pnpm 12+ 是原生二进制），无法核对补丁标记。'
+      }
+    }
+  }
+  if ($problems.Count -gt 0) {
+    foreach ($p in $problems) { Write-WarnLine "版本核对：$p" }
+    throw "覆盖参数未生效：$($problems -join '；')。请检查 yarn install 的输出与根 resolutions。"
+  }
 }
 
 function Test-PackagingPosture {
@@ -820,6 +1463,30 @@ function Assert-OverlayArtifacts {
     $missing.Add('主程序 exe')
   }
 
+  # 1b) exe 版本资源：ProductVersion / FileVersion 必须都是 <version 前三段>.0
+  #     这一条是 Assert 级的：只写在构建日志里没人看，装到用户机器上才发现「版本显示不对」。
+  if ($exe.Count -gt 0) {
+    $expected = $null
+    $wsPkgPath = Join-Path $script:WsDir 'package.json'
+    if (Test-Path -LiteralPath $wsPkgPath) {
+      $wsVer = (Get-JsonObject $wsPkgPath).version
+      if ($wsVer) { $expected = Get-WindowsVersionQuad -Version $wsVer }
+    }
+    $vi = $exe[0].VersionInfo
+    $fileRaw = [string]$vi.FileVersionRaw
+    $productRaw = [string]$vi.ProductVersionRaw
+    $fileName = [string]$vi.FileVersion
+    $productName = [string]$vi.ProductVersion
+    if (-not $expected) {
+      $rows.Add([pscustomobject]@{ 项目 = '版本资源'; 结果 = '跳过'; 说明 = '未能从 package.json 推出四段版本' })
+    } elseif ($fileRaw -eq $expected -and $productRaw -eq $expected -and $fileName -eq $expected -and $productName -eq $expected) {
+      $rows.Add([pscustomobject]@{ 项目 = '版本资源'; 结果 = 'OK'; 说明 = "FileVersion/ProductVersion = $expected（数字段与字符串值一致）" })
+    } else {
+      $rows.Add([pscustomobject]@{ 项目 = '版本资源'; 结果 = '不符'; 说明 = "期望 $expected；实际 FileVersion=$fileName($fileRaw) ProductVersion=$productName($productRaw)" })
+      $missing.Add("exe 版本资源（期望 $expected）")
+    }
+  }
+
   # 2) startup.json（exe 同级）
   $cfg = Join-Path $exeDir 'startup.json'
   if (Test-Path -LiteralPath $cfg) {
@@ -910,6 +1577,9 @@ function Update-PackagedTimestamps {  $exeDir = Get-PackagedDir
 try {
   $bannerRuntime = Get-NextDeclaredRuntime
   if (-not $bannerRuntime) { $bannerRuntime = '(跟随上游，待校验)' }
+  $bannerHarness = if ($script:HarnessOverrideActive) { "$($script:HarnessVersionOverride)（-HarnessVersion 指定）" } else { "$bannerRuntime（跟随上游）" }
+  $bannerElectron = if ($script:ElectronOverrideActive) { "$($script:ElectronOverride)（-ElectronVersion 指定）" } else { 'upstream' }
+  $bannerPnpm = if ($script:PnpmOverrideActive) { "$($script:PnpmOverride)（-PnpmVersion 指定）" } else { 'upstream' }
   $banner = @"
 DSH NEXT build log
 started : $(Get-Date -Format o)
@@ -917,7 +1587,10 @@ root    : $script:Root
 src     : $script:Src
 workspace: $script:WsName
 target  : $Target
-runtime : $bannerRuntime（跟随上游）
+runtime : $bannerHarness
+electron: $bannerElectron
+pnpm    : $bannerPnpm
+preview : $($Preview.IsPresent)
 "@
   Write-Log $banner
   Write-Host $banner -ForegroundColor DarkGray
@@ -955,22 +1628,67 @@ runtime : $bannerRuntime（跟随上游）
   Invoke-Step '获取 / 更新 dsh-desktop 源码' {
     if ($SkipPull) { Write-WarnLine '已跳过源码拉取（-SkipPull）。' } else { Update-SourceRepository }
   }
+  Invoke-Step '解析 dsh 运行时版本（-HarnessVersion / 上游声明）' { Resolve-HarnessVersion }
+  Invoke-Step "固定运行时版本（dsh $($script:ResolvedRuntimeVersion)）" { Set-HarnessVersionPinned }
   Invoke-Step '对齐 deepseek-harness 子模块' { Ensure-Submodule }
-  Invoke-Step '选择工作区（加入 next / 排除 stable+beta）' { Set-WorkspaceSelection }
+  Invoke-Step '选择工作区（加入 next / 排除 stable）' { Set-WorkspaceSelection }
   Invoke-Step '应用 next 覆盖层（代码补丁）' { Apply-Overlay }
-  Invoke-Step '校验运行时版本与打包姿态' {
+  Invoke-Step '校验运行时版本与打包姿态（含 electron / pnpm / 版本资源注入）' {
     Test-NextRuntimeVersion
     Set-ElectronOverride
+    Set-PnpmOverride
+    Set-WindowsVersionInfo
     Test-PackagingPosture
     Set-PayloadExclusions
     Set-MarketWorkspaceCheck
     Set-AAWorkspaceCheck
   }
 
+  if ($Preview) {
+    # 预演：把上面那一步「实际改了什么」摊开给人看，然后退出。
+    # 加这个开关的原因很实际：三个版本参数改的是 dsh-desktop 工作区里的已跟踪文件，跑一次
+    # 完整构建要 6 分钟以上，而「参数写错」通常看一眼 diff 就能发现。
+    Write-Host ''
+    Write-Host 'git diff --stat（dsh-desktop 工作区）：' -ForegroundColor White
+    $stat = @(& git -C $script:Src --no-pager diff --stat 2>&1)
+    foreach ($line in $stat) { Write-Host "  $line"; Write-Log "[preview] $line" }
+    $wsPkg = Get-JsonObject (Join-Path $script:WsDir 'package.json')
+    Write-Host ''
+    Write-Host '关键注入值（next 工作区 package.json）：' -ForegroundColor White
+    $rows = [ordered]@{
+      'version'                 = [string]$wsPkg.version
+      'build.buildVersion'      = [string]$wsPkg.build.buildVersion
+      'devDependencies.electron'= [string]$wsPkg.devDependencies.electron
+      'dependencies.pnpm'       = [string]$wsPkg.dependencies.pnpm
+      '@deepseek-ai/dsh'        = [string]$wsPkg.dependencies.'@deepseek-ai/dsh'
+      '@deepseek-ai/cordis'     = [string]$wsPkg.dependencies.'@deepseek-ai/cordis'
+      '@deepseek-ai/schemastery'= [string]$wsPkg.dependencies.'@deepseek-ai/schemastery'
+      'dsh 运行时（解析结果）'   = [string]$script:ResolvedRuntimeVersion
+      'harness commit'          = [string]$script:ResolvedHarnessCommit
+    }
+    foreach ($k in $rows.Keys) {
+      $v = $rows[$k]
+      if ([string]::IsNullOrEmpty($v)) { $v = '(未注入 / 上游未声明)' }
+      Write-Host ("  {0,-26}: {1}" -f $k, $v)
+      Write-Log "[preview] $k = $v"
+    }
+    Write-Host ''
+    Write-Host '预演结束（-Preview）：未安装依赖、未编译、未打包。' -ForegroundColor Yellow
+    Write-Info "预演日志：$script:LogPath"
+    exit 0
+  }
+
   if (-not $SkipInstall) {
     Invoke-Step '安装工作区依赖' { Invoke-Workspace }
   } else {
     Write-WarnLine '已跳过 yarn install（-SkipInstall）'
+  }
+  # 覆盖参数最容易的失败形态是「构建成功但版本没换」，装完立刻核对一次。
+  if ($script:ElectronOverrideActive -or $script:PnpmOverrideActive) {
+    Invoke-Step '核对已安装的 electron / pnpm 版本（含 dsh 原生 addon 支持表）' {
+      Test-InstalledOverrides
+      Test-ElectronAddonSupport
+    }
   }
 
   if (-not $env:ELECTRON_MIRROR) { $env:ELECTRON_MIRROR = 'https://npmmirror.com/mirrors/electron/' }
