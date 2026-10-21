@@ -2088,20 +2088,38 @@ function Set-AAVendorDependency {
     Write-WarnLine "修复：$ws 的 AA 依赖已对齐 provenance（$($prov.artifact)）"
   }
 
-  # 根 package.json resolutions 里的 connector 补丁也必须指向同一产物：上游
-  # aaConnectorResolution() 把它写成
-  #   patch:@agents-anywhere/dsh-bridge-next@file%3Avendor/agents-anywhere/<artifact>#./patches/agents-anywhere-connector-httpx.patch
-  # 只对齐工作区依赖时，assertPreparedAaRelease 会以 “Connector compatibility patch
-  # references a different AA artifact” 直接中止打包。保留原有补丁路径，只替换产物名。
+  # 根 package.json 里的 AA 引用同样必须指向本机产物，否则上游 assertPreparedAaRelease
+  # 以 “root resolution references a different AA artifact” 直接中止打包 —— 它要求
+  #   resolutions["@agents-anywhere/dsh-bridge-next"] === file:vendor/agents-anywhere/<artifact>
+  # 上游先后用过两种写法，两种都要处理（根 dependencies 与根 resolutions 各有一条）：
+  #   ① 纯 file:           file:vendor/agents-anywhere/<artifact>
+  #   ② connector 补丁写法  patch:@agents-anywhere/dsh-bridge-next@file%3Avendor/agents-anywhere/<artifact>#./patches/…
+  # 只替换产物名，patch: 前缀与 #补丁路径原样保留；幂等（已对齐则不写盘）。
+  # 历史：早期上游用 ② 且写在 resolutions 里，本地只关注 ②；上游 master 改成 ① 之后
+  # 本步骤静默失配（正则不再命中、也不报错），AA 校验随即在 [08] 中止。
   $rootPkgPath = Join-Path $script:Src 'package.json'
   if (Test-Path -LiteralPath $rootPkgPath) {
     $rootText = Get-Content -LiteralPath $rootPkgPath -Raw -Encoding utf8
-    $res = [regex]::Match($rootText, '"@agents-anywhere/dsh-bridge-next"\s*:\s*"([^"]*@file%3Avendor/agents-anywhere/)([^"#]+\.tgz)([^"]*)"')
-    if ($res.Success -and $res.Groups[2].Value -ne $prov.artifact) {
-      $replacement = '"@agents-anywhere/dsh-bridge-next": "' + $res.Groups[1].Value + $prov.artifact + $res.Groups[3].Value + '"'
-      $rootText = $rootText.Remove($res.Index, $res.Length).Insert($res.Index, $replacement)
-      Set-Content -LiteralPath $rootPkgPath -Value $rootText -Encoding utf8 -NoNewline
-      Write-WarnLine "修复：根 package.json 的 AA connector 补丁已对齐 provenance（$($prov.artifact)）"
+    $artifactName = [string]$prov.artifact
+    $rootUpdated = [regex]::Replace($rootText, '("@agents-anywhere/dsh-bridge-next"\s*:\s*")([^"]*)(")', {
+        param($m)
+        $head = $m.Groups[1].Value
+        $value = $m.Groups[2].Value
+        $tail = $m.Groups[3].Value
+        if ($value -match '^file:vendor/agents-anywhere/(?<a>[^"]+)$') {
+          if ($Matches['a'] -eq $artifactName) { return $m.Value }
+          return $head + 'file:vendor/agents-anywhere/' + $artifactName + $tail
+        }
+        if ($value -match '^(?<p>patch:@agents-anywhere/dsh-bridge-next@file%3Avendor/agents-anywhere/)(?<a>[^#]+)(?<s>#.*)?$') {
+          if ($Matches['a'] -eq $artifactName) { return $m.Value }
+          $suffix = if ($null -eq $Matches['s']) { '' } else { $Matches['s'] }
+          return $head + $Matches['p'] + $artifactName + $suffix + $tail
+        }
+        return $m.Value
+      })
+    if ($rootUpdated -ne $rootText) {
+      Set-Content -LiteralPath $rootPkgPath -Value $rootUpdated -Encoding utf8 -NoNewline
+      Write-WarnLine "修复：根 package.json 的 AA 引用（dependencies + resolutions）已对齐 provenance（$artifactName）"
     }
   }
 }
@@ -2676,6 +2694,11 @@ function Update-SourceRepository {
     $PSNativeCommandUseErrorActionPreference = $false
     try {
       Write-Info "dsh-desktop 已存在，正在拉取上游 $($script:SrcBranch) 最新并重置本地分支 ..."
+      # 必须在下方的 checkout --force 之前把工作树里覆盖层文件的策展改动固化到 overlay\
+      # （git diff → overlay\patches\、新文件 → overlay\src\），否则会被静默丢弃。
+      # 历史 bug：该导出原先只在 [04] 的 Reset-OverlayTrackedFiles 里调用，而那时
+      # checkout --force 早已把改动清掉 —— 「pull 前导出」实际永远导不到东西。
+      Export-SrcOverlay
       $output = @(& git -C $script:Src fetch origin 2>&1)
       foreach ($line in $output) {
         $text = if ($null -eq $line) { '' } else { [string]$line }

@@ -698,6 +698,20 @@ if ($LASTEXITCODE -ne 0) {
 
 `Export-SrcOverlay` 会在 pull 前把工作区改动导出到 `overlay\`，所以「改源码 → 跑脚本」不会丢改动。但如果某个补丁是**策展过的**（例如按 1.2 手写的最小上下文版本），必须加进 `NoAutoExportPatchFiles`，否则下次会被自动导出覆盖回 `-U3` 版本。
 
+#### 1.5.1 「改源码 → 跑脚本」仍会丢改动：导出时序（2026-10-21 修复）
+
+上面那句话在 2026-10-21 之前**是错的**。`Export-SrcOverlay` 原先只经 `[04] Invoke-ChannelOverlayPreInstall` → `Reset-OverlayTrackedFiles` 调用，而 `[01] Update-SourceRepository` 早在那之前就执行了 `git checkout -B master origin/master --force` —— 「pull 前导出」实际发生在 pull **之后**，`SrcPatchFiles` 里的工作区改动已被 force checkout 清掉，导出永远拿不到东西（日志里也**不会**出现「已导出」）。
+
+实证：手工给 `verify-packaged-runtime.ts` 加了白名单前缀 → 构建后该行消失、`overlay\patches\*.patch` 未更新、日志没有任何「已导出」行。
+
+修法：把 `Export-SrcOverlay` 提到 `Update-SourceRepository` 的 `checkout --force` **之前**。现在 `[01]` 会先打印
+
+```
+[WARN ] 覆盖层：已导出 dsh-plugin-desktop/scripts/verify-packaged-runtime.ts 的本地改动 → overlay\patches\verify-packaged-runtime.ts.patch
+```
+
+再重置分支。判断「改动有没有被收走」就看这一行；`dsh-plugin-desktop/package.json` 仍受 `NoAutoExportPatchFiles` 保护（只告警、不导出，避免构建期注入把策展补丁覆盖掉）。
+
 #### 1.6 补丁缺失时的版本迁移（加固行为）
 
 当上游升级某个工作区依赖，而配套补丁只有旧版本时，脚本**拒绝**把旧补丁硬套到新版本上（这正是最早 `types-DxezulnA.js` 故障的成因），改为告警并回退：
@@ -764,6 +778,8 @@ cd dsh-desktop\dsh-plugin-desktop\node_modules\electron; node install.js
 | `Missing Next payload` / `Missing packaged dependency` | 产物缺条目/依赖 | 检查 `files` 列表与依赖闭包 |
 
 **提高上限时必须在常量上方写清理由和逐项体积**，否则以后会被当成随意放宽。
+
+实例（2026-10-21）：`non-allowlisted package roots: node_modules/meshcall-router-win32-arm64, node_modules/meshcall-router-win32-x64` —— 上游 `meshcall` 包按平台/架构发布的原生 router/CLI，白名单里没有对应前缀。处置：补 `'node_modules/meshcall-router-'`（补丁 `overlay\patches\verify-packaged-runtime.ts.patch`）。注意这类「上游新增原生包」只会在**某次上游提交之后**才出现；同一份覆盖层在旧 commit 上可能一直正常，升级后才红。
 
 #### 2.3 上游把 ASAR 关掉了（要重新启用）
 
@@ -895,6 +911,44 @@ next 的 `afterPack`（`scripts\verify-packaged.ts`）依次做三件事：检�
 `@deepseek-ai/libreoffice-kit-win32-arm64/**` + 1 个 `@koromix/koffi-win32-x64/win32_x64/koffi.lib`；
 注入两条排除项后门禁放行，随后 `Verified the sealed Next payload … 18514 files` 与
 `Packaged Next Host booted from …app.asar`（真实 Host 冒烟）双双通过。
+
+#### 2.7 AA 发布校验失败：`root resolution references a different AA artifact`
+
+`[08]` 在 5 秒内就失败，日志只剩一句 `程序"corepack.cmd"以非零退出代码结束: 1` —— 那是 corepack 的外层退出码，真实报错是上游 `aa:prepare-release` 的发布校验先挂了（yarn 子进程输出不进构建日志，见 6.4）。手工跑一次才看得到：
+
+```
+AA release check failed: root resolution references a different AA artifact. Run corepack yarn aa:prepare-release.
+```
+
+判据在 `scripts/agents-anywhere-release-policy.mjs` 的 `assertPreparedAaRelease`：
+
+```js
+if (json(join(root,'package.json')).resolutions?.[AA_PACKAGE] !== aaArtifactResolution(artifact)) fail(…)
+// aaArtifactResolution(artifact) === `file:vendor/agents-anywhere/${artifact}`
+```
+
+**根因是上游换了写法、本地覆盖层只对齐旧写法。** 上游原先把它写成 connector 补丁形态：
+
+```
+patch:@agents-anywhere/dsh-bridge-next@file%3Avendor/agents-anywhere/<artifact>#./patches/agents-anywhere-connector-httpx.patch
+```
+
+`Set-AAVendorDependency` 的正则只认 `@file%3A…` 这一种形态；上游 master 改成**裸 `file:`** 之后正则不再命中，**而且不报错**（静默失配）。于是覆盖层把 `vendor\agents-anywhere` 换成本机固化产物（`c58d98da25a23`）后，根 `resolutions` 仍指向上游自带那份（`c43434415e1d6`）→ 校验失败。
+
+修法：`Set-AAVendorDependency` 现在同时处理两种形态（纯 `file:` 与 `patch:…@file%3A…`），只替换产物名、保留 `patch:` 前缀与 `#补丁路径`，幂等。构建日志会出现：
+
+```
+[WARN ] 修复：根 package.json 的 AA 引用（dependencies + resolutions）已对齐 provenance（…c58d98da25a23.r2e406d2a.tgz）
+```
+
+**别把两个「AA 检查」混为一谈：**
+
+| 命令 | 比对基准 | 何时为红 |
+|------|---------|---------|
+| `yarn aa:prepare-release`（`package:dir` 里跑） | vendored `provenance.json` ↔ 本机产物 / 锁 / 工作区依赖 / 已安装包 | 覆盖层换过产物却没对齐 → 本 2.7（会**中止打包**） |
+| `yarn aa:check` | **AA main 最新 commit**（联网 `git ls-remote` 解析） | AA main 前进了就红，属"该刷新了"；上游自己的 CI 同样会红，**与打包无关** |
+
+`package:dir` 不跑 `aa:check`，所以 `aa:check` 红不代表构建有问题。2026-10-21 实测三个值互不相同：AA main = `3b456016f4`、上游自带 provenance = `43434415e1`、本机固化 = `58d98da25a`。
 
 ---
 
