@@ -939,21 +939,29 @@ function Export-SrcOverlay {
       }
       continue
     }
+    $patch = Join-Path (Join-Path $script:SrcOverlayDir 'patches') "$([IO.Path]::GetFileName($rel)).patch"
+    # 用 `git diff --output=<文件>` 直接由 git 写字节，不经过 PowerShell 的逐行捕获/重新拼接。
+    # 原因（2026-10-24 实测）：旧写法 `@(& git diff) | Join("`n")` 在「文件本身是 CRLF」时会把
+    # 补丁写坏 —— hunk 头声明的行数与正文对不上，git apply 直接报
+    # `corrupt patch at ...:75`，于是 [04] 覆盖层整步中断。改用 --output 后补丁与
+    # `git diff` 的输出逐字节相同，行尾由 git 自己决定，不再受宿主换行/编码影响。
     $prevNative = $PSNativeCommandUseErrorActionPreference
     $PSNativeCommandUseErrorActionPreference = $false
+    $tmp = [IO.Path]::Combine([IO.Path]::GetTempPath(), [IO.Path]::GetRandomFileName())
     try {
-      $diff = @(& git -C $script:Src diff -- $rel)
+      & git -C $script:Src diff --output=$tmp -- $rel
       $diffCode = $LASTEXITCODE
     } finally {
       $PSNativeCommandUseErrorActionPreference = $prevNative
     }
-    if ($diffCode -ne 0) { throw "git diff 失败: $rel (exit $diffCode)" }
-    if ($diff.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace(($diff -join ''))) {
-      $patch = Join-Path (Join-Path $script:SrcOverlayDir 'patches') "$([IO.Path]::GetFileName($rel)).patch"
-      # git diff 在 PowerShell 中按行拆成 string[]，必须显式用 LF 重新连接
-      # （WriteAllText 直接收数组会用空格拼，破坏补丁格式）。
-      [System.IO.File]::WriteAllText($patch, [string]::Join("`n", $diff) + "`n")
-      Write-WarnLine "覆盖层：已导出 $rel 的本地改动 → $patch"
+    try {
+      if ($diffCode -ne 0) { throw "git diff 失败: $rel (exit $diffCode)" }
+      if ((Test-Path -LiteralPath $tmp) -and (Get-Item -LiteralPath $tmp).Length -gt 0) {
+        Copy-Item -LiteralPath $tmp -Destination $patch -Force
+        Write-WarnLine "覆盖层：已导出 $rel 的本地改动 → $patch"
+      }
+    } finally {
+      Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
     }
   }
   foreach ($rel in $script:SrcOverlayFiles) {
@@ -2949,7 +2957,26 @@ try {
     $env:HTTP_PROXY = $Proxy
     $env:HTTPS_PROXY = $Proxy
     $env:ALL_PROXY = $Proxy
-    Write-Info "已设置代理: $Proxy"
+    $env:http_proxy = $Proxy
+    $env:https_proxy = $Proxy
+    # Node 的原生 fetch（undici）**默认不认** HTTP_PROXY/HTTPS_PROXY —— Node 24 起需要
+    # NODE_USE_ENV_PROXY=1 才会读。上游 scripts/primary-runtime.ts 下载运行时载荷用的
+    # 正是 fetch + AbortSignal.timeout，少了这个变量就是直连 GitHub / nodejs.org：
+    # 2026-10-24 实测照抄 next 通道的判据 —— 直连时 package:dir 在 [08] 步以
+    # "TypeError: fetch failed / ECONNRESET" 失败（Payload 换版本后缓存失效，必须重下）。
+    # 这段与 build-next.ps1 里的同名块保持等价，别再只设 HTTP(S)_PROXY。
+    $env:NODE_USE_ENV_PROXY = '1'
+    $env:ELECTRON_GET_USE_PROXY = '1'
+    if (-not $env:DSH_RESOURCE_DOWNLOAD_TIMEOUT_MS) {
+      # 上游默认 5 分钟在代理链路上偏紧（Python 载荷上百 MB），给足余量；显式设过就不动。
+      $env:DSH_RESOURCE_DOWNLOAD_TIMEOUT_MS = '900000'
+    }
+    Write-Info "已设置代理: $Proxy（NODE_USE_ENV_PROXY=1；运行时载荷下载超时 $($env:DSH_RESOURCE_DOWNLOAD_TIMEOUT_MS)ms，可用同名环境变量覆盖）"
+  } elseif ($NoProxy) {
+    Remove-Item Env:HTTP_PROXY -ErrorAction SilentlyContinue
+    Remove-Item Env:HTTPS_PROXY -ErrorAction SilentlyContinue
+    $env:NODE_USE_ENV_PROXY = '0'
+    Write-Info '已禁用代理（-NoProxy）'
   }
 
   # Yarn 4.18 默认拒绝“发布不足 1 天”的版本（npmMinimalAgeGate），而 AA 准备阶段会在

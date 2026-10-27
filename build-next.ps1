@@ -163,16 +163,25 @@ $script:PnpmOverrideActive = $MyInvocation.BoundParameters.ContainsKey('PnpmVers
 $script:PnpmPatchSourceDir = Join-Path $script:Root 'overlay\pnpm'
 
 
-# 本脚本不构建的工作区（只让它们不参与编译/打包），但其中有些仍需安装依赖：
-#   - dsh-plugin-desktop（stable）：next 完全不引用，排除即可。
-#   - dsh-plugin-desktop-beta：**必须保留依赖**。next 的 vite.client.config.ts
-#     直接 re-export beta 的配置（"Native onboarding and its assets use the same
-#     renderer build as Beta"），native-ui 配置也注明 "Shared components live in
-#     another workspace"，且 next 有 10 处 import 来自 beta/src。beta 的 vite
-#     配置把 lucide-react 等当作外部包解析，因此 beta 的 node_modules 必须存在，
-#     否则构建报 "Rolldown failed to resolve import lucide-react from
-#     dsh-plugin-desktop-beta/src/client/DesktopNativeActions.tsx"。
-$script:ExcludedWorkspaces = @('dsh-plugin-desktop')
+# 本脚本不构建的工作区（只让它们不参与编译/打包）—— 现在是空的：**一个都不能排除**。
+# 2026-10-24 上游 ba41476b10（"migrate dsh-plugin-desktop-beta to dsh-desktop-next
+# framework"）把 next 的渲染层依赖整体翻到了 stable 一侧，于是 next 同时需要 beta 和
+# stable 的 node_modules：
+#   1) 渲染层：dsh-desktop-next/vite.client.config.ts 现在 re-export
+#      ../dsh-plugin-desktop/vite.client.config.ts（此前是 ../dsh-plugin-desktop-beta/…），
+#      编译的是 dsh-plugin-desktop/src/client/*.tsx —— 那些文件按 Node 解析顺序从自己
+#      目录往上找 node_modules，永远走不到 dsh-desktop-next/node_modules（不在上溯路径上）。
+#   2) 打包脚本：next 的 scripts/package.ts、verify-fuses.ts、prepare-runtime.ts、
+#      mac-runtime.ts 共 10+ 处 import 来自 ../../dsh-plugin-desktop/scripts/*。
+#   3) beta：仍是 next 的共享组件来源（native-ui "Shared components live in another
+#      workspace"），dshmarket / AA 的两处工作区校验也以它为准。
+# 排除 stable 的后果（2026-10-24 实测）：yarn install 会把它已有的 node_modules
+# 一并删掉，接着 [11] 客户端构建直接失败：
+#   Rolldown failed to resolve import "lucide-react" from
+#   .../dsh-plugin-desktop/src/client/DesktopNativeActions.tsx
+# 代价是 install 会连 stable 的依赖一起装（约 +1.6 GB / +1~2 分钟）；这是上游布局
+# 决定的必需开销，不能靠"少装一个工作区"省掉。
+$script:ExcludedWorkspaces = @()
 
 # overlay-next：next 专属覆盖层（与 stable 的 overlay\ 隔离）
 $script:OverlayDir = Join-Path $script:Root 'overlay-next'
@@ -468,7 +477,8 @@ function Apply-Overlay {
 
 function Set-WorkspaceSelection {
   # next 必须出现在根 workspaces 里，否则 yarn install 不装它的依赖。
-  # 同时把本脚本不构建的 stable/beta 移出，避免连带安装与编译。
+  # 其余工作区默认全部保留（见 $script:ExcludedWorkspaces 的说明：next 现在同时需要
+  # stable 的渲染层源码与打包脚本依赖，排除任何一个都会在 [11] 客户端构建失败）。
   $rootPkgPath = Join-Path $script:Src 'package.json'
   $text = [System.IO.File]::ReadAllText($rootPkgPath)
   $m = [regex]::Match($text, '(?s)("workspaces"\s*:\s*\[)(.*?)(\])')
@@ -1674,7 +1684,7 @@ preview : $($Preview.IsPresent)
   Invoke-Step '解析 dsh 运行时版本（-HarnessVersion / 上游声明）' { Resolve-HarnessVersion }
   Invoke-Step "固定运行时版本（dsh $($script:ResolvedRuntimeVersion)）" { Set-HarnessVersionPinned }
   Invoke-Step '对齐 deepseek-harness 子模块' { Ensure-Submodule }
-  Invoke-Step '选择工作区（加入 next / 排除 stable）' { Set-WorkspaceSelection }
+  Invoke-Step '选择工作区（next + stable + beta 全部保留）' { Set-WorkspaceSelection }
   Invoke-Step '应用 next 覆盖层（代码补丁）' { Apply-Overlay }
   Invoke-Step '校验运行时版本与打包姿态（含 electron / pnpm / 版本资源注入）' {
     Test-NextRuntimeVersion

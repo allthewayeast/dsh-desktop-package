@@ -1,5 +1,5 @@
 diff --git a/dsh-plugin-desktop/scripts/verify-packaged-runtime.ts b/dsh-plugin-desktop/scripts/verify-packaged-runtime.ts
-index e9c5b7fc08..eb90f34b9e 100644
+index e0fd4292fc..3876f27ec1 100644
 --- a/dsh-plugin-desktop/scripts/verify-packaged-runtime.ts
 +++ b/dsh-plugin-desktop/scripts/verify-packaged-runtime.ts
 @@ -72,8 +72,18 @@ const PNPM_RUNTIME_VERSION = packageVersion(PNPM_PACKAGE_ROOT)
@@ -23,7 +23,7 @@ index e9c5b7fc08..eb90f34b9e 100644
  
  /** Narrow ceiling for pnpm's smart-unpacked native-helper package root. */
  export const MAX_PNPM_SMART_UNPACK_FILES = 32
-@@ -94,10 +104,17 @@ export const ALLOWED_SMART_UNPACK_PACKAGE_ROOTS = [
+@@ -94,11 +104,18 @@ export const ALLOWED_SMART_UNPACK_PACKAGE_ROOTS = [
  export const ALLOWED_SMART_UNPACK_PACKAGE_PREFIXES = [
    'node_modules/@dataiku/uv-',
    'node_modules/@deepseek-ai/node-addon-system-',
@@ -32,6 +32,7 @@ index e9c5b7fc08..eb90f34b9e 100644
    'node_modules/@img/sharp-',
    'node_modules/@koromix/koffi-',
    'node_modules/@vscode/ripgrep-',
+   'node_modules/meshcall-router-',
    'node_modules/node-addon-require-builtin-',
 +  // DSH Desktop: offline speech-to-text ships ONNX Runtime DLLs per platform.
 +  'node_modules/sherpa-onnx-',
@@ -41,7 +42,7 @@ index e9c5b7fc08..eb90f34b9e 100644
  ] as const
  
  /** Every generated JavaScript file shipped by the installed DSH CLI package. */
-@@ -853,13 +870,30 @@ export function reportUnpackedRuntime(summary: UnpackedRuntimeSummary): void {
+@@ -854,13 +871,30 @@ export function reportUnpackedRuntime(summary: UnpackedRuntimeSummary): void {
    process.stdout.write(`dsh-plugin-desktop: packaged runtime inventory: ${formatUnpackedRuntimeSummary(summary)}\n`)
  }
  

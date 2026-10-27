@@ -1,5 +1,5 @@
 diff --git a/dsh-plugin-desktop/src/main.ts b/dsh-plugin-desktop/src/main.ts
-index ba3937a91e..48d82c0e03 100644
+index 15bb657d3b..1b49640f8a 100644
 --- a/dsh-plugin-desktop/src/main.ts
 +++ b/dsh-plugin-desktop/src/main.ts
 @@ -242,6 +242,10 @@ import {
