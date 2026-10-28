@@ -375,18 +375,40 @@ function Export-Overlay {
     $patchDir = Join-Path $script:OverlayDir 'patches'
     New-Item -ItemType Directory -Force -Path $patchDir | Out-Null
     foreach ($rel in $script:OverlayPatches) {
+      $out = Join-Path $patchDir ("$([IO.Path]::GetFileName($rel)).patch")
+      $tmp = "$out.tmp"
+      # ⚠️ 必须让 git 自己把差异写成文件（--output）：把 git 的标准输出读进 PowerShell
+      # 字符串再写回，会按控制台代码页（中文 Windows 是 GBK）解码本该是 UTF-8 的差异内容，
+      # 于是上下文里的中文和全角标点全变成乱码，补丁之后再也打不上。
+      # 2026-10-27 的 overlay-next\patches\main.ts.patch 就是这样被毁掉的（整个文件变成
+      # 只剩乱码的删除补丁）。
       $prevNative = $PSNativeCommandUseErrorActionPreference
       $PSNativeCommandUseErrorActionPreference = $false
       try {
-        $diff = @(& git diff -- $rel)
+        & git diff --output=$tmp -- $rel
         $diffCode = $LASTEXITCODE
       } finally {
         $PSNativeCommandUseErrorActionPreference = $prevNative
       }
-      if ($diffCode -ne 0) { continue }
-      if ($diff.Count -eq 0) { continue }
-      $out = Join-Path $patchDir ("$([IO.Path]::GetFileName($rel)).patch")
-      [System.IO.File]::WriteAllText($out, ([string]::Join("`n", $diff) + "`n"))
+      if ($diffCode -ne 0) {
+        Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
+        continue
+      }
+      if (-not (Test-Path -LiteralPath $tmp) -or (Get-Item -LiteralPath $tmp).Length -eq 0) {
+        Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
+        continue
+      }
+      # 「整文件删除」的差异绝不能当成策展内容保存：工作区里该文件被删掉（或换成了别的
+      # 东西）时 git diff 就是一份删除补丁，存下来等于让下一次构建把上游整个文件删掉。
+      # 这种状态一律判定为异常，丢弃导出的临时文件、保留仓库里已有的补丁。
+      $text = [System.IO.File]::ReadAllText($tmp)
+      if ($text -match '(?m)^deleted file mode ') {
+        Write-WarnLine "覆盖层：$rel 的本地改动是整文件删除（异常状态），保留原补丁不覆盖"
+        Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
+        continue
+      }
+      [System.IO.File]::WriteAllText($out, ($text -replace "`r`n", "`n"))
+      Remove-Item -LiteralPath $tmp -ErrorAction SilentlyContinue
       Write-WarnLine "覆盖层：已导出 $rel 的本地改动 → $(Split-Path -Leaf $out)"
     }
   } finally {
