@@ -19,13 +19,21 @@
     5. 不做图标处理（按需求）。
     6. 运行时跟随上游（不再钉 0.1.7-rc.2），deepseek-harness 子模块对齐上游 HEAD 的 gitlink。
 
-  overlay-next 现在只承担一件事：把 exe 同级的 startup.json 接进启动流程。
+  overlay-next 负责三件事：启动配置、主窗口几何持久化、页面缩放（Ctrl/Cmd `+` `-` `0`）。
     overlay-next\src\startup-config.ts        新文件：启动配置解析（网络/环境变量开关）
     overlay-next\src\startup-config.spec.ts   新文件：配套单测
-    overlay-next\patches\main.ts.patch        接入 applyDesktopStartupConfig + 让 DSH_HOME 生效
+    overlay-next\src\window-state.ts          新文件：主窗口位置/大小持久化
+    overlay-next\src\window-state.spec.ts     新文件：配套单测
+    overlay-next\patches\main.ts.patch        接入 applyDesktopStartupConfig、DSH_HOME 回退、
+                                              窗口几何恢复/保存、主进程页面缩放快捷键
     overlay-next\startup.json                 运行时数据，构建后拷到 exe 同级
   "让 DSH_HOME 生效"不是附加功能：startup.json 里配置的就是 DSH_HOME，而 next 原本只认
   DSH_DESKTOP_NEXT_HOME，不补这段启动配置就落不到 home 上。
+
+  页面缩放同理：next 自己不做任何缩放接线，Ctrl/Cmd `+`/`-` 于是落到客户端 ui-theme 的
+  **字号**绑定上 —— 那套只步进字号 token，px 定的外壳（最显眼的就是左侧面板）纹丝不动，
+  看起来像"只缩放了半个窗口"。现在由主进程拦下这三个手势并 setZoomLevel（范围
+  -4..4，与 stable 的 handleZoomShortcut 一致），整页一个缩放级别，面板跟着一起动。
 
   2026-10-14 起 ASAR 相关的策展全部撤掉，因为上游自己接过去了，且我们的旧做法会与新门禁冲突：
     - 上游 dsh-desktop-next\package.json 现在自带 "asar": true + build.asarUnpack（含
@@ -1323,6 +1331,106 @@ function Invoke-Workspace {
   }
 }
 
+function Test-PeerRangeSatisfied {
+  # 只用来判断「某个工作区里已装的那一份能不能顶上这个 peer」：先认完全相等，
+  # 再认 ~ / ^ 前缀的「同 major.minor」。不是完整的 semver 解析 —— 这里的 peer 范围
+  # 全是上游写死的精确版本或 ~x.y.z，够用且不会误判。
+  param([string]$Version, [string]$Range)
+  if ([string]::IsNullOrWhiteSpace($Version)) { return $false }
+  foreach ($part in ($Range -split '\|\|')) {
+    $r = $part.Trim()
+    if (-not $r) { continue }
+    if ($r -eq $Version) { return $true }
+    $prefix = $null
+    if ($r.StartsWith('~') -or $r.StartsWith('^')) { $prefix = $r.Substring(1) }
+    if (-not $prefix) { continue }
+    $want = $prefix -split '\.'
+    $have = $Version -split '\.'
+    if ($want.Count -ge 2 -and $have.Count -ge 2 -and $have[0] -eq $want[0] -and $have[1] -eq $want[1]) { return $true }
+  }
+  return $false
+}
+
+function Repair-WorkspacePeers {
+  # 为什么需要这一步（2026-10-28 上游 e7d0170dde 起）：
+  #   dsh-community-market 把 75 个 @deepseek-ai/* 列进 devDependencies（0.2.2-alpha.2），
+  #   而这些包彼此之间的 peerDependencies 并没有一起声明。yarn **从不自动安装 peer**，
+  #   于是 market\node_modules\@deepseek-ai\dsh-agent 缺 19 个 peer（dsh-scope /
+  #   dsh-system-prompt / dsh-fs …）。dsh-desktop-next\scripts\prepare-payload.ts 在收集
+  #   生产闭包时把「非 optional 的 peer」当必装项，打包阶段直接失败：
+  #     Next payload: dependency @deepseek-ai/dsh-scope required by @deepseek-ai/dsh-agent is not installed
+  #   这是上游 devDependencies 的缺口，不是我们的覆盖层问题，也不该靠改上游源码去补。
+  # 做法：install 之后，逐个工作区扫描已安装的 @deepseek-ai/* 包，发现 peer 在
+  #   <包自身> / <工作区> / <仓库根> 三级 node_modules 里都解析不到时，从「别的已经装了
+  #   同版本的工作区」复制一份过去（beta 装的就是 0.2.2-alpha.2，正好能顶 market 的那份）。
+  # 只补缺、不覆盖已存在的包；找不到可用版本时只告警，让打包阶段报更具体的错。
+  $wsDirs = @(Get-ChildItem -LiteralPath $script:Src -Directory | Where-Object {
+      (Test-Path -LiteralPath (Join-Path $_.FullName 'package.json')) -and
+      (Test-Path -LiteralPath (Join-Path $_.FullName 'node_modules'))
+    })
+  if ($wsDirs.Count -eq 0) { Write-Info '工作区 peer：未找到已安装的工作区，跳过。'; return }
+
+  # 已安装副本索引：包名 -> @(@{ Version; Path })
+  $installed = @{}
+  foreach ($ws in $wsDirs) {
+    $scopeDir = Join-Path $ws.FullName 'node_modules\@deepseek-ai'
+    if (-not (Test-Path -LiteralPath $scopeDir)) { continue }
+    foreach ($pkg in @(Get-ChildItem -LiteralPath $scopeDir -Directory)) {
+      $manifest = Join-Path $pkg.FullName 'package.json'
+      if (-not (Test-Path -LiteralPath $manifest)) { continue }
+      $key = "@deepseek-ai/$($pkg.Name)"
+      if (-not $installed.ContainsKey($key)) { $installed[$key] = @() }
+      $installed[$key] += @{ Version = [string](Get-JsonObject $manifest).version; Path = $pkg.FullName }
+    }
+  }
+
+  $repaired = 0
+  $unresolved = @()
+  foreach ($ws in $wsDirs) {
+    $scopeDir = Join-Path $ws.FullName 'node_modules\@deepseek-ai'
+    if (-not (Test-Path -LiteralPath $scopeDir)) { continue }
+    foreach ($pkg in @(Get-ChildItem -LiteralPath $scopeDir -Directory)) {
+      $manifest = Join-Path $pkg.FullName 'package.json'
+      if (-not (Test-Path -LiteralPath $manifest)) { continue }
+      $obj = Get-JsonObject $manifest
+      if (-not ($obj.PSObject.Properties.Name -contains 'peerDependencies')) { continue }
+      $meta = if ($obj.PSObject.Properties.Name -contains 'peerDependenciesMeta') { $obj.peerDependenciesMeta } else { $null }
+      foreach ($name in @($obj.peerDependencies.PSObject.Properties.Name)) {
+        if ($name -notlike '@deepseek-ai/*') { continue }
+        if ($meta -and ($meta.PSObject.Properties.Name -contains $name) -and $meta.$name.optional -eq $true) { continue }
+        $present = $false
+        foreach ($candidate in @(
+            (Join-Path $pkg.FullName "node_modules\$name"),
+            (Join-Path $ws.FullName "node_modules\$name"),
+            (Join-Path $script:Src "node_modules\$name"))) {
+          if (Test-Path -LiteralPath (Join-Path $candidate 'package.json')) { $present = $true; break }
+        }
+        if ($present) { continue }
+        $range = [string]$obj.peerDependencies.$name
+        $source = $null
+        if ($installed.ContainsKey($name)) {
+          $source = $installed[$name] | Where-Object { Test-PeerRangeSatisfied -Version $_.Version -Range $range } | Select-Object -First 1
+        }
+        if (-not $source) {
+          $unresolved += "$name ($range) ← $($ws.Name)"
+          continue
+        }
+        Copy-Item -LiteralPath $source.Path -Destination $scopeDir -Recurse -Force
+        $installed[$name] += @{ Version = $source.Version; Path = (Join-Path $scopeDir ($name -replace '^@deepseek-ai/', '')) }
+        $repaired++
+      }
+    }
+  }
+  if ($repaired -gt 0) {
+    Write-WarnLine "工作区 peer：已从其它工作区补齐 $repaired 个缺失 peer（上游 devDependencies 没声明，yarn 不装 peer）"
+  } else {
+    Write-Info '工作区 peer：无需补齐'
+  }
+  if ($unresolved.Count -gt 0) {
+    Write-WarnLine "工作区 peer：$($unresolved.Count) 个 peer 在任何工作区都找不到可用版本 —— $($unresolved -join '；')"
+  }
+}
+
 function Ensure-ElectronDist {
   # .yarnrc.yml 的 enableScripts:false 让 electron 的 postinstall 不执行，于是
   # node_modules\electron\dist 缺失，而 electron-builder 现在优先用这个本地目录，
@@ -1755,6 +1863,8 @@ preview : $($Preview.IsPresent)
 
   if (-not $SkipInstall) {
     Invoke-Step '安装工作区依赖' { Invoke-Workspace }
+    # install 之后才有的树：补齐上游 devDependencies 漏声明的 peer（见 Repair-WorkspacePeers）。
+    Invoke-Step '补齐工作区缺失 peer（打包闭包前置）' { Repair-WorkspacePeers }
   } else {
     Write-WarnLine '已跳过 yarn install（-SkipInstall）'
   }

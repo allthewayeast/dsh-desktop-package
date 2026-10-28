@@ -1,8 +1,23 @@
 diff --git a/dsh-desktop-next/tests/main-lifecycle.spec.ts b/dsh-desktop-next/tests/main-lifecycle.spec.ts
-index 38220f1e4c..6e464abe09 100644
+index b33be0cd6f..ceae0ada6b 100644
 --- a/dsh-desktop-next/tests/main-lifecycle.spec.ts
 +++ b/dsh-desktop-next/tests/main-lifecycle.spec.ts
-@@ -100,8 +100,13 @@ vi.mock('electron', async () => {
+@@ -90,10 +90,13 @@ vi.mock('electron', async () => {
+   })
+   class BrowserWindow extends EventEmitter {
+     visible = false
++    /** Page zoom level the shell reads and writes for the Ctrl/Cmd `+`/`-` gestures. */
++    zoomLevel = 0
+     loadedUrls: string[] = []
+     webContents = Object.assign(new EventEmitter(), { id: fixture.windows.length + 1,
+       mainFrame: { url: '' }, getURL: () => this.webContents.mainFrame.url, setWindowOpenHandler() {}, send: vi.fn(), isDestroyed: () => false,
+-      setIgnoreMenuShortcuts() {}, isFocused: () => true, executeJavaScript: vi.fn(async () => true) })
++      setIgnoreMenuShortcuts() {}, isFocused: () => true, executeJavaScript: vi.fn(async () => true),
++      getZoomLevel: () => this.zoomLevel, setZoomLevel: (level: number) => { this.zoomLevel = level } })
+     size: { width: number, height: number }
+     minSize: { width: number, height: number }
+     constructor(readonly options: any) {
+@@ -103,8 +106,13 @@ vi.mock('electron', async () => {
        fixture.windows.push(this)
      }
      destroyed = false
@@ -16,7 +31,7 @@ index 38220f1e4c..6e464abe09 100644
      isFocused() { return false }
      show() { this.visible = true }
      hide() { this.visible = false }
-@@ -141,6 +146,8 @@ vi.mock('electron', async () => {
+@@ -145,6 +153,8 @@ vi.mock('electron', async () => {
      // Templates stay plain arrays for tray assertions; the popup spy is non-enumerable.
      Menu: { buildFromTemplate: (items: any) => Object.defineProperty(items, 'popup', { value: (options: unknown) => fixture.popup(items, options), configurable: true }), setApplicationMenu() {} },
      protocol: { registerSchemesAsPrivileged() {}, handle() {} },
@@ -25,7 +40,36 @@ index 38220f1e4c..6e464abe09 100644
      session: { defaultSession: { webRequest: { onBeforeSendHeaders() {} }, setPermissionCheckHandler() {}, setPermissionRequestHandler() {}, setDisplayMediaRequestHandler() {}, on() {} } },
      systemPreferences: { getMediaAccessStatus: () => 'not-determined', askForMediaAccess: vi.fn(async () => false), isTrustedAccessibilityClient: () => false },
      desktopCapturer: { getSources: vi.fn(async () => []) },
-@@ -1608,3 +1615,37 @@ it('refuses data-directory changes and backups from Safe Mode', async () => {
+@@ -689,6 +699,28 @@ it('retains the Host when hiding to tray, restores the window, keeps failed-Host
+     expect(takeSettings(sender)).toBe('general')
+     window.webContents.emit('before-input-event', { preventDefault() {} }, { type: 'keyDown', key: ',', meta: true })
+     expect(takeSettings(sender)).toBe('general')
++    // Zoom chords are consumed by the shell and drive one page zoom level, so every surface
++    // (sidebar included) scales with the conversation instead of the client font-size binding.
++    const zoomIn = { preventDefault: vi.fn() }
++    window.webContents.emit('before-input-event', zoomIn, { type: 'keyDown', key: '=', control: true })
++    expect(zoomIn.preventDefault).toHaveBeenCalledOnce()
++    expect(window.webContents.getZoomLevel()).toBe(1)
++    window.webContents.emit('before-input-event', { preventDefault() {} }, { type: 'keyDown', key: '-', control: true })
++    expect(window.webContents.getZoomLevel()).toBe(0)
++    window.webContents.emit('before-input-event', { preventDefault() {} }, { type: 'keyDown', key: '-', control: true })
++    expect(window.webContents.getZoomLevel()).toBe(-1)
++    window.webContents.emit('before-input-event', { preventDefault() {} }, { type: 'keyDown', key: '0', control: true })
++    expect(window.webContents.getZoomLevel()).toBe(0)
++    // Out-of-range requests clamp to the Stable shell's range instead of running away.
++    for (let step = 0; step < 10; step += 1) window.webContents.emit('before-input-event', { preventDefault() {} }, { type: 'keyDown', key: '+', control: true })
++    expect(window.webContents.getZoomLevel()).toBe(4)
++    for (let step = 0; step < 20; step += 1) window.webContents.emit('before-input-event', { preventDefault() {} }, { type: 'keyDown', key: '_', control: true })
++    expect(window.webContents.getZoomLevel()).toBe(-4)
++    // A Ctrl+Alt chord stays text input (AltGr layouts type with it), not zoom.
++    const typed = { preventDefault: vi.fn() }
++    window.webContents.emit('before-input-event', typed, { type: 'keyDown', key: '=', control: true, alt: true })
++    expect(typed.preventDefault).not.toHaveBeenCalled()
++    expect(window.webContents.getZoomLevel()).toBe(-4)
+     expect(fixture.windows).toHaveLength(1)
+     await fixture.handlers.get('dsh-next:command')!(sender, { type: 'controls', page: 'profiles' })
+     expect(fixture.windows).toHaveLength(2)
+@@ -1645,3 +1677,37 @@ it('refuses data-directory changes and backups from Safe Mode', async () => {
      expect(existsSync(join(fixture.locationRoot, 'desktop-next-last-home.json'))).toBe(false)
    } finally { process.argv.splice(0, process.argv.length, ...argv); vi.unstubAllEnvs(); rmSync(home, { recursive: true, force: true }) }
  })

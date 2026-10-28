@@ -1,13 +1,13 @@
 diff --git a/dsh-desktop-next/src/main.ts b/dsh-desktop-next/src/main.ts
-index 5e555fadb3..ac0e4467c9 100644
+index 180b0fa482..86cc27eef6 100644
 --- a/dsh-desktop-next/src/main.ts
 +++ b/dsh-desktop-next/src/main.ts
-@@ -6,13 +6,14 @@ import { readFileSync, rmSync } from 'node:fs'
- import { writeFile } from 'node:fs/promises'
+@@ -7,13 +7,14 @@ import { writeFile } from 'node:fs/promises'
  import { createRequire } from 'node:module'
+ import { freemem, totalmem } from 'node:os'
  import { dirname, isAbsolute, join, resolve } from 'node:path'
--import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, net, Notification, protocol, safeStorage, session, shell, type IpcMainInvokeEvent, type MenuItemConstructorOptions, type OpenDialogOptions } from 'electron'
-+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeTheme, net, Notification, protocol, safeStorage, screen, session, shell, type IpcMainInvokeEvent, type MenuItemConstructorOptions, type OpenDialogOptions } from 'electron'
+-import { app, BrowserWindow, clipboard, crashReporter, dialog, ipcMain, Menu, nativeTheme, net, Notification, protocol, safeStorage, session, shell, type IpcMainInvokeEvent, type MenuItemConstructorOptions, type OpenDialogOptions } from 'electron'
++import { app, BrowserWindow, clipboard, crashReporter, dialog, ipcMain, Menu, nativeTheme, net, Notification, protocol, safeStorage, screen, session, shell, type Input, type IpcMainInvokeEvent, type MenuItemConstructorOptions, type OpenDialogOptions, type WebContents } from 'electron'
  import { appRequestHeaders, forwardWebRequest, serveWebDocument } from './web-document.ts'
  import { installAppDownloads } from './app-downloads.ts'
  import { claimDesktopSingleInstance } from './single-instance.ts'
@@ -18,7 +18,7 @@ index 5e555fadb3..ac0e4467c9 100644
  import { preferredDesktopLocale, resolveDesktopLocale } from './menu-locale.ts'
  import { NativeLocaleStore } from './native-locale.ts'
  import { NextDesktopRuntime } from './desktop-runtime.ts'
-@@ -28,6 +29,10 @@ import { desktopTerminalStateDirectory, openDesktopTerminal } from './desktop-te
+@@ -29,6 +30,10 @@ import { desktopTerminalStateDirectory, openDesktopTerminal } from './desktop-te
  import { createPackageRunner } from './extensions.ts'
  import { bundledPnpmEntry } from './bundled-pnpm.ts'
  import { applyDesktopPackageManagerPolicy } from './pnpm-policy.ts'
@@ -29,7 +29,7 @@ index 5e555fadb3..ac0e4467c9 100644
  import { auxiliaryWindowChromeOptions, auxiliaryWindowHasCustomFrame } from '../../dsh-plugin-desktop/src/auxiliary-window-options.ts'
  import { cleanupDisposableTree } from '../../dsh-plugin-desktop/src/disposable-tree.ts'
  import { installEditingContextMenu } from '../../dsh-plugin-desktop/src/context-menu.ts'
-@@ -59,9 +64,31 @@ const startupElevationState = startupElevation.relaunched ? {} : startupElevatio
+@@ -61,9 +66,31 @@ const startupElevationState = startupElevation.relaunched ? {} : startupElevatio
  // Inherit the package policy across the Host and every runtime child process.
  applyDesktopPackageManagerPolicy(process.env)
  
@@ -62,7 +62,7 @@ index 5e555fadb3..ac0e4467c9 100644
  // The in-app choice keeps its former Next-owned anchor, whatever the variable says.
  const locationRoot = dataDirectoryLocationRoot(app.isPackaged, () => app.getPath('appData'), root)
  const locationFile = dataDirectoryLocationFile(locationRoot)
-@@ -265,9 +292,75 @@ function show(window: BrowserWindow): void {
+@@ -290,9 +317,116 @@ function show(window: BrowserWindow): void {
   * Electron derives their hover and press tint from the native theme rather than from this fill.
   */
  const WINDOWS_CAPTION_FILL = '#00000000'
@@ -130,6 +130,47 @@ index 5e555fadb3..ac0e4467c9 100644
 +  })
 +  flushMainWindowGeometry = save
 +}
++
++/**
++ * Page-zoom bounds for the Ctrl/Cmd `+`/`-` shortcuts. Same range as the Stable shell
++ * (`dsh-plugin-desktop`), so a chord means the same thing in both channels.
++ */
++const MIN_ZOOM_LEVEL = -4
++const MAX_ZOOM_LEVEL = 4
++
++function clampedZoomLevel(level: number): number {
++  return Math.min(MAX_ZOOM_LEVEL, Math.max(MIN_ZOOM_LEVEL, level))
++}
++
++/**
++ * Classify the page-zoom gestures of the Stable shell: Ctrl/Cmd `+`/`=`, `-`/`_`, and `0`.
++ * `input.key` is the layout character, so both the unshifted and shifted forms count.
++ */
++function zoomShortcut(input: Input): 'in' | 'out' | 'reset' | undefined {
++  if (input.type !== 'keyDown' || input.alt || (!input.control && !input.meta)) return undefined
++  if (input.key === '+' || input.key === '=') return 'in'
++  if (input.key === '-' || input.key === '_') return 'out'
++  if (input.key === '0') return 'reset'
++  return undefined
++}
++
++/**
++ * Zoom the application page instead of the client's font-size binding.
++ *
++ * Next wires no zoom of its own, so Ctrl/Cmd `+`/`-` fell through to `ui-theme`, whose desktop
++ * binding only steps the font-size settings. That grows text but leaves every surface sized in
++ * px — most visibly the left sidebar, which stayed put while the conversation grew, so the window
++ * looked half zoomed. A page zoom level covers the whole document, and swallowing the key here
++ * also keeps the client binding from firing on top of it. Stable behaves the same way
++ * (`handleZoomShortcut` in its electron shell).
++ */
++function applyZoomShortcut(event: Electron.Event, contents: WebContents, input: Input): void {
++  const action = zoomShortcut(input)
++  if (action === undefined) return
++  event.preventDefault()
++  if (action === 'reset') { contents.setZoomLevel(0); return }
++  contents.setZoomLevel(clampedZoomLevel(contents.getZoomLevel() + (action === 'in' ? 1 : -1)))
++}
  
  function createWindow(preload: string, primary = false): BrowserWindow {
 -  const window = new BrowserWindow({ width: 1280, height: 840, minWidth: 800, minHeight: 580,
@@ -139,7 +180,7 @@ index 5e555fadb3..ac0e4467c9 100644
      show: false, title: 'DSH NEXT',
      ...(process.platform !== 'darwin' ? { icon: unpackedPath(join(root, 'build', process.platform === 'win32' ? 'app-icon.ico' : 'app-icon.png')) } : {}),
      ...(!primary ? auxiliaryWindowChromeOptions() : {}),
-@@ -310,6 +403,10 @@ function createWindow(preload: string, primary = false): BrowserWindow {
+@@ -335,8 +469,13 @@ function createWindow(preload: string, primary = false): BrowserWindow {
    window.once('ready-to-show', () => show(window))
    applyWindowMaterial(window, runtime.preferences)
    if (primary) {
@@ -149,11 +190,14 @@ index 5e555fadb3..ac0e4467c9 100644
 +    trackMainWindowGeometry(window)
      window.webContents.on('before-input-event', (event, input) => {
        if (input.type === 'keyDown' && input.key === ',' && (input.control || input.meta) && !input.alt) { event.preventDefault(); openControls() }
++      applyZoomShortcut(event, window.webContents, input)
      })
-@@ -1238,6 +1335,9 @@ app.on('before-quit', event => {
-   event.preventDefault()
-   quitting = true
+     window.on('close', event => {
+       if (!quitting && runtime.preferences.closeToTray && native.available) { event.preventDefault(); window.hide() }
+@@ -1272,6 +1411,9 @@ app.on('before-quit', event => {
    rendererRecovery?.stop()
+   // Pending evidence lands now; a Host that dies of OOM while stopping is written at once.
+   runtime.memory.stop()
 +  // Windows are hidden below without emitting `close`, so flush the pending
 +  // geometry write here instead of losing the last move.
 +  flushMainWindowGeometry?.()

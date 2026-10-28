@@ -1687,6 +1687,47 @@ $script:RuntimeLinePayloadFiles = @(
   'tests/primary-runtime.spec.ts'
 )
 
+# 迁移前必须确认「目标工作区从该模块 import 的符号，源文件都还导出」。
+# 上游会整条线重命名运行时 API：实测 rc.4 线把 desktopRuntimeTargets / prepareDesktopRuntime /
+# expectedDesktopVersion … 全量改成 nextRuntimeTargets / prepareNextRuntime / expectedNextVersion，
+# 并删掉了 prepareDesktopInterpreters。此时照抄进 stable 工作区，本地语法检查看不出来，
+# 一直要到 package:dir 里 node scripts/package-win.ts 才炸（SyntaxError: does not provide an
+# export named …），前面十几分钟的 AA 重发布 / market 构建全白跑。这里提前拒绝并说明原因。
+function Get-ModuleImportBindings {
+  param(
+    [Parameter(Mandatory = $true)][string]$WorkspaceDir,
+    [Parameter(Mandatory = $true)][string]$ModuleBase
+  )
+  $bindings = [System.Collections.Generic.HashSet[string]]::new()
+  $pattern = "import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+'[^']*$([regex]::Escape($ModuleBase))\.ts'"
+  foreach ($file in @(Get-ChildItem -LiteralPath $WorkspaceDir -Recurse -File -Filter '*.ts' -ErrorAction SilentlyContinue)) {
+    if ($file.FullName -match '[\\/](node_modules|lib|dist)[\\/]') { continue }
+    $text = Get-Content -LiteralPath $file.FullName -Raw
+    foreach ($m in [regex]::Matches($text, $pattern)) {
+      foreach ($token in ($m.Groups[1].Value -split ',')) {
+        $name = ($token -replace '^\s*type\s+', '' -replace '\s+as\s+[\s\S]*$', '').Trim()
+        if ($name) { [void]$bindings.Add($name) }
+      }
+    }
+  }
+  return ,$bindings
+}
+
+function Get-ModuleExportNames {
+  param([Parameter(Mandatory = $true)][string]$File)
+  $names = [System.Collections.Generic.HashSet[string]]::new()
+  $text = Get-Content -LiteralPath $File -Raw
+  $decl = '(?m)^export\s+(?:declare\s+)?(?:async\s+)?(?:function|const|let|var|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)'
+  foreach ($m in [regex]::Matches($text, $decl)) { [void]$names.Add($m.Groups[1].Value) }
+  foreach ($m in [regex]::Matches($text, '(?m)^export\s+(?:type\s+)?\{([^}]*)\}')) {
+    foreach ($token in ($m.Groups[1].Value -split ',')) {
+      $name = ($token -replace '^\s*type\s+', '' -replace '\s+as\s+[\s\S]*$', '').Trim()
+      if ($name) { [void]$names.Add($name) }
+    }
+  }
+  return ,$names
+}
+
 function Set-RuntimeLineMigration {
   param(
     [Parameter(Mandatory = $true)][string]$Version,
@@ -1712,6 +1753,20 @@ function Set-RuntimeLineMigration {
     $srcHash = (Get-FileHash -LiteralPath $srcFile -Algorithm SHA256).Hash
     $dstHash = (Get-FileHash -LiteralPath $dstFile -Algorithm SHA256).Hash
     if ($srcHash -eq $dstHash) { continue }
+    if ($rel -like 'scripts/*') {
+      $moduleBase = [IO.Path]::GetFileNameWithoutExtension($rel)
+      $needed = Get-ModuleImportBindings -WorkspaceDir (Join-Path $script:Src $script:ChannelWsName) -ModuleBase $moduleBase
+      if ($needed.Count -gt 0) {
+        $exported = Get-ModuleExportNames -File $srcFile
+        $lost = @($needed | Where-Object { -not $exported.Contains($_) } | Sort-Object)
+        if ($lost.Count -gt 0) {
+          throw ("运行时载荷层迁移被拒绝：$($Sibling.Name) 的 $rel（dsh $Version 线）已不再导出 $($lost -join '、')，" +
+            "而 $($script:ChannelWsName) 的脚本仍在 import 这些符号 —— 两条 harness 线的运行时 API 已分叉。" +
+            "把 $($script:ChannelWsName) 跨线固定到 $Version 需要上游先把该工作区迁到该线，本脚本不做源码级移植。" +
+            "请改用本通道所属的 harness 线：不带 -HarnessVersion，或显式指定该通道 upstream.json 里的 sourceVersion。")
+        }
+      }
+    }
     Copy-Item -LiteralPath $srcFile -Destination $dstFile -Force
     $migrated += $rel
   }
@@ -2779,12 +2834,68 @@ function Install-Workspace {
   }
 }
 
+# 打包/发布脚本会走外网（AA 仓库 ls-remote、electron 二进制、registry）。实测本机代理偶发
+# `schannel: failed to receive handshake, SSL/TLS connection failed`：一次抖动就让十几分钟的
+# 打包整体失败，而失败行只落进控制台、日志里仅剩 PowerShell 的「以非零退出代码结束」，
+# 事后无从判断是代码问题还是网络问题。这里认几个典型特征，只为给出「重跑即可」的提示，
+# 不自动重试 —— 打包大半程重跑一遍（AA 重发布、asar 组装）代价远高于让人手动再跑一次。
+$script:TransientNetworkSignatures = @(
+  'schannel', 'SSL/TLS', 'TLS handshake', 'failed to receive handshake',
+  'unable to access', 'Could not resolve host', 'Temporary failure in name resolution',
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'EPROTO',
+  'Connection reset', 'The remote end hung up', 'RPC failed', 'early EOF',
+  'socket hang up', 'getaddrinfo', 'network timeout', 'request to https://'
+)
+
+function Get-TransientNetworkHint {
+  param([string[]]$Lines)
+  foreach ($line in $Lines) {
+    if (-not $line) { continue }
+    foreach ($signature in $script:TransientNetworkSignatures) {
+      if ($line.IndexOf($signature, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $signature }
+    }
+  }
+  return $null
+}
+
 function Invoke-YarnScript {
   # 执行根脚本（如 package:dir / dist:win）
-  param([Parameter(Mandatory)][string]$ScriptName)
+  param(
+    [Parameter(Mandatory)][string]$ScriptName,
+    # 打包类脚本：把 yarn 的原始输出同时写进日志（否则失败原因只存在于控制台）
+    [switch]$Capture
+  )
   Push-Location $script:Src
   try {
-    Invoke-Yarn @($ScriptName)
+    if (-not $Capture) {
+      Invoke-Yarn @($ScriptName)
+      return
+    }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $prevEap = $ErrorActionPreference
+    $prevNative = $PSNativeCommandUseErrorActionPreference
+    # 逐行转发：不缓冲到结束，长任务仍能实时看到进度；同时 stderr 不再被 Stop 策略打断。
+    $ErrorActionPreference = 'Continue'
+    $PSNativeCommandUseErrorActionPreference = $false
+    try {
+      & $script:YarnCmd.FileName @($script:YarnCmd.Prefix + @($ScriptName)) 2>&1 | ForEach-Object {
+        $text = if ($null -eq $_) { '' } else { [string]$_ }
+        $lines.Add($text)
+        Write-Host $text
+        Write-Log $text
+      }
+      $code = $LASTEXITCODE
+    } finally {
+      $ErrorActionPreference = $prevEap
+      $PSNativeCommandUseErrorActionPreference = $prevNative
+    }
+    if ($code -ne 0) {
+      $hint = Get-TransientNetworkHint -Lines $lines.ToArray()
+      if ($hint) {
+        Write-WarnLine "yarn $ScriptName 的失败行命中瞬时网络错误特征「$hint」—— 这类抖动与本仓库代码无关，直接重跑同一条命令通常即可。"
+      }
+      throw "yarn $ScriptName 失败 (exit $code)"
+    }
   } finally {
     Pop-Location
   }
@@ -3112,7 +3223,8 @@ try {
         Prepare-PackagingEnvironment
       }
       Clear-ReadOnlyAssets
-      Invoke-Step "执行 yarn $yarnScript" { Invoke-YarnScript $yarnScript }
+      # dev / start 要保留交互式 TTY，故只在打包类目标上接管输出
+      Invoke-Step "执行 yarn $yarnScript" { Invoke-YarnScript $yarnScript -Capture:(-not $graphical) }
     }
   }
 
