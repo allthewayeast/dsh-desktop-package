@@ -69,6 +69,26 @@ describe('applyDesktopStartupConfig', () => {
     ])
   })
 
+  it('applies the controlled Web-access names alongside DSH_HOME', () => {
+    const path = configPath()
+    writeFileSync(path, JSON.stringify({
+      version: 1,
+      env: {
+        DSH_NEXT_WEB_HOST: '0.0.0.0',
+        DSH_WEB_TOKEN: 'FixedToken_1234567890',
+        DSH_WEB_TRUSTED_HOSTS: '["192.168.1.9","139.9.73.189"]',
+      },
+    }))
+
+    const result = applyDesktopStartupConfig({ configPath: path, environment: {} })
+
+    expect(result.envUpdates).toEqual([
+      ['DSH_NEXT_WEB_HOST', '0.0.0.0'],
+      ['DSH_WEB_TOKEN', 'FixedToken_1234567890'],
+      ['DSH_WEB_TRUSTED_HOSTS', '["192.168.1.9","139.9.73.189"]'],
+    ])
+  })
+
   it('omits env entries already present in the environment', () => {
     const path = configPath()
     writeFileSync(path, JSON.stringify({

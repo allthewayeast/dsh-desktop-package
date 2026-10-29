@@ -69,6 +69,18 @@ describe('applyDesktopStartupConfig', () => {
     ])
   })
 
+  it('applies the fixed Web launch token', () => {
+    const path = configPath()
+    writeFileSync(path, JSON.stringify({
+      version: 1,
+      env: { DSH_WEB_TOKEN: 'FixedToken_1234567890' },
+    }))
+
+    const result = applyDesktopStartupConfig({ configPath: path, environment: {} })
+
+    expect(result.envUpdates).toEqual([['DSH_WEB_TOKEN', 'FixedToken_1234567890']])
+  })
+
   it('omits env entries already present in the environment', () => {
     const path = configPath()
     writeFileSync(path, JSON.stringify({

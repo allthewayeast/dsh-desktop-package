@@ -106,6 +106,23 @@
   保留 Electron 官方 zip 的 1980-01-01 时间戳（可复现构建行为）。
   默认关闭：打包后会把 dist\win-unpacked 内文件时间戳规整为当前时间。
 
+.PARAMETER FixedTokenPatch
+  【补丁开关，不是值】把「启动 token 可由外部定住」这个能力编进产物：
+  给 dsh-client-connection 的产物加一条 config.launchToken ?? $env:DSH_WEB_TOKEN 的来源链。
+  **不给这个开关就不打补丁**，token 仍是每次启动随机（上游行为）。
+
+  打了之后 token 从哪来？**不在编译参数里**，写进 exe 同级的 startup.json：
+      { "version": 1, "env": { "DSH_WEB_TOKEN": "<至少 16 位，A-Za-z0-9_- >" } }
+  也可以直接用同名环境变量（优先级高于文件）。换 token 重启即可，不必重编。
+
+  **必须同时指定 -Overlay**：startup.json 的读取点是覆盖层补进去的（overlay\src\startup-config.ts），
+  上游原样构建里没有这个集成点，写进去也没人读 —— 所以组合不成立时直接报错，不会静默失效。
+
+  为什么 stable 没有「监听所有网卡」补丁：DesktopWebServer 不支持绑定非回环地址 ——
+  dsh-plugin-desktop 的 desktopWebServerHost() 恒返回 127.0.0.1，webserver.ts 与 index.ts
+  两处都按这个值断言，对外暴露只能走它自带的局域网 HTTPS 入口（networkExposure=lan）。
+  想真正控制监听地址，请用 build-next.ps1 的 -ListenAllInterfacesPatch。
+
 .EXAMPLE
   .\build.ps1
   .\build.ps1 -Target package-dir              # 解包打包（无覆盖层）
@@ -113,6 +130,7 @@
   .\build.ps1 -Overlay -Target package-dir -ElectronVersion 45.0.0   # 临时换 Electron 版本
   .\build.ps1 -Overlay -Target package-dir -PnpmVersion 11.28.5       # 临时换 pnpm 版本（需 overlay\pnpm\pnpm@11.28.5.patch）
   .\build.ps1 -Target package-dir -HarnessVersion 0.2.1-alpha.1   # 换 dsh 运行时版本（commit 由标签 dsh-v0.2.1-alpha.1 解析）
+  .\build.ps1 -Overlay -Target package-dir -FixedTokenPatch   # 打固定 Token 补丁（值另写 startup.json）
   .\build.ps1 -Target build                    # 编译
   .\build.ps1 -Target dist-win-portable
   .\build.ps1 -Target dist-win -Proxy http://127.0.0.1:7890
@@ -179,7 +197,14 @@ param(
   # 语义与 -ElectronVersion 一致；差别在于 pnpm 的补丁 resolution 键是版本化的，
   # 换版本必须同时重指，否则补丁静默失效 —— 详见 Set-PnpmOverride。
   [ValidatePattern('^(?:\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?)?$')]
-  [string]$PnpmVersion = ''
+  [string]$PnpmVersion = '',
+
+  # 【补丁开关，不是值】把「启动 token 可由外部定住」编进产物：
+  # 给 dsh-client-connection 的产物加一条 config.launchToken ?? $env:DSH_WEB_TOKEN 的来源链。
+  # 不给就不打补丁，token 仍是每次启动随机（上游行为）。
+  # 值不在编译参数里 —— 写进 exe 同级的 startup.json 的 env.DSH_WEB_TOKEN（≥16 位、[A-Za-z0-9_-]）。
+  # 必须同时给 -Overlay：startup.json 的读取点是覆盖层补进去的。
+  [switch]$FixedTokenPatch
 )
 
 Set-StrictMode -Version Latest
@@ -277,6 +302,20 @@ $script:DisableNext = $true
 # 再像旧版本那样无条件把它改写成历史提交 a022d928（0.1.5-rc.2 时代的产物）会让校验
 # 直接失败。保留该值仅供自洽性检查失败时回落使用。
 $script:AaSourceRef = 'a022d9286dd025bb4ae9f77b59cc2b7581f78b34'
+
+# ---------------- 固定 Token 补丁（-FixedTokenPatch）----------------
+# 只有产物侧那一半：tools\dsh-web-access.ps1 的 token 组，让 connection 插件按
+# config.launchToken ?? $env:DSH_WEB_TOKEN ?? "" 取 token（空串仍回落随机）。
+# 值本身**不在编译里** —— 写进产物 exe 同级的 startup.json（overlay\src\startup-config.ts
+# 已放行该名字），运行期改文件即可换 token，不必重编。
+# 监听地址不在本脚本范围内：stable 的 DesktopWebServer 恒绑回环，见 .PARAMETER FixedTokenPatch。
+$script:WebAccessModule = Join-Path $script:Root 'tools\dsh-web-access.ps1'
+if (-not (Test-Path -LiteralPath $script:WebAccessModule)) {
+  throw "缺少补丁模块：$script:WebAccessModule"
+}
+. $script:WebAccessModule
+$script:TokenPatchActive = [bool]$FixedTokenPatch
+$script:WebAccessActive = $script:TokenPatchActive
 
 # ---- src 覆盖层（用户自定义源码改动，-Overlay 时自动生效）----
 # 覆盖层目录（包根 overlay\，不属于 dsh-desktop 仓库，pull 不受影响）：
@@ -2575,6 +2614,26 @@ function Invoke-ChannelOverlayPostInstall {
   Set-DshFsLocalBigintPatch
 }
 
+# ---------------- 固定 Token 的运行时补丁 ----------------
+
+<#
+  给 stable 工作区（以及任何装了同一批运行时的 node_modules）打 **token 组**补丁。
+  stable 不做「监听所有网卡」，所以这里固定 -Groups token，只动 client-connection。
+  改了哪些行、怎么自愈，全在 tools\dsh-web-access.ps1。
+#>
+function Invoke-WebAccessPatch {
+  $roots = @(Find-DshWebAccessRoots -SearchRoot $script:Src)
+  if ($roots.Count -eq 0) {
+    throw "没找到可打补丁的 @deepseek-ai 包根（期望 <工作区>\node_modules\@deepseek-ai 下有 dsh-client-connection / dsh-host-webserver / dsh-web-app）。依赖装了吗？"
+  }
+  foreach ($root in $roots) {
+    $result = Invoke-DshWebAccessPatch -PackagesRoot $root -Groups 'token'
+    foreach ($line in $result.Messages) { Write-Info $line }
+    foreach ($file in $result.Written) { Write-Ok "运行时补丁：$file" }
+  }
+  Write-Ok "固定 Token 的运行时补丁已就位（$($roots.Count) 处 node_modules）"
+}
+
 # ---- 覆盖层产物部署与核对（打包后执行）----
 # 打进去的 startup-config.ts 会在启动时读 dirname(process.execPath)\startup.json；
 # 文件缺失时 applyDesktopStartupConfig 静默返回“无配置”——app 照常启动但定制不生效。
@@ -2592,29 +2651,34 @@ function Publish-OverlayRuntimeAssets {
   # overlay\startup.json → 产物 exe 同级目录（启动配置的唯一来源）
   if (-not $script:SrcOverlayDir) { return }
   $src = Join-Path $script:SrcOverlayDir 'startup.json'
-  if (-not (Test-Path -LiteralPath $src)) {
+  $exeDir = Get-PackagedExeDir
+  $hasTemplate = Test-Path -LiteralPath $src
+  if (-not $hasTemplate) {
     Write-WarnLine "覆盖层：未找到 $src，跳过 startup.json 部署（产物不会带启动配置）。"
     return
   }
-  $exeDir = Get-PackagedExeDir
   if (-not $exeDir) {
     Write-WarnLine '覆盖层：未找到 dist\win-unpacked，跳过 startup.json 部署。'
     return
   }
-  # 配置写错会让 app 直接启动失败（applyDesktopStartupConfig 抛错），构建期先拦一道。
-  # 这里只做结构自检；bootstrap 名单等语义校验仍在运行时（src\startup-config.ts）执行。
-  try {
-    $parsed = [System.IO.File]::ReadAllText($src) | ConvertFrom-Json
-  } catch {
-    throw "覆盖层：overlay\startup.json 不是合法 JSON：$($_.Exception.Message)"
-  }
-  if ($parsed.version -ne 1) {
-    throw "覆盖层：overlay\startup.json 的 version 必须为 1（实际为 $($parsed.version)）。"
+  if ($hasTemplate) {
+    # 配置写错会让 app 直接启动失败（applyDesktopStartupConfig 抛错），构建期先拦一道。
+    # 这里只做结构自检；bootstrap 名单等语义校验仍在运行时（src\startup-config.ts）执行。
+    try {
+      $parsed = [System.IO.File]::ReadAllText($src) | ConvertFrom-Json
+    } catch {
+      throw "覆盖层：overlay\startup.json 不是合法 JSON：$($_.Exception.Message)"
+    }
+    if ($parsed.version -ne 1) {
+      throw "覆盖层：overlay\startup.json 的 version 必须为 1（实际为 $($parsed.version)）。"
+    }
   }
   $dst = Join-Path $exeDir 'startup.json'
-  Copy-Item -LiteralPath $src -Destination $dst -Force
-  try { [System.IO.File]::SetAttributes($dst, [System.IO.FileAttributes]::Normal) } catch {}
-  Write-Ok "覆盖层：startup.json 已部署到 $dst"
+  if ($hasTemplate) {
+    Copy-Item -LiteralPath $src -Destination $dst -Force
+    try { [System.IO.File]::SetAttributes($dst, [System.IO.FileAttributes]::Normal) } catch {}
+    Write-Ok "覆盖层：startup.json 已部署到 $dst（模板原样拷贝，不写 token）"
+  }
 }
 
 function Test-BinaryContainsAscii {
@@ -2699,6 +2763,32 @@ function Assert-OverlayArtifacts {
     $where = if (Test-Path -LiteralPath $asar) { 'app.asar' } elseif (Test-Path -LiteralPath $unpackedApp) { 'resources\app' } else { 'resources（既无 app.asar 也无 app\）' }
     $rows.Add([pscustomobject]@{ 项目 = '补丁代码'; 结果 = '缺失'; 说明 = "$where 中未找到 startup-config 集成点" })
     $missing.Add('补丁代码（startup-config 集成点）')
+  }
+
+  # 3b) 运行时补丁：启动 token 的解析链（tools\dsh-web-access.ps1 改的 dsh-client-connection）
+  #     必须真的进了产物 —— 否则 startup.json 里写了 DSH_WEB_TOKEN 也没人读，token 仍是随机。
+  $tokenNeedle = 'DSH_WEB_TOKEN'
+  $tokenPatchFound = $null
+  if (Test-Path -LiteralPath $asar) {
+    if (Test-BinaryContainsAscii -Path $asar -Needle $tokenNeedle) {
+      $tokenPatchFound = 'token 解析链已打包（app.asar）'
+    }
+  }
+  if (-not $tokenPatchFound -and (Test-Path -LiteralPath $unpackedApp)) {
+    $hit = @(Get-ChildItem -LiteralPath $unpackedApp -Recurse -File -Include '*.js', '*.mjs', '*.cjs' -ErrorAction SilentlyContinue |
+      Select-String -Pattern $tokenNeedle -SimpleMatch -List -ErrorAction SilentlyContinue)
+    if ($hit.Count -gt 0) {
+      $tokenPatchFound = "token 解析链已打包（$($hit[0].Path.Substring($exeDir.Length).TrimStart('\'))）"
+    }
+  }
+  if ($tokenPatchFound) {
+    $rows.Add([pscustomobject]@{ 项目 = '运行时补丁'; 结果 = 'OK'; 说明 = $tokenPatchFound })
+  } elseif ($script:TokenPatchActive) {
+    # 只在真的要求固定 token 时才当失败：默认构建不该被这件事拦住。
+    $rows.Add([pscustomobject]@{ 项目 = '运行时补丁'; 结果 = '缺失'; 说明 = '未找到 DSH_WEB_TOKEN，-FixedTokenPatch 打的东西不在产物里' })
+    $missing.Add('运行时补丁（DSH_WEB_TOKEN 解析链）')
+  } else {
+    $rows.Add([pscustomobject]@{ 项目 = '运行时补丁'; 结果 = '跳过'; 说明 = '未给 -FixedTokenPatch' })
   }
 
   # 4) 图标资源：ASAR 启用时解包到 app.asar.unpacked\build；禁用 ASAR 时直接在
@@ -3101,6 +3191,15 @@ try {
   }
 
   Initialize-Log
+  # -FixedTokenPatch 依赖覆盖层：startup.json 是被 overlay\src\startup-config.ts 读进来的，
+  # 不带 -Overlay 的构建里根本没有这个集成点，写了也没人读 —— 所以直接拦下，别让人以为生效了。
+  if ($script:TokenPatchActive) {
+    if (-not $Overlay) {
+      throw "-FixedTokenPatch 需要同时指定 -Overlay：固定 token 走的是覆盖层的 startup.json 集成点，上游原样构建不读这个文件。"
+    }
+    Write-Info 'Fixed Token 补丁：将给 dsh-client-connection 加 DSH_WEB_TOKEN 解析链'
+    Write-Info '  → token 值不在编译里，构建后写进 exe 同级 startup.json 的 env.DSH_WEB_TOKEN（≥16 位、[A-Za-z0-9_-]）'
+  }
   Invoke-Step '获取 / 更新 dsh-desktop 源码' { Ensure-Source }
   Invoke-Step '解析 deepseek-harness 运行时版本（-HarnessVersion / 上游声明）' { Resolve-HarnessVersion }
   Invoke-Step "固定运行时版本（deepseek-harness $($script:ResolvedRuntimeVersion)）" { Set-RuntimeVersionPinned }
@@ -3160,6 +3259,18 @@ try {
 
   if ($Overlay) {
     Invoke-Step '重应用 pnpm 补丁（install 后）' { Invoke-ChannelOverlayPostInstall }
+  }
+
+  # 固定 Token 的运行时补丁：install 之后、编译/打包之前（payload 里的 node_modules
+  # 是打包时从这棵树拷过去的）。
+  # ⚠️ 默认**不打**：只有给了 -FixedTokenPatch 才应用。
+  #    不给开关时产物必须与上游一致 —— 补丁只加了「读 DSH_WEB_TOKEN」这一个分支，
+  #    没打算用就别让它出现在产物里，省得日后排查「这段代码是哪来的」。
+  #    -FixedTokenPatch 已在上游强制要求 -Overlay，所以条件里不必再写 $Overlay。
+  if ($script:TokenPatchActive) {
+    Invoke-Step '应用运行时补丁（固定 Token）' { Invoke-WebAccessPatch }
+  } else {
+    Write-Info '未给 -FixedTokenPatch：跳过运行时补丁（产物保持上游的随机 token 行为）'
   }
 
   if ($Upstream) {

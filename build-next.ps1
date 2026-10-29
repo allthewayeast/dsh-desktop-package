@@ -84,11 +84,48 @@
 .PARAMETER KeepGoing
   出错继续，最后汇总。
 
+.PARAMETER FixedTokenPatch
+  【补丁开关，不是值】把「启动 token 可由外部定住」这个能力编进产物：
+  给 dsh-client-connection 的产物加一条 config.launchToken ?? $env:DSH_WEB_TOKEN 的来源链。
+  **不给这个开关就不打补丁**，token 仍是每次启动随机（上游行为）。
+
+  打了之后 token 从哪来？**不在编译参数里**，写进 exe 同级的 startup.json：
+      { "version": 1, "env": { "DSH_WEB_TOKEN": "<至少 16 位，A-Za-z0-9_- >" } }
+  也可以直接用同名环境变量（优先级高于文件）。换 token 重启即可，不必重编。
+
+.PARAMETER ListenAllInterfacesPatch
+  【补丁开关，不是值】把「可以绑定 0.0.0.0（本机所有网卡）」这个能力编进产物，共两处：
+    · 运行时产物（tools\dsh-web-access.ps1 的 listen 组）：放行通配地址、通配绑定时的 URL
+      回落成回环、删掉 `dsh web --host` 的 CLI 守卫；
+    · 源码补丁（overlay-next\patches\index.ts.patch）：Host 把 webserver 的 host 从写死的
+      127.0.0.1 改成读 DSH_NEXT_WEB_HOST。
+  **不给这个开关就不打补丁**，产物仍只监听 127.0.0.1（上游行为）。
+
+  打了之后监听地址从哪来？同样写进 startup.json：
+      { "version": 1, "env": { "DSH_NEXT_WEB_HOST": "0.0.0.0" } }
+  通配绑定时 /api 围栏**不会**自动信任别的机器，每个要用的入口都得登记：
+      "DSH_WEB_TRUSTED_HOSTS": "[\"192.168.1.9\",\"139.9.73.189\"]"
+  格式与上游 DSH_NEXT_TRUSTED_HOSTS 一致：JSON 数组字符串（env 只能存字符串，所以要转义引号）；
+  也接受逗号分隔的 "192.168.1.9,139.9.73.189"，两种都认。格式写错会启动报错，不会静默放过。
+  （172.16/192.168 这类局域网地址由桌面自己采样，公网/NAT 地址必须显式给。）
+
+  ⚠️ 别在这里写具体网卡 IP：真正的单网卡绑定会打断主窗口 —— main.ts 的 WebSocket 桥把目标
+  钉在 127.0.0.1，单网卡绑定后回环不再监听，窗口立刻连不上。要「只有某个地址能访问」，
+  用 0.0.0.0 + DSH_WEB_TRUSTED_HOSTS 收窄围栏。
+
+  别名为 -ListenAllInterfacesPatch / -WildcardListenPatch（语义更准确：监听所有**网卡**，
+  不是「所有网段」）。
+
+  注意：外部浏览器要能打开，还必须在 DSH NEXT 设置里勾选「允许在浏览器中打开」
+  （browserAccess；它是 Desktop 自己的门，与 token 无关）。
+
 .EXAMPLE
   pwsh -File .\build-next.ps1
   pwsh -File .\build-next.ps1 -Target package-dir -SkipSubmodule -ElectronVersion 44.4.5
   pwsh -File .\build-next.ps1 -HarnessVersion 0.2.1-rc.2 -PnpmVersion 11.28.5
   pwsh -File .\build-next.ps1 -Preview -ElectronVersion 44.9.2 -PnpmVersion 11.28.5
+  pwsh -File .\build-next.ps1 -FixedTokenPatch -ListenAllInterfacesPatch
+  # ↑ 只决定「打不打补丁」；IP / Token 另写到 exe 同级的 startup.json（见上）
 #>
 [CmdletBinding()]
 param(
@@ -116,7 +153,14 @@ param(
   [string]$HarnessCommit = '',
 
   [ValidatePattern('^(?:\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.\-]+)?)?$')]
-  [string]$PnpmVersion = ''
+  [string]$PnpmVersion = '',
+
+  # --- 可控 Web 入口的两个**补丁开关**（不是值！）---
+  # 只决定「要不要把这段代码能力编进产物」；IP / Token 写在 exe 同级的 startup.json 里，
+  # 与编译无关，换值不必重编。两个开关都不给 = 产物与上游完全一致。
+  [switch]$FixedTokenPatch,
+  [Alias('ListenAllInterfacesPatch', 'WildcardListenPatch')]
+  [switch]$ListenAllInterfacesPatch
 )
 
 $ErrorActionPreference = 'Stop'
@@ -132,6 +176,34 @@ $script:SrcBranch = 'master'
 # 通道工作区（next 自己的目录名）
 $script:WsName = 'dsh-desktop-next'
 $script:WsDir = Join-Path $script:Src $script:WsName
+
+# ---------------- 可控 Web 入口（两个补丁开关）----------------
+# 两个开关各管一件事，都只决定「代码能力编不编进产物」，**不承载任何值**：
+#
+#   -FixedTokenPatch        [token]  让启动 token 可以从外部定住
+#                                    改 dsh-client-connection 产物：config.launchToken ?? $env:DSH_WEB_TOKEN
+#   -ListenAllInterfacesPatch  [listen] 允许绑定 0.0.0.0（本机所有网卡）
+#                                    改 dsh-host-webserver / dsh-web-app 产物（放行通配 + URL 回落环 + 删 CLI 守卫），
+#                                    外加 overlay-next\patches\index.ts.patch（Host 把 host 读成 DSH_NEXT_WEB_HOST）
+#
+# 值写在哪：exe 同级的 startup.json（或真实环境变量），**编译期不写死**，换 IP/Token 不必重编。
+# 详见 BUILD_GUIDE.md 的「远端访问」一节。
+#
+# ⚠️ 两个开关都不给时，一层补丁都不打，产物保持上游行为（只监听回环 + 每次启动随机 token）。
+#    唯一的例外是 startup-config 本身（overlay-next\src\startup-config.ts）：它是覆盖层的既有能力
+#    （读 exe 同级的 startup.json），始终生效；它只是「允许」这三个 DSH_* 键，不代表补丁打了。
+$script:WebAccessModule = Join-Path $script:Root 'tools\dsh-web-access.ps1'
+if (-not (Test-Path -LiteralPath $script:WebAccessModule)) {
+  throw "缺少补丁模块：$script:WebAccessModule"
+}
+. $script:WebAccessModule
+$script:TokenPatchActive = [bool]$FixedTokenPatch
+$script:ListenPatchActive = [bool]$ListenAllInterfacesPatch
+# 任意一组要打就跑运行时补丁；具体打哪组由 -Groups 决定。
+$script:WebAccessActive = $script:TokenPatchActive -or $script:ListenPatchActive
+$script:WebAccessGroups = @()
+if ($script:TokenPatchActive) { $script:WebAccessGroups += 'token' }
+if ($script:ListenPatchActive) { $script:WebAccessGroups += 'listen' }
 
 # 运行时：跟随上游（不再硬钉 0.1.7-rc.2）
 # next 的 dsh 运行时由上游决定，三处必须一致：next 工作区声明的 @deepseek-ai/dsh 版本、
@@ -210,6 +282,27 @@ $script:OverlayPatches = @(
   # 主窗口几何回归用例：main.ts 的窗口状态接线需要假 Electron 提供窗口几何 API
   # （isMaximized/maximize/getNormalBounds/screen），否则每个主窗口用例都会中断。
   'dsh-desktop-next/tests/main-lifecycle.spec.ts'
+  # 可控 Web 入口（监听地址 / Token）的第一半：Host 把 webserver 的 host 从写死的
+  # 127.0.0.1 改成读 DSH_NEXT_WEB_HOST，并把绑定地址/额外入口登记进 connection.trustedHosts。
+  # ⚠️ 补丁文件名由 basename 决定，所以是 index.ts.patch（指 src\host\index.ts）。
+  # 另一半是 tools\dsh-web-access.ps1 改的 @deepseek-ai 运行时产物，两半缺一不可。
+  'dsh-desktop-next/src/host/index.ts'
+)
+
+# 只应用、不自动导出的补丁目标（Export-Overlay 会跳过）：
+# host\index.ts 是上游高频改动点，且它的本地改动里可能混着别人的实验性修改 ——
+# 让它自动导出，一次误改就会把策展补丁覆盖成半成品。改它就手工重生成补丁。
+$script:OverlayPatchesApplyOnly = @(
+  'dsh-desktop-next/src/host/index.ts'
+)
+
+# 「监听所有网卡」补丁的**源码侧**那一半：只有给了 -ListenAllInterfacesPatch 才应用。
+#   host\index.ts 让 webserver 的 host 读 DSH_NEXT_WEB_HOST、并把绑定地址登记进 trustedHosts。
+#   另一半是 tools\dsh-web-access.ps1 的 listen 组（dsh-host-webserver / dsh-web-app 产物）——
+#   两半缺一不可：只改源码不改产物，通配地址仍会被上游守卫拒掉。
+#   （固定 Token 补丁只有产物那一半，不涉及工作区源码。）
+$script:OverlayPatchesRequireListenAllNetwork = @(
+  'dsh-desktop-next/src/host/index.ts'
 )
 # 二进制资源：把本仓库 build\ 里的托盘图标覆盖到 next 的 assets\。
 #   为什么必须走这一步：它们是 **git 跟踪文件**，[01]/[02] 拉源码时的 checkout --force 会把
@@ -251,9 +344,21 @@ $script:RequiredPayloadEntries = @(
   'node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html'
 )
 # 覆盖层专属断言：只有我们的补丁会引入这些字符串。
-#   lib/main.js 必须含 startup-config 的集成点（否则 exe 同级的 startup.json 不会被读）
+#   lib/main.js 必须含 startup-config 的集成点（否则 exe 同级的 startup.json 不会被读）；
+#   同一条目里的 DSH_WEB_TOKEN 来自 startup-config 的白名单字面量，与补丁无关、恒存在。
 $script:RequiredMarkers = @{
-  'lib/main.js' = 'applyDesktopStartupConfig'
+  'lib/main.js'                                                  = @('applyDesktopStartupConfig', 'DSH_WEB_TOKEN')
+}
+
+# 补丁专属断言：**只在该补丁被要求时才检查**。默认构建两个补丁都不打，产物里当然没有
+# 这些标记 —— 按组判断，避免「没要的东西却报缺失」把人拦在产物核对那一步。
+#   token  组：client-connection 产物里必须含 DSH_WEB_TOKEN（否则 startup.json 写了也只是随机值）
+#   listen 组：lib/host.js 必须含监听地址读取点（否则 DSH_NEXT_WEB_HOST 写了没人看）
+$script:RequiredMarkersWhenTokenPatch = @{
+  'node_modules/@deepseek-ai/dsh-client-connection/lib/index.js'  = 'DSH_WEB_TOKEN'
+}
+$script:RequiredMarkersWhenListenPatch = @{
+  'lib/host.js'                                                  = 'DSH_NEXT_WEB_HOST'
 }
 
 # ---------------- 日志 ----------------
@@ -301,6 +406,44 @@ function Invoke-Step {
 function Get-JsonObject {
   param([Parameter(Mandatory)][string]$Path)
   return (Get-Content -LiteralPath $Path -Raw -Encoding utf8 | ConvertFrom-Json)
+}
+
+# ---------------- 可控 Web 入口 ----------------
+
+<#
+  把两个开关翻译成「要打哪个组」，并把「补丁打完之后你还需要自己做什么」提前讲清楚。
+  放在最前面执行：让人在装依赖之前就知道这次构建会多出哪些代码能力。
+  参数本身没有值可校验（IP / Token 不在构建期），所以这里不抛错，只报告。
+#>
+function Resolve-WebAccessPlan {
+  if (-not $script:WebAccessActive) {
+    Write-Info '可控 Web 入口：两个补丁都不打（未给 -FixedTokenPatch / -ListenAllInterfacesPatch）'
+    Write-Info '  → 产物保持上游行为：只监听 127.0.0.1、启动 token 每次随机'
+    return
+  }
+  $parts = New-Object System.Collections.Generic.List[string]
+  if ($script:TokenPatchActive) { $parts.Add('- 固定 Token 补丁：代码会读 DSH_WEB_TOKEN') }
+  if ($script:ListenPatchActive) { $parts.Add('- 监听所有网卡补丁：代码会读 DSH_NEXT_WEB_HOST（0.0.0.0）') }
+  Write-Info ("可控 Web 入口（本次会打这些补丁）：`n  " + ($parts -join "`n  "))
+  Write-Info '  注意：补丁只管「代码认这些变量」，具体 IP / Token 要你自己写进 exe 同级的 startup.json'
+}
+
+<#
+  给 next 工作区（以及任何装了同一批运行时的 node_modules）打运行时补丁。
+  install 之后、编译/打包之前执行：payload 里的 node_modules 是打包时从这棵树拷过去的。
+  只打 $script:WebAccessGroups 里的组 —— 开关没给的组一行都不碰。
+#>
+function Invoke-WebAccessPatch {
+  $roots = @(Find-DshWebAccessRoots -SearchRoot $script:Src)
+  if ($roots.Count -eq 0) {
+    throw "没找到可打补丁的 @deepseek-ai 包根（期望 <工作区>\node_modules\@deepseek-ai 下有 dsh-client-connection / dsh-host-webserver / dsh-web-app）。依赖装了吗？"
+  }
+  foreach ($root in $roots) {
+    $result = Invoke-DshWebAccessPatch -PackagesRoot $root -Groups $script:WebAccessGroups
+    foreach ($line in $result.Messages) { Write-Info $line }
+    foreach ($file in $result.Written) { Write-Ok "运行时补丁：$file" }
+  }
+  Write-Ok ("可控 Web 入口的运行时补丁已就位（$($script:WebAccessGroups -join '、') · $($roots.Count) 处 node_modules）")
 }
 
 # ---------------- Git / 源码 ----------------
@@ -383,6 +526,10 @@ function Export-Overlay {
     $patchDir = Join-Path $script:OverlayDir 'patches'
     New-Item -ItemType Directory -Force -Path $patchDir | Out-Null
     foreach ($rel in $script:OverlayPatches) {
+      if ($script:OverlayPatchesApplyOnly -contains $rel) {
+        Write-Info "覆盖层：$rel 是只应用不导出的补丁，跳过导出"
+        continue
+      }
       $out = Join-Path $patchDir ("$([IO.Path]::GetFileName($rel)).patch")
       $tmp = "$out.tmp"
       # ⚠️ 必须让 git 自己把差异写成文件（--output）：把 git 的标准输出读进 PowerShell
@@ -442,6 +589,32 @@ function Apply-Overlay {
     # 2) 已跟踪文件的修改：git apply
     foreach ($rel in $script:OverlayPatches) {
       $patch = Join-Path (Join-Path $script:OverlayDir 'patches') ("$([IO.Path]::GetFileName($rel)).patch")
+
+      # 监听所有网卡补丁的源码侧：没给 -ListenAllInterfacesPatch 就不应用。
+      # 顺手撤掉上一轮可能残留的改动 —— 正常流程里 Update-SourceRepository 的
+      # `git checkout --force` 会清干净，但 -SkipPull 复用旧工作区时它不会跑。
+      if ($script:OverlayPatchesRequireListenAllNetwork -contains $rel -and -not $script:ListenPatchActive) {
+        if (Test-Path -LiteralPath $patch) {
+          $prevNative = $PSNativeCommandUseErrorActionPreference
+          $PSNativeCommandUseErrorActionPreference = $false
+          try {
+            & git apply --reverse --check $patch 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              & git apply --reverse $patch 2>$null
+              if ($LASTEXITCODE -eq 0) {
+                Write-WarnLine "覆盖层：未给 -ListenAllInterfacesPatch，已撤销 $rel 上残留的补丁"
+              } else {
+                Write-WarnLine "覆盖层：撤销 $rel 的残留补丁失败（工作区可能有别的改动），请手工确认"
+              }
+            }
+          } finally {
+            $PSNativeCommandUseErrorActionPreference = $prevNative
+          }
+        }
+        Write-Info "覆盖层：未给 -ListenAllInterfacesPatch，跳过 $rel（监听所有网卡的 Host 补丁）"
+        continue
+      }
+
       if (-not (Test-Path -LiteralPath $patch)) {
         Write-WarnLine "覆盖层：无补丁文件 $(Split-Path -Leaf $patch)，跳过 $rel"
         continue
@@ -1545,13 +1718,19 @@ function Get-PackagedDir {
 
 function Publish-OverlayRuntimeAssets {
   # startup.json 必须落在 exe 同级，应用才会读到。
+  # ⚠️ 这里只**原样拷贝模板**，不写任何 IP / Token —— 补丁开关不承载值，
+  #    要固定地址或 token 请自己编辑 overlay-next\startup.json（构建时带过去）
+  #    或直接改部署出去的那一份（换值不必重编）。
   $exeDir = Get-PackagedDir
   if (-not $exeDir) { Write-WarnLine '未找到打包目录，跳过 startup.json 部署。'; return }
-  $src = Join-Path $script:OverlayDir 'startup.json'
-  if (-not (Test-Path -LiteralPath $src)) { Write-Info '覆盖层无 startup.json，跳过部署。'; return }
   $dst = Join-Path $exeDir 'startup.json'
+  $src = Join-Path $script:OverlayDir 'startup.json'
+  if (-not (Test-Path -LiteralPath $src)) {
+    Write-Info '覆盖层无 startup.json 模板，跳过部署。'
+    return
+  }
   Copy-Item -LiteralPath $src -Destination $dst -Force
-  Write-Ok "startup.json 已部署到 $dst"
+  Write-Ok "startup.json 已部署到 $dst（模板原样拷贝）"
 }
 
 function Get-ArchiveHelper {
@@ -1700,22 +1879,52 @@ function Assert-OverlayArtifacts {
       if (-not $present) { $missing.Add("负载条目 $item") }
     }
 
-    # 3b) 覆盖层集成点必须真的打进去了
+    # 3b) 覆盖层集成点必须真的打进去了。
+    #     两类标记：常态要求的（startup-config 集成点），以及可控 Web 入口专属的 ——
+    #     后者只在给了 -FixedTokenPatch / -ListenAllNetworkPatch 的构建里才要求，默认构建
+    #     没打那两个补丁，自然没有这些字符串，不该在这里报缺失。
+    $markerChecks = New-Object System.Collections.Generic.List[object]
     foreach ($entry in $script:RequiredMarkers.Keys) {
-      $marker = $script:RequiredMarkers[$entry]
+      # 一个条目可以有多个标记（同一个文件里要同时验两处，例如 startup-config 的集成点
+      # 与它放行的 DSH_* 白名单）。
+      foreach ($marker in @($script:RequiredMarkers[$entry])) {
+        $markerChecks.Add([pscustomobject]@{ Entry = $entry; Marker = $marker; Requires = '' })
+      }
+    }
+    foreach ($entry in $script:RequiredMarkersWhenTokenPatch.Keys) {
+      foreach ($marker in @($script:RequiredMarkersWhenTokenPatch[$entry])) {
+        $markerChecks.Add([pscustomobject]@{ Entry = $entry; Marker = $marker; Requires = 'token' })
+      }
+    }
+    foreach ($entry in $script:RequiredMarkersWhenListenPatch.Keys) {
+      foreach ($marker in @($script:RequiredMarkersWhenListenPatch[$entry])) {
+        $markerChecks.Add([pscustomobject]@{ Entry = $entry; Marker = $marker; Requires = 'listen' })
+      }
+    }
+    foreach ($chk in $markerChecks) {
+      $required = switch ($chk.Requires) {
+        'token'  { $script:TokenPatchActive }
+        'listen' { $script:ListenPatchActive }
+        default  { $true }
+      }
+      if (-not $required) {
+        $which = if ($chk.Requires -eq 'token') { '-FixedTokenPatch' } else { '-ListenAllInterfacesPatch' }
+        $rows.Add([pscustomobject]@{ 项目 = "补丁代码 ($($chk.Entry))"; 结果 = '跳过'; 说明 = "未给 $which，该补丁未打" })
+        continue
+      }
       $found = $false
       if ($useArchive) {
-        $snippet = Get-ArchiveFileText $archive $entry
-        $found = ($null -ne $snippet) -and $snippet.Contains($marker)
+        $snippet = Get-ArchiveFileText $archive $chk.Entry
+        $found = ($null -ne $snippet) -and $snippet.Contains($chk.Marker)
       } else {
-        $target = Join-Path $plain ($entry -replace '/', '\')
-        $found = (Test-Path -LiteralPath $target) -and ((Select-String -Path $target -Pattern $marker -List -ErrorAction SilentlyContinue) -ne $null)
+        $target = Join-Path $plain ($chk.Entry -replace '/', '\')
+        $found = (Test-Path -LiteralPath $target) -and ((Select-String -Path $target -Pattern $chk.Marker -SimpleMatch -List -ErrorAction SilentlyContinue) -ne $null)
       }
       if ($found) {
-        $rows.Add([pscustomobject]@{ 项目 = "补丁代码 ($entry)"; 结果 = 'OK'; 说明 = "$marker 已打包（$layoutName）" })
+        $rows.Add([pscustomobject]@{ 项目 = "补丁代码 ($($chk.Entry))"; 结果 = 'OK'; 说明 = "$($chk.Marker) 已打包（$layoutName）" })
       } else {
-        $rows.Add([pscustomobject]@{ 项目 = "补丁代码 ($entry)"; 结果 = '缺失'; 说明 = "$layoutName 的 $entry 中没有 $marker" })
-        $missing.Add("补丁代码（$entry 的 $marker）")
+        $rows.Add([pscustomobject]@{ 项目 = "补丁代码 ($($chk.Entry))"; 结果 = '缺失'; 说明 = "$layoutName 的 $($chk.Entry) 中没有 $($chk.Marker)" })
+        $missing.Add("补丁代码（$($chk.Entry) 的 $($chk.Marker)）")
       }
     }
   }
@@ -1803,6 +2012,9 @@ preview : $($Preview.IsPresent)
   }
   Write-Info "日志: $script:LogPath"
 
+  # 补丁开关的处理放在这里：让人在装依赖之前就看到「这次会多出哪些代码能力」。
+  Resolve-WebAccessPlan
+
   if (-not (Test-Path -LiteralPath (Join-Path $script:Src '.git'))) {
     throw "未找到 $script:Src（或缺少 .git）。请先运行一次 stable 的构建以完成克隆。"
   }
@@ -1876,6 +2088,16 @@ preview : $($Preview.IsPresent)
     }
   }
 
+  # 运行时补丁必须在「编译/打包」之前：payload 里的 node_modules 是打包时从这棵树拷的，
+  # 打完包再改就只改到磁盘上的产物、下次 install 还会还原。
+  # ⚠️ 默认**不打**：只有给了 -FixedTokenPatch / -ListenAllInterfacesPatch 才应用。
+  #    不给开关时产物保持上游行为（回环 + 每次随机 token），运行时补丁不该出现在产物里。
+  if ($script:WebAccessActive) {
+    Invoke-Step "应用运行时补丁（$($script:WebAccessGroups -join ' / ')）" { Invoke-WebAccessPatch }
+  } else {
+    Write-Info '未给 -FixedTokenPatch/-ListenAllInterfacesPatch：跳过运行时补丁（产物保持上游的回环 + 随机 token 行为）'
+  }
+
   if (-not $env:ELECTRON_MIRROR) { $env:ELECTRON_MIRROR = 'https://npmmirror.com/mirrors/electron/' }
 
   Invoke-Step '准备 Electron 运行时（dist 解包）' { Ensure-ElectronDist }
@@ -1904,6 +2126,30 @@ preview : $($Preview.IsPresent)
   Write-Host ('=' * 72) -ForegroundColor Green
   $exeDir = Get-PackagedDir
   if ($exeDir) { Write-Host "产物：$exeDir" }
+  if ($script:WebAccessActive) {
+    Write-Host ''
+    Write-Host '可控 Web 入口（已打的补丁）：' -ForegroundColor White
+    if ($script:TokenPatchActive) { Write-Host '  · 固定启动 Token —— 产物会读 DSH_WEB_TOKEN' }
+    if ($script:ListenPatchActive) { Write-Host '  · 监听所有网卡 —— 产物会读 DSH_NEXT_WEB_HOST' }
+    Write-Host ''
+    Write-Host '  ↓ 值**不在编译里**，写进 exe 同级的 startup.json（改完重启生效，不必重编）：' -ForegroundColor White
+    Write-Host '    {'
+    Write-Host '      "version": 1,'
+    Write-Host '      "env": {'
+    $guide = @(Get-DshWebAccessStartupGuide -FixedToken:$script:TokenPatchActive -ListenAllNetwork:$script:ListenPatchActive)
+    for ($i = 0; $i -lt $guide.Count; $i++) {
+      $comma = if ($i -lt $guide.Count - 1) { ',' } else { '' }
+      Write-Host ("        {0}{1}" -f $guide[$i], $comma)
+    }
+    Write-Host '      }'
+    Write-Host '    }'
+    Write-Host '  想长期生效就写进 overlay-next\startup.json 模板（构建时会原样拷过去）；'
+    Write-Host '  临时试一次可用同名环境变量（它能压过文件里的值）。'
+    Write-Host '  DSH_WEB_TRUSTED_HOSTS 是 JSON 数组字符串（与上游 DSH_NEXT_TRUSTED_HOSTS 同格式，'
+    Write-Host '  只从本机访问可整行删掉）；嫌引号转义麻烦就写 "1.2.3.4,5.6.7.8"，两种都认。'
+    Write-Host '  外部浏览器还需在 DSH NEXT 设置里勾选「允许在浏览器中打开」，端口取设置里的 port。'
+    Write-Log ("[web-access] patches=$($script:WebAccessGroups -join ',')")
+  }
   Write-Info "日志已写入 $script:LogPath"
 
   if ($script:Failed -gt 0) { exit 1 }

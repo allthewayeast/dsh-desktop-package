@@ -1,0 +1,62 @@
+diff --git a/dsh-desktop-next/src/host/index.ts b/dsh-desktop-next/src/host/index.ts
+index 46c287d0bb..b24f30b997 100644
+--- a/dsh-desktop-next/src/host/index.ts
++++ b/dsh-desktop-next/src/host/index.ts
+@@ -28,6 +28,23 @@ import { formatFatalDiagnostic } from './fatal-diagnostic.ts'
+ import * as desktopOffice from './office.ts'
+ import { resolveOfficeConfig } from './office.ts'
+ 
++// 【本地覆盖层 web-access】额外受信入口的解析。
++// 格式与上游 DSH_NEXT_TRUSTED_HOSTS 一致：JSON 数组字符串（desktop-runtime 用 JSON.stringify
++// 注入、这里 JSON.parse 读取）。手写 startup.json 时也接受逗号分隔，省掉一层引号转义。
++// 以 [ 或 { 开头一律按 JSON 解析：写错时在这里就报出来，不要当成主机名继续往下传。
++function parseTrustedHostsEnv(raw: string | undefined): string[] {
++  const value = raw?.trim() ?? ''
++  if (value === '') return []
++  if (value.startsWith('[') || value.startsWith('{')) {
++    const parsed: unknown = JSON.parse(value)
++    if (!Array.isArray(parsed) || parsed.some(entry => typeof entry !== 'string')) {
++      throw new Error('Invalid DSH_WEB_TRUSTED_HOSTS: expected a JSON array of strings')
++    }
++    return (parsed as string[]).map(entry => entry.trim()).filter(entry => entry !== '')
++  }
++  return value.split(/[,;\s]+/).map(entry => entry.trim()).filter(entry => entry !== '')
++}
++
+ export async function main(): Promise<void> {
+   // The Host lists and reads user workspaces; see asar-archive-policy.ts.
+   disableAsarArchiveView(import.meta.url)
+@@ -61,9 +78,22 @@ export async function main(): Promise<void> {
+   delete process.env[SYSTEM_PROXY_ENV]
+   const profile = loadNextProfile(projectDir, home)
+   const runtimePatch = join(projectDir, 'desktop-next.runtime.patch.json')
++  // 【本地覆盖层 web-access】监听地址与「额外受信入口」改由启动环境给出，默认仍是回环。
++  //   DSH_NEXT_WEB_HOST     —— 0.0.0.0 / :: 或具体网卡 IP 字面量（上游 Config schema 会校验）
++  //   DSH_WEB_TRUSTED_HOSTS —— 额外 authority，与 DSH_NEXT_TRUSTED_HOSTS 同格式：JSON 数组字符串
++  //                            （也接受逗号分隔）；通配绑定时 /api 围栏只认逐个登记的入口
++  // 值来自 exe 同级的 startup.json（由 startup-config.ts 放行），也可用同名环境变量覆盖。
++  const webHost = process.env.DSH_NEXT_WEB_HOST?.trim() || '127.0.0.1'
++  const extraTrustedHosts = parseTrustedHostsEnv(process.env.DSH_WEB_TRUSTED_HOSTS)
++  // 非通配、非回环的绑定地址由围栏按「监听地址本身」自动信任；通配绑定则必须逐条登记。
++  // 默认路径（127.0.0.1）不往 trustedHosts 里加任何东西 —— 与上游配置逐字一致。
++  const bindTrustedHosts = webHost === '127.0.0.1' || webHost === '0.0.0.0' || webHost === '::' ? [] : [webHost]
++  const remainingTrustedHosts = [...new Set([...(trustedHosts as string[]), ...bindTrustedHosts, ...extraTrustedHosts])]
++  // 通配绑定仍然可以走回环（0.0.0.0 含 127.0.0.1），而具体网卡地址只能用自己连 —— 内部 URL 跟随。
++  const webOriginHost = webHost === '0.0.0.0' || webHost === '::' ? '127.0.0.1' : webHost
+   atomicJson(runtimePatch, [
+-    { id: 'desktop-next-webserver', config: { host: '127.0.0.1', port: preferences.port } },
+-    { id: 'connection', config: { trustedHosts } },
++    { id: 'desktop-next-webserver', config: { host: webHost, port: preferences.port } },
++    { id: 'connection', config: { trustedHosts: remainingTrustedHosts } },
+   ])
+   // runProfile installs the outbound proxy policy from this environment before any plugin mounts.
+   const { environment, resolution: proxy } = withSystemProxy(loadLayeredEnv('dsh-desktop-next'), systemProxy, trustedHosts as string[])
+@@ -141,7 +171,7 @@ export async function main(): Promise<void> {
+     try { await ctx.plugin(desktopOffice, office); mounted() } catch (error) { mounted(error); throw error }
+   }
+   hostLog({ source: 'host', event: 'process.ready' })
+-  await send({ type: 'ready', url: ctx.connection.authenticatedUrl(`http://127.0.0.1:${ctx.webServer.port}`),
++  await send({ type: 'ready', url: ctx.connection.authenticatedUrl(`http://${webOriginHost}:${ctx.webServer.port}`),
+     injections: webIndexInjections(ctx) })
+   auditHostPlugins(ctx)
+   const account = ctx.get('deepseekAccount') as PlatformLoginAccount | undefined

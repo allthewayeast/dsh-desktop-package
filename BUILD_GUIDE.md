@@ -256,6 +256,139 @@ Desktop 的 `--config.minimumReleaseAge=0` 修复随之丢失（pnpm 11 把字�
    通道，伴随包（cordis / schemastery）**无处抄版本**，脚本会明确点名保留原样；③ 目标 manifest 里
    没有的同名包会保持原版本（脚本会列出来）。所以**推荐只在上游自己声明的版本之间切换**。
 
+### 远端访问：补丁开关 + startup.json 配置（next）
+
+Next 默认只在 `127.0.0.1` 上服务，启动 token 每次随机 —— 所以**没法从另一台机器打开**。
+这件事要拆成两半看，别混在一起：
+
+| | 是什么 | 在哪决定 |
+|---|---|---|
+| **补丁开关** | 让代码「认识」`DSH_WEB_TOKEN` / `DSH_NEXT_WEB_HOST` 这些变量 | **编译时**（两个 `[switch]`，不给就不打补丁） |
+| **具体值** | token 是什么、监听哪个地址、信任谁 | **运行时**：exe 同级的 `startup.json`（改完重启即生效，不必重编） |
+
+两个开关都**不接收值**，只回答「要不要把这段代码能力编进产物」：
+
+| 开关 | 别名 | 作用 |
+|---|---|---|
+| `-FixedTokenPatch` | — | 固定启动 Token：给 `dsh-client-connection` 加 `config.launchToken ?? $env:DSH_WEB_TOKEN` 解析链 |
+| `-ListenAllNetworkPatch` | `-ListenAllInterfacesPatch`、`-WildcardListenPatch` | 监听所有网卡（`0.0.0.0`）：放行通配绑定，并让 Host 读 `DSH_NEXT_WEB_HOST` |
+
+> **关于「监听全网段」这个译法**：`ListenAllNetwork` 里的 Network 指的是**本机所有网络接口（网卡）**，
+> 不是「所有网段」—— 中文说「全网段」容易被读成「所有子网」，而技术上这是 `0.0.0.0` 通配绑定，
+> 跟网段划分无关。想更准确可以用别名 `-ListenAllInterfacesPatch`（监听所有网卡），效果完全一样。
+>
+> 两个开关都**不给**时，一层补丁都不打，产物与上游一致（回环 + 每次随机 token），
+> 构建日志会明确写「跳过」。想退回上游形态，去掉开关重跑一次即可。
+
+#### 第 1 步：构建时决定打哪些补丁
+
+```powershell
+pwsh -File .\build-next.ps1 -Target package-dir -FixedTokenPatch -ListenAllNetworkPatch
+```
+
+#### 第 2 步：把值写进 startup.json
+
+它在 exe 同级（打包产物里通常是
+`dsh-desktop\dsh-desktop-next\dist\win-unpacked\startup.json`）。保留原有键，把需要的加进 `env`：
+
+```json
+{
+  "version": 1,
+  "env": {
+    "DSH_HOME": "E:\\AppData\\YMZ\\.dsh-desktop-next",
+    "DSH_NEXT_WEB_HOST": "0.0.0.0",
+    "DSH_WEB_TOKEN": "MyFixedToken_2026",
+    "DSH_WEB_TRUSTED_HOSTS": "[\"139.9.73.189\",\"192.168.1.9\"]"
+  }
+}
+```
+
+| 键 | 作用 | 说明 |
+|---|---|---|
+| `DSH_NEXT_WEB_HOST` | 监听地址 | `0.0.0.0` / `::` = 所有网卡。**别填具体 IP**，原因见下 |
+| `DSH_WEB_TOKEN` | 固定启动 token | ≥16 位、`[A-Za-z0-9_-]`；访问形如 `http://<地址>:<port>/?token=<token>` |
+| `DSH_WEB_TRUSTED_HOSTS` | `/api` 围栏的额外受信入口 | **JSON 数组字符串**（与上游 `DSH_NEXT_TRUSTED_HOSTS` 同格式）；**通配绑定时每个入口都得登记**，否则 `/api` 一律 403 |
+
+`DSH_WEB_TRUSTED_HOSTS` 为什么写成「带转义引号的字符串」而不是 JSON 里的真数组：`startup.json` 的
+`env` 最终会变成**进程环境变量**，而环境变量只能存字符串。上游自己也是这么传的 ——
+`desktop-runtime.ts` 用 `JSON.stringify(addresses)` 注入 `DSH_NEXT_TRUSTED_HOSTS`，
+`host/index.ts` 再 `JSON.parse` 回来。这个补丁沿用同一格式，所以两边语义一致、代码里也是同一套解析。
+
+嫌转义难看可以写逗号分隔，引擎两种都认（`[` / `{` 开头按 JSON，否则按 `,` `;` 空白切分）：
+
+```json
+"DSH_WEB_TRUSTED_HOSTS": "139.9.73.189,192.168.1.9"
+```
+
+格式写错不会被静默忽略：JSON 数组里混入非字符串、写成对象、括号没闭合，Host 启动时会直接报
+`Invalid DSH_WEB_TRUSTED_HOSTS` / JSON 解析错误，而不是把它当主机名悄悄放过去。IPv6 地址写不带方括号
+的形式（`::1`，不要 `[::1]`）。
+
+#### 三种写法，按场合选
+
+1. **想长期生效** → 编辑仓库里的模板 `overlay-next\startup.json`，每次 `-Target package-dir`
+   都会把它**原样**拷到 exe 同级。模板会进 git，所以**别把真 token 提交上去**。
+2. **只想改现在这台机器** → 直接改 `<安装目录>\startup.json`，重启应用即可，**不用重编**。
+3. **临时试一次** → 用同名环境变量，它优先于文件：
+   ```powershell
+   $env:DSH_WEB_TOKEN='TempToken_2026xyz'; .\dsh-desktop-next.exe
+   ```
+
+⚠️ 环境里若**残留**同名值（比如以前 `setx` 过），它会一直压过文件 —— 排查「改了没生效」先看
+`Get-ChildItem Env:DSH_*`。
+
+⚠️ `update-app-next.bat` 的 `robocopy ... /xf "startup.json"` **会保留目标目录里已有的
+startup.json**，所以覆盖安装不会把新值带过去 —— 要么手工同步一次，要么删掉目标那份让它重新拷。
+
+#### 为什么 `DSH_NEXT_WEB_HOST` 别填具体网卡 IP
+
+主窗口的 WebSocket 桥（`main.ts` 里 `target.hostname !== '127.0.0.1'` 那条守卫）把目标钉死在回环；
+真按单网卡绑定后 `127.0.0.1` 不再监听，窗口立刻连不上自己的 Host。
+要「只有某个地址能访问」，正确做法是 `0.0.0.0` + 用 `DSH_WEB_TRUSTED_HOSTS` 把围栏收窄到那个地址
+（其它入口进不了 `/api`）。真要 netstat 里只出现一个地址，得改 `main.ts` 的守卫 —— 本仓库**没有**做。
+
+#### 补丁具体改了什么
+
+两个开关各打一组，互不依赖；都有产物级断言，开关给了但产物里缺标记会以 `产物不完整` 失败：
+
+1. **`token` 组**（`-FixedTokenPatch`）：`tools\dsh-web-access.ps1` 改
+   `dsh-client-connection/lib/index.js` 的 5 处 —— token 链变成
+   `config.launchToken ?? $env:DSH_WEB_TOKEN ?? ""`，并带上长度校验。
+2. **`listen` 组**（`-ListenAllNetworkPatch`）：
+   - 运行时产物 3 处：`dsh-host-webserver` 放行通配地址、通配绑定的 URL 形式改回回环；
+     `dsh-web-app` 删掉 `dsh web --host` 的 CLI 守卫。
+   - 源码补丁 `overlay-next\patches\index.ts.patch`：Host 把 webserver 的 `host` 从写死的
+     `127.0.0.1`（`host.cordis.patch.yml` 只是初值，会被 runtimePatch 覆盖）改成读
+     `DSH_NEXT_WEB_HOST`，并把绑定地址计入 `connection.trustedHosts`。
+
+   两组共 8 处运行时改动，按**代码形状锚定**（不依赖行号），任一处打不上就整体放弃、零写入，
+   写完 `node --check`，语法不过立刻从备份还原。备份后缀 `.dsh-web-access.bak`。
+   上一轮残留在工作区里的 `index.ts.patch` 会在这次不给开关时自动反向撤销
+   （`-SkipPull` 复用旧工作区时会遇到这种情况）。
+
+`overlay-next\src\startup-config.ts` **始终**放行这三个 `DSH_*` 名字（否则 `applyDesktopStartupConfig`
+会以 `unsafe` 拒绝启动）—— 这是「允许你写进去」，与「打没打补丁」无关，所以它不受开关控制。
+
+**外部浏览器能打开还需要两步**（与 token 无关，是 Desktop 自己的门）：
+
+1. DSH NEXT 设置里勾选「允许在浏览器中打开」（`browserAccess`）—— 关着时除渲染进程外的所有请求
+   一律 403；
+2. 端口取设置里的 `port`（`0` = 系统分配，看日志 `Host ready` 或设置页的实际端口）。
+
+**stable 通道只有 `-FixedTokenPatch`**（`build.ps1 -Overlay -FixedTokenPatch`，不给开关则不打补丁）：
+stable 的 `DesktopWebServer` 不支持绑定非回环地址（`desktopWebServerHost()` 恒返回 `127.0.0.1`，
+`webserver.ts` 与 `index.ts` 两处都按这个值断言），对外暴露只能走它自带的局域网 HTTPS 入口
+（`networkExposure=lan`）。打了补丁后 token 同样写进 exe 同级的 `startup.json`：
+
+```json
+{ "version": 1, "env": { "DSH_WEB_TOKEN": "MyFixedToken_2026" } }
+```
+
+**安全提醒**：通配绑定 = 本机所有网卡都听（含 Wi-Fi / 热点 / VPN 适配器）。这台机器不只有一块
+网卡时，优先「绑回环 + 前置代理」；一定要通配时，用防火墙把端口限制到真正要用的来源，并把
+`DSH_WEB_TRUSTED_HOSTS` 收窄到只需要的入口。固定 token 等于长期凭证，**别提交进本仓库**
+（所以更推荐改部署出去的那一份，而不是写进 `overlay-next\startup.json` 模板）。
+
 ### Electron 版本支持表（node-addon-require-builtin）
 
 `-ElectronVersion` **不是想给什么就给什么**。dsh 宿主在 Electron 里 `require` Node 内置模块，靠的是预编译

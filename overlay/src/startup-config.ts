@@ -116,11 +116,19 @@ const BOOTSTRAP_PREFIXES = [
 
 /**
  * `DSH_*` names a user-owned startup config may set. The file lives next to the
- * executable the user launched, so the Home override and the telemetry opt-out
- * are safe; every other `DSH_*` name keeps changing how the process starts and
- * stays refused.
+ * executable the user launched, so the Home override, the telemetry opt-out, and
+ * the Web launch token (the reader is added by `build.ps1 -FixedTokenPatch`, the value is
+ * written by hand into startup.json) are safe; every other
+ * `DSH_*` name keeps changing how the process starts and stays refused.
  */
-const DSH_ALLOWED_NAMES = new Set(['DSH_HOME', 'DSH_TELEMETRY_DISABLED'])
+const DSH_ALLOWED_NAMES = new Set([
+  'DSH_HOME',
+  'DSH_TELEMETRY_DISABLED',
+  // Fixed Web launch token. It only decides which `?token=` the Web carrier exchanges
+  // for a cookie; it cannot redirect code, instructions, or the runtime tree, so it
+  // sits at the same risk level as DSH_HOME rather than with the bootstrap names.
+  'DSH_WEB_TOKEN',
+])
 
 /** Whether a variable may come only from the inherited process environment. */
 function isBootstrapOnly(name: string): boolean {
