@@ -123,6 +123,18 @@
   两处都按这个值断言，对外暴露只能走它自带的局域网 HTTPS 入口（networkExposure=lan）。
   想真正控制监听地址，请用 build-next.ps1 的 -ListenAllInterfacesPatch。
 
+.PARAMETER GitHubProxy
+  GitHub 加速前缀，例如 https://gh-proxy.com/（别名 -GhProxy）。**未指定时直连**。
+  给了之后 GitHub 的 HTTPS 地址会变成「前缀 + 原地址」：
+      https://github.com/anywhere-labs/dsh-desktop.git
+        → https://gh-proxy.com/https://github.com/anywhere-labs/dsh-desktop.git
+  实现方式是 git 的 `url.<前缀>…insteadOf`，所以**一次配置全覆盖**：clone、
+  fetch、submodule update（含嵌套子模块）、ls-remote 都自动走前缀，仓库地址本身不改
+  （去掉参数就完全回到直连，工作区不留改动）。Electron 发行包下载也套同一前缀并排到镜像列表最前。
+  只匹配 https://github.com/ —— SSH 形式（git@github.com:…）不会被重写，要加速得先把
+  remote 换成 HTTPS。值必须以 http:// 或 https:// 开头，末尾斜杠会自动补齐。
+  代理服务本身可能失效或限速，失败时先用不带本参数的命令重试，确认是代理问题再换服务。
+
 .EXAMPLE
   .\build.ps1
   .\build.ps1 -Target package-dir              # 解包打包（无覆盖层）
@@ -138,6 +150,8 @@
   .\build.ps1 -Target build -SkipSubmodule -SkipInstall
   .\build.ps1 -Force                           # 版本相同时不再询问，直接构建
   .\build.ps1 -Target dist-win-portable -NoZip # 生成解包目录，不打 ZIP
+  .\build.ps1 -Overlay -Target package-dir -GitHubProxy https://gh-proxy.com/
+  # ↑ 拉源码 / 子模块 / Electron 包都走加速前缀
 #>
 
 [CmdletBinding()]
@@ -204,7 +218,17 @@ param(
   # 不给就不打补丁，token 仍是每次启动随机（上游行为）。
   # 值不在编译参数里 —— 写进 exe 同级的 startup.json 的 env.DSH_WEB_TOKEN（≥16 位、[A-Za-z0-9_-]）。
   # 必须同时给 -Overlay：startup.json 的读取点是覆盖层补进去的。
-  [switch]$FixedTokenPatch
+  [switch]$FixedTokenPatch,
+
+  # --- GitHub 加速前缀（'' = 直连）---
+  # 给 GitHub 的 HTTPS 地址套一个前缀，例如 'https://gh-proxy.com/'：
+  #   https://github.com/anywhere-labs/dsh-desktop.git
+  #     → https://gh-proxy.com/https://github.com/anywhere-labs/dsh-desktop.git
+  # 靠 git 的 url.<前缀>…insteadOf 实现，所以 clone / fetch / submodule update /
+  # ls-remote 全部自动生效（含嵌套子模块）；Electron 发行包下载也套同一前缀。
+  # 只匹配 https://github.com/ —— SSH 形式（git@github.com:…）不会被重写。
+  [Alias('GhProxy')]
+  [string]$GitHubProxy = ''
 )
 
 Set-StrictMode -Version Latest
@@ -223,6 +247,20 @@ $script:SrcBranch = 'master'
 # commit 归属仍由 upstream.json / 标签决定。换目标版本时上游 upstream.json 只声明自己那一版，
 # 所以「版本 → commit」只能靠标签。
 $script:HarnessRepository = 'https://github.com/deepseek-ai/deepseek-harness.git'
+
+# ---------------- GitHub 加速前缀（-GitHubProxy）----------------
+# 用 git 的 url.<前缀>…insteadOf 重写，不改上面两个仓库地址 —— 去掉参数就完全回到
+# 直连，工作区里不留「改过的 remote / .gitmodules」。
+#   'https://gh-proxy.com/' → https://github.com/x → https://gh-proxy.com/https://github.com/x
+# 生效两条腿：进程环境变量 GIT_CONFIG_COUNT（git ≥2.31，连 git 自己 fork 的子进程与
+# yarn 内部调用的 git 都走前缀）+ 各调用点的显式 -c（老版本 git 的兜底）。
+$script:GitHubProxyModule = Join-Path $script:Root 'tools\github-proxy.ps1'
+if (-not (Test-Path -LiteralPath $script:GitHubProxyModule)) {
+  throw "缺少 GitHub 加速模块：$script:GitHubProxyModule"
+}
+. $script:GitHubProxyModule
+$script:GitHubProxyPrefix = Initialize-GitHubProxy $GitHubProxy
+$script:GitHubProxyGitArgs = @(Get-GitHubProxyGitArgs $script:GitHubProxyPrefix)
 $script:StartedAt = Get-Date
 $script:StepIndex = 0
 $script:Failed = 0
@@ -736,10 +774,16 @@ function Initialize-Submodule {
   $harness = Join-Path $script:Src 'deepseek-harness'
   $harnessPkg = Join-Path $harness 'package.json'
 
-  Invoke-External git @(
+  # 加速前缀（-GitHubProxy）在这里也生效：子模块 clone 是最吃网络的一步。
+  Invoke-External git (@($script:GitHubProxyGitArgs) + @(
     '-C', $script:Src,
     'submodule', 'update', '--init', '--recursive'
-  ) 
+  ))
+  # 兜底：子模块 remote 若被写成带前缀的地址，还原（正常情况 git 存的是原始地址）。
+  if ($script:GitHubProxyPrefix) {
+    $fixed = @(Reset-GitHubProxyRemotes -RepoPath $script:Src -Prefix $script:GitHubProxyPrefix)
+    if ($fixed.Count -gt 0) { Write-WarnLine "  已把 $($fixed.Count) 条子模块地址上残留的加速前缀还原" }
+  }
 
   if (-not (Test-Path -LiteralPath $harnessPkg)) {
     throw '子模块初始化后仍缺少 deepseek-harness\package.json。请检查网络或 Git 凭据。'
@@ -748,7 +792,7 @@ function Initialize-Submodule {
   $head = (git -C $harness rev-parse HEAD).Trim()
   if ($head -ne $targetCommit) {
     Write-WarnLine "检出 commit 为 $head，期望 $targetCommit（通道 $script:Channel），正在强制对齐 pinned commit。"
-    Invoke-External git @('-C', $harness, 'fetch', '--depth', '1', 'origin', $targetCommit)
+    Invoke-External git (@($script:GitHubProxyGitArgs) + @('-C', $harness, 'fetch', '--depth', '1', 'origin', $targetCommit))
     Invoke-External git @('-C', $harness, 'checkout', '--detach', $targetCommit)
   }
 
@@ -798,6 +842,15 @@ $script:ElectronDistMirrors = @(
   @{ Name = 'npmmirror'; Mirror = 'https://npmmirror.com/mirrors/electron/'; Dir = '{0}' },
   @{ Name = 'github'; Mirror = 'https://github.com/electron/electron/releases/download/'; Dir = 'v{0}' }
 )
+# -GitHubProxy 给了前缀就把 GitHub 的 release 地址也套上，并排到最前 ——
+# 主动要代理通常正是因为直连 GitHub 拉不动这个大包（100MB+）。
+if ($script:GitHubProxyPrefix) {
+  $script:ElectronDistMirrors = @(
+    @{ Name = 'github(proxy)'
+       Mirror = (Add-GitHubProxyToUrl $script:GitHubProxyPrefix 'https://github.com/electron/electron/releases/download/')
+       Dir = 'v{0}' }
+  ) + $script:ElectronDistMirrors
+}
 
 # 依次向各源要一个文件；全部失败返回 $false（调用方决定是否致命，本流程一律不致命）。
 function Get-ElectronFile {
@@ -1592,7 +1645,9 @@ function Resolve-HarnessCommitFromTag {
       }
     }
     # 注释标签会同时列出 <标签> 与 <标签>^{} 两行，^{} 指向 commit，优先取它。
-    $remote = @(& git ls-remote --tags $script:HarnessRepository "refs/tags/$tag" "refs/tags/$tag^{}" 2>$null)
+    # 远端查询同样吃 -GitHubProxy 的前缀（insteadOf 对命令行 URL 与 remote 都生效）。
+    $gp = $script:GitHubProxyGitArgs
+    $remote = @(& git @gp ls-remote --tags $script:HarnessRepository "refs/tags/$tag" "refs/tags/$tag^{}" 2>$null)
     if ($LASTEXITCODE -ne 0 -or $remote.Count -eq 0) { return $null }
     $peeled = @($remote | Where-Object { $_ -match '\^\{\}\s*$' })
     $line = if ($peeled.Count -gt 0) { [string]$peeled[0] } else { [string]$remote[0] }
@@ -2852,7 +2907,9 @@ function Update-SourceRepository {
       # 历史 bug：该导出原先只在 [04] 的 Reset-OverlayTrackedFiles 里调用，而那时
       # checkout --force 早已把改动清掉 —— 「pull 前导出」实际永远导不到东西。
       Export-SrcOverlay
-      $output = @(& git -C $script:Src fetch origin 2>&1)
+      # 加速前缀（-GitHubProxy）通过 -c insteadOf 生效；没给时 @gp 是空数组，命令与原来一致。
+      $gp = $script:GitHubProxyGitArgs
+      $output = @(& git @gp -C $script:Src fetch origin 2>&1)
       foreach ($line in $output) {
         $text = if ($null -eq $line) { '' } else { [string]$line }
         Write-Host $text
@@ -2872,7 +2929,7 @@ function Update-SourceRepository {
         throw "git checkout -B $($script:SrcBranch) origin/$($script:SrcBranch) --force 失败 (exit $LASTEXITCODE)。"
       }
 
-      $output = @(& git -C $script:Src submodule update --init --recursive --force 2>&1)
+      $output = @(& git @gp -C $script:Src submodule update --init --recursive --force 2>&1)
       foreach ($line in $output) {
         $text = if ($null -eq $line) { '' } else { [string]$line }
         Write-Host $text
@@ -2892,7 +2949,16 @@ function Update-SourceRepository {
     throw "目录 $($script:Src) 已存在但不是 Git 仓库（缺少 .git）。请手动处理该目录后再运行本脚本。"
   } else {
     Write-Info "未找到 $($script:Src)，正在克隆 $script:SrcRepository（--recursive 含嵌套 deepseek-harness）..."
-    Invoke-External git @('clone', '--recursive', $script:SrcRepository, $script:Src)
+    if ($script:GitHubProxyPrefix) {
+      Write-Info "  GitHub 加速前缀：$($script:GitHubProxyPrefix)（clone 与子模块都走它）"
+    }
+    Invoke-External git (@($script:GitHubProxyGitArgs) + @('clone', '--recursive', $script:SrcRepository, $script:Src))
+    # 兜底：git 正常存的是原始地址，但如果哪次真被写成带前缀（手工 set-url / 旧脚本），
+    # 就地还原 —— 否则下次不带 -GitHubProxy 也会悄悄走代理。
+    if ($script:GitHubProxyPrefix) {
+      $fixed = @(Reset-GitHubProxyRemotes -RepoPath $script:Src -Prefix $script:GitHubProxyPrefix)
+      if ($fixed.Count -gt 0) { Write-WarnLine "  已把 $($fixed.Count) 条仓库地址上残留的加速前缀还原（它们此前被写死进了 .git/config）" }
+    }
   }
 }
 
@@ -3069,6 +3135,14 @@ function Show-Summary {
     Write-Info '当前目标没有生成 dist 安装包。使用 -Target dist-win 可打 Windows 安装程序。'
   }
 
+  if ($script:GitHubProxyPrefix) {
+    Write-Host ''
+    Write-Host ("GitHub 加速前缀：{0}" -f $script:GitHubProxyPrefix) -ForegroundColor White
+    Write-Host '  已作用于本次的 clone / fetch / submodule update / ls-remote 与 Electron 发行包下载。'
+    Write-Host '  产物里**没有**这个前缀 —— 它只是构建期的网络加速，不影响运行时行为。'
+    Write-Log ("[github-proxy] prefix=$($script:GitHubProxyPrefix)")
+  }
+
   Write-Info "日志已写入 $script:LogPath"
   Write-Host ''
   Write-Host '常用命令：' -ForegroundColor White
@@ -3191,6 +3265,10 @@ try {
   }
 
   Initialize-Log
+  if ($script:GitHubProxyPrefix) {
+    Write-Info "GitHub 加速前缀：$($script:GitHubProxyPrefix)"
+    Write-Info '  → clone / fetch / submodule update / ls-remote 与 Electron 发行包下载都会套上它'
+  }
   # -FixedTokenPatch 依赖覆盖层：startup.json 是被 overlay\src\startup-config.ts 读进来的，
   # 不带 -Overlay 的构建里根本没有这个集成点，写了也没人读 —— 所以直接拦下，别让人以为生效了。
   if ($script:TokenPatchActive) {

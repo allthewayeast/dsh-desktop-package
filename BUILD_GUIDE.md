@@ -116,6 +116,50 @@ build.bat dist-win-portable --skip-install --skip-submodule
 - 使用 `--no-proxy` 或 `-NoProxy` 禁用
 - 使用 `-Proxy <url>` 自定义代理地址
 
+### GitHub 加速前缀（`-GitHubProxy`）
+
+代理解决的是「本机 → 外网」的出口；`-GitHubProxy` 解决的是另一件事：**把 GitHub 的地址换成一个镜像网关**
+（`gh-proxy.com`、`ghfast.top` 这类）。两者互不冲突，可以同时用。
+
+```powershell
+pwsh -File .\build-next.ps1 -Target package-dir -GitHubProxy https://gh-proxy.com/
+pwsh -File .\build.ps1 -Overlay -Target package-dir -GitHubProxy https://gh-proxy.com/
+```
+
+给了前缀后，GitHub 的 HTTPS 地址会变成「前缀 + 原地址」：
+
+```
+https://github.com/anywhere-labs/dsh-desktop
+  → https://gh-proxy.com/https://github.com/anywhere-labs/dsh-desktop
+```
+
+**实现方式是 git 的 `url.<前缀>…insteadOf`，一次配置全覆盖**，不需要逐个改仓库地址：
+
+| 调用点 | 脚本里的形式 |
+|---|---|
+| `git fetch origin` | `git -c url.<前缀>…insteadOf=… -C <src> fetch origin` |
+| `git submodule update --init --recursive` | 同上（含嵌套的 `deepseek-harness`） |
+| `git clone --recursive` | 同上 |
+| `git ls-remote --tags`（查 harness 版本） | 同上 |
+| Electron 发行包下载 | 镜像列表前插一项 `<前缀>https://github.com/electron/electron/releases/download/`，失败自动回落到 npmmirror |
+
+对**已经配置好的 `origin`** 同样生效（`insteadOf` 在解析 remote 时改写），所以不用 `git remote set-url`，
+去掉参数就完全回到直连，工作区里不留任何改动：git 存进 `.git/config` 的仍是**原始**地址，
+被改写的只是传输层用的 URL。
+
+> 因此构建日志里出现 `https://gh-proxy.com/https://github.com/...` 是**正常现象** ——
+> `git remote get-url` / `ls-remote --get-url` 输出的就是改写后的地址。想看真实存储值用
+> `git -C dsh-desktop config --get remote.origin.url`。
+> 只有真的被写进 config（有人手工 `remote set-url` 过）时，脚本才会在 clone / submodule
+> 之后打一行 WARN 并还原。
+
+**几个边界**：
+
+- 只匹配 `https://github.com/`。SSH 形式（`git@github.com:…`）不会被重写 —— 要加速得先把 remote 换成 HTTPS。
+- 值必须以 `http://` / `https://` 开头，末尾斜杠会自动补齐（`https://gh-proxy.com` 与 `https://gh-proxy.com/` 等价）。
+- 别名 `-GhProxy` 更短，效果相同。
+- 镜像服务本身可能限速或失效。失败时先**去掉本参数**重试一次：如果直连能通，就是代理的问题，换个服务或等一会再试。
+
 ## 增量构建
 
 首次构建后，后续修改代码可使用增量构建加速：
@@ -175,17 +219,28 @@ pwsh -File .\build-next.ps1 -Preview                             # 只做注入�
 
 ### 覆盖层（overlay-next）
 
-overlay-next 只承担一件事：**把 exe 同级的 `startup.json` 接进启动流程**。
+overlay-next 承担三件事：**把 exe 同级的 `startup.json` 接进启动流程**、**主进程页面缩放**
+（Ctrl/Cmd `+` `-` `0`）、**可控 Web 入口**（`DSH_WEB_HOST` + `DSH_WEB_PORT` + 受信任主机）。
 
 | 文件 | 内容 |
 |------|------|
-| `overlay-next\patches\main.ts.patch` | 接入 `startup-config`（`applyDesktopStartupConfig`）+ 让 `DSH_HOME` 生效 |
+| `overlay-next\patches\main.ts.patch` | 接入 `startup-config`（`applyDesktopStartupConfig`）+ 让 `DSH_HOME` 生效 + 页面缩放手势 |
+| `overlay-next\patches\main-lifecycle.spec.ts.patch` | 配套单测：假 Electron 补 `getZoomLevel`/`setZoomLevel`，并断言三个手势与边界钳制 |
+| `overlay-next\patches\index.ts.patch` | Host 读 `DSH_WEB_HOST`（监听地址）、`DSH_WEB_PORT`（端口）与 `DSH_WEB_TRUSTED_HOSTS`（受信任主机） |
 | `overlay-next\src\startup-config.ts` | 新文件：exe 同级 `startup.json` 启动配置 |
 | `overlay-next\src\startup-config.spec.ts` | 新文件：配套单测 |
 | `overlay-next\startup.json` | 运行时数据文件，构建后拷到 exe 同级 |
 
 > 「让 `DSH_HOME` 生效」不是附加功能：`startup.json` 里配的就是 `DSH_HOME`，而 next 原本只认
 > `DSH_DESKTOP_NEXT_HOME`，不补这段，启动配置就落不到 home 上。
+
+**2026-10-30：主窗口几何持久化已从覆盖层移除。** 上游 #1514（`feat(desktop): restore the main
+window's bounds and maximized state in Next and Beta`）自带 `src\main-window-state.ts` 及其单测，
+功能等价（含 `fitMainWindowBounds` 的多屏保护）。两套实现同时存在只会争用同一份
+`main-window-state.json`，于是删掉 `overlay-next\src\window-state.ts` 与配套单测，`main.ts.patch`
+里对应的 import、`mainWindowRestore` / `trackMainWindowGeometry` / `flushMainWindowGeometry`
+以及 `before-quit` 的 flush 一并去掉 —— 这正是那次 `main.ts.patch`「无法应用」的根因：
+补丁的第一块 hunk 要改 electron import 行，而上游已在同一行加了 `screen`。
 
 **2026-10-14 起，ASAR 相关的三份补丁全部撤销**（原 `package.json.patch`、`verify-packaged.ts.patch`、
 `verify-fuses.ts.patch`）：上游自己接过去了，旧写法会与新门禁**直接冲突**。
@@ -263,15 +318,18 @@ Next 默认只在 `127.0.0.1` 上服务，启动 token 每次随机 —— 所�
 
 | | 是什么 | 在哪决定 |
 |---|---|---|
-| **补丁开关** | 让代码「认识」`DSH_WEB_TOKEN` / `DSH_NEXT_WEB_HOST` 这些变量 | **编译时**（两个 `[switch]`，不给就不打补丁） |
-| **具体值** | token 是什么、监听哪个地址、信任谁 | **运行时**：exe 同级的 `startup.json`（改完重启即生效，不必重编） |
+| **补丁开关** | 让代码「认识」`DSH_WEB_TOKEN` / `DSH_WEB_HOST` / `DSH_WEB_PORT` 这些变量 | **编译时**（两个 `[switch]`，不给就不打补丁） |
+| **具体值** | token 是什么、监听哪个地址和端口、信任谁 | **运行时**：exe 同级的 `startup.json`（改完重启即生效，不必重编） |
 
 两个开关都**不接收值**，只回答「要不要把这段代码能力编进产物」：
 
 | 开关 | 别名 | 作用 |
 |---|---|---|
 | `-FixedTokenPatch` | — | 固定启动 Token：给 `dsh-client-connection` 加 `config.launchToken ?? $env:DSH_WEB_TOKEN` 解析链 |
-| `-ListenAllNetworkPatch` | `-ListenAllInterfacesPatch`、`-WildcardListenPatch` | 监听所有网卡（`0.0.0.0`）：放行通配绑定，并让 Host 读 `DSH_NEXT_WEB_HOST` |
+| `-ListenAllNetworkPatch` | `-ListenAllInterfacesPatch`、`-WildcardListenPatch` | 监听所有网卡（`0.0.0.0`）：放行通配绑定，并让 Host 读 `DSH_WEB_HOST` |
+
+> `DSH_WEB_PORT`（监听端口）由两者**共用**的源码补丁提供，所以给任一开关都能用它 —— 只固定
+> 端口、不开通配绑定时，只给 `-FixedTokenPatch` 即可。
 
 > **关于「监听全网段」这个译法**：`ListenAllNetwork` 里的 Network 指的是**本机所有网络接口（网卡）**，
 > 不是「所有网段」—— 中文说「全网段」容易被读成「所有子网」，而技术上这是 `0.0.0.0` 通配绑定，
@@ -296,7 +354,8 @@ pwsh -File .\build-next.ps1 -Target package-dir -FixedTokenPatch -ListenAllNetwo
   "version": 1,
   "env": {
     "DSH_HOME": "E:\\AppData\\YMZ\\.dsh-desktop-next",
-    "DSH_NEXT_WEB_HOST": "0.0.0.0",
+    "DSH_WEB_HOST": "0.0.0.0",
+    "DSH_WEB_PORT": "3080",
     "DSH_WEB_TOKEN": "MyFixedToken_2026",
     "DSH_WEB_TRUSTED_HOSTS": "[\"139.9.73.189\",\"192.168.1.9\"]"
   }
@@ -305,7 +364,8 @@ pwsh -File .\build-next.ps1 -Target package-dir -FixedTokenPatch -ListenAllNetwo
 
 | 键 | 作用 | 说明 |
 |---|---|---|
-| `DSH_NEXT_WEB_HOST` | 监听地址 | `0.0.0.0` / `::` = 所有网卡。**别填具体 IP**，原因见下 |
+| `DSH_WEB_HOST` | 监听地址 | `0.0.0.0` / `::` = 所有网卡。**别填具体 IP**，原因见下 |
+| `DSH_WEB_PORT` | 监听端口 | `1`–`65535`。不写 = 沿用设置页的 `port`（`0` 时由系统分配）；写 `0` = 强制让系统分配。**远程访问必须固定**，否则每次重启链接都变 |
 | `DSH_WEB_TOKEN` | 固定启动 token | ≥16 位、`[A-Za-z0-9_-]`；访问形如 `http://<地址>:<port>/?token=<token>` |
 | `DSH_WEB_TRUSTED_HOSTS` | `/api` 围栏的额外受信入口 | **JSON 数组字符串**（与上游 `DSH_NEXT_TRUSTED_HOSTS` 同格式）；**通配绑定时每个入口都得登记**，否则 `/api` 一律 403 |
 
@@ -340,7 +400,26 @@ pwsh -File .\build-next.ps1 -Target package-dir -FixedTokenPatch -ListenAllNetwo
 ⚠️ `update-app-next.bat` 的 `robocopy ... /xf "startup.json"` **会保留目标目录里已有的
 startup.json**，所以覆盖安装不会把新值带过去 —— 要么手工同步一次，要么删掉目标那份让它重新拷。
 
-#### 为什么 `DSH_NEXT_WEB_HOST` 别填具体网卡 IP
+#### 端口：`DSH_WEB_PORT` 怎么生效
+
+上游的端口来自**设置页**（`desktop-preferences.json` 的 `port`，默认 `0` = 系统分配）：
+`host/index.ts` 把它写进 runtime patch 的 `desktop-next-webserver` 配置，同时作为 `--port` 传给
+web-app 的 CLI。补丁在这两处都换成「`DSH_WEB_PORT` 优先、没写才用偏好值」：
+
+| `DSH_WEB_PORT` | 实际绑定 |
+|---|---|
+| 不写 / 空串 | 设置页里的 `port`（可能仍是 `0` = 系统分配） |
+| `3080` | `3080` |
+| `0` | 强制让系统分配（**覆盖**设置页里已经固定的值） |
+
+优先级是「未写 → 偏好值，写了 → 一定用它」，所以显式写 `0` 是有意义的（把设置页的固定端口压回随机）。
+
+⚠️ **设置页显示的仍是偏好值**，不会跟着变。判断到底听在哪个端口，看 Host 日志里的
+`web.listen.plan`（`port` + `portSource` 是 `preferences` 还是 `DSH_WEB_PORT`），或者看实际连接地址。
+写错（非数字、负数、`>65535`）Host 启动时直接报 `Invalid DSH_WEB_PORT: expected an integer from 0
+through 65535`，不会带着一个坏值去绑端口。
+
+#### 为什么 `DSH_WEB_HOST` 别填具体网卡 IP
 
 主窗口的 WebSocket 桥（`main.ts` 里 `target.hostname !== '127.0.0.1'` 那条守卫）把目标钉死在回环；
 真按单网卡绑定后 `127.0.0.1` 不再监听，窗口立刻连不上自己的 Host。
@@ -359,21 +438,27 @@ startup.json**，所以覆盖安装不会把新值带过去 —— 要么手工�
      `dsh-web-app` 删掉 `dsh web --host` 的 CLI 守卫。
    - 源码补丁 `overlay-next\patches\index.ts.patch`：Host 把 webserver 的 `host` 从写死的
      `127.0.0.1`（`host.cordis.patch.yml` 只是初值，会被 runtimePatch 覆盖）改成读
-     `DSH_NEXT_WEB_HOST`，并把绑定地址计入 `connection.trustedHosts`。
+     `DSH_WEB_HOST`、`port` 改成读 `DSH_WEB_PORT`，并把绑定地址计入 `connection.trustedHosts`。
+
+     四个变量统一用 `DSH_WEB_` 前缀：上游 `DSH_NEXT_*` 专指主进程注入、host 读完即删的内部
+     通道（`DSH_NEXT_PREFERENCES`、`DSH_NEXT_TRUSTED_HOSTS`…），不是用户手写的启动配置。
+     监听地址原先叫 `DSH_NEXT_WEB_HOST`，2026-10-31 改名为 `DSH_WEB_HOST`，**旧名不再识别** ——
+     升级后请把已有 `startup.json` 里的这个键一并改名，否则会静默回落到 `127.0.0.1`。
 
    两组共 8 处运行时改动，按**代码形状锚定**（不依赖行号），任一处打不上就整体放弃、零写入，
    写完 `node --check`，语法不过立刻从备份还原。备份后缀 `.dsh-web-access.bak`。
    上一轮残留在工作区里的 `index.ts.patch` 会在这次不给开关时自动反向撤销
    （`-SkipPull` 复用旧工作区时会遇到这种情况）。
 
-`overlay-next\src\startup-config.ts` **始终**放行这三个 `DSH_*` 名字（否则 `applyDesktopStartupConfig`
+`overlay-next\src\startup-config.ts` **始终**放行这四个 `DSH_*` 名字（否则 `applyDesktopStartupConfig`
 会以 `unsafe` 拒绝启动）—— 这是「允许你写进去」，与「打没打补丁」无关，所以它不受开关控制。
 
 **外部浏览器能打开还需要两步**（与 token 无关，是 Desktop 自己的门）：
 
 1. DSH NEXT 设置里勾选「允许在浏览器中打开」（`browserAccess`）—— 关着时除渲染进程外的所有请求
    一律 403；
-2. 端口取设置里的 `port`（`0` = 系统分配，看日志 `Host ready` 或设置页的实际端口）。
+2. 端口：写了 `DSH_WEB_PORT` 以它为准，没写才取设置里的 `port`（`0` = 系统分配，看日志
+   `web.listen.plan` 或设置页的实际端口）。
 
 **stable 通道只有 `-FixedTokenPatch`**（`build.ps1 -Overlay -FixedTokenPatch`，不给开关则不打补丁）：
 stable 的 `DesktopWebServer` 不支持绑定非回环地址（`desktopWebServerHost()` 恒返回 `127.0.0.1`，
@@ -673,8 +758,25 @@ Error: Desktop runtime: missing x64 Office checker:
 ```
 
 **修法**：`-HarnessVersion` 跨线时，把下列 4 个文件从「与该版本同线的兄弟通道工作区」逐文件
-比对后覆盖。三个保护条件：内容相同即跳过（幂等，本函数在 `[03]` 与 `[05]` 各跑一次）；
-`$v` 就是本通道所属的线时不迁移；上游 `upstream.json` 里找不到同线兄弟工作区时只告警。
+比对后覆盖。四个保护条件：内容相同即跳过（幂等，本函数在 `[03]` 与 `[05]` 各跑一次）；
+`$v` 就是本通道所属的线时不迁移；上游 `upstream.json` 里找不到同线兄弟工作区时只告警；
+**兄弟工作区的 `scripts/*.ts` 已不再导出本通道 import 的符号时直接拒绝**。
+
+第四条是 2026-10-30 补的。`scripts/*` 不只是载荷清单，它们是**真实代码**，会 import
+`DesktopRuntimeArch`、`prepareDesktopRuntimeTree` 这类符号。目标线的兄弟工作区一旦改写过
+API（dsh `0.2.1-rc.4` 的 `prepare-runtime.ts` 就不再导出七个符号），照抄过来只会得到一堆
+`TS2305`，所以脚本选择在动手之前停下，并对照 `Get-ModuleImportBindings` / `Get-ModuleExportNames`
+算出具体丢了哪些名字：
+
+```
+运行时载荷层迁移被拒绝：dsh-desktop-next 的 scripts/prepare-runtime.ts（dsh 0.2.1-rc.4 线）
+已不再导出 DesktopRuntimeArch、desktopRuntimeBuildPaths、… ，而 dsh-plugin-desktop 的脚本
+仍在 import 这些符号 —— 两条 harness 线的运行时 API 已分叉。
+```
+
+这不是缺陷，是护栏：**stable 通道不能跨到 next 线**。给 stable 传 `-HarnessVersion 0.2.1-rc.4`
+必然撞上它 —— stable 要么不传该参数（跟随 `upstream.json` 的 `0.2.1-rc.3`），要么显式传
+`0.2.1-rc.3`。`next` 通道本身就在 rc.4 线上，传 rc.4 属于「同线」，不会进迁移分支。
 
 | 文件 | 随线变化的内容 |
 |---|---|
@@ -719,6 +821,14 @@ Error: Desktop runtime: missing x64 Office checker:
 | `[05]` 依赖安装 | 网络、缓存、版本漂移、补丁多点应用 |
 | `[07]` package:dir | electron-builder、afterPack 门禁、vite 编译、electron dist |
 | `[09]` 产物核对 | 覆盖层代码没真正进产物 |
+
+> **`[16]` 报「补丁代码缺失」时，先验产物本身再动代码。** 2026-10-30 踩过：断言走
+> `.asar-probe.cjs` 调 `asar.extractFile`，传的是 `/` 分隔路径，而该版本只认 `\`
+> （Windows 归档里的条目名就是反斜杠），于是产物里明明有 `DSH_WEB_TOKEN` 也被判成缺失。
+> 判别方法：**若 `list` 出来的条目存在性检查全绿、只有 marker 检查报缺失，基本就是探针读不到
+> 而不是产物没有** —— 手动 `npx @electron/asar extract-file <app.asar> <条目>` 核一遍即可。
+> 探针现在会依次尝试原文 / 反斜杠 / 正斜杠，并在条目表里按归一化路径兜底；同时改为每次构建
+> 重写（以前是存在即复用，会让改过的探针代码失效）。
 
 **2. 读完整日志，不要只看控制台。** 控制台输出可能被截断——例如在管道里用 `| Select-Object -First N`，PowerShell 会在收满 N 行后**提前终止上游命令**，看起来像构建中途死掉，其实是被管道杀了。完整日志在：
 
@@ -1481,13 +1591,18 @@ install 会输出 `YN0002`（market 未在自己 `peerDependencies` 里声明部
 - `quick-build.bat` - stable 通道一键编译+解包（先对齐子模块，不打 ZIP）
 - `quick-build-overlay.bat` - 同上，附加 `-Overlay` 覆盖层
 - `overlay\` - stable 覆盖层（`src\` 新文件 + `patches\` 补丁）
+- `tools\dsh-web-access.ps1` - Web 访问补丁模块（`-FixedTokenPatch`，两个通道共用）
+- `tools\github-proxy.ps1` - GitHub 加速前缀模块（`-GitHubProxy`，两个通道共用）
 
 ### DSH NEXT 通道
 
 - `build-next.ps1` - next 通道构建脚本（独立，理由见「DSH NEXT 通道」）
 - `quick-build-next.bat` - next 通道一键编译+解包
-- `overlay-next\` - next 覆盖层。**2026-10-14 起只含 `src\startup-config(.spec).ts` +
-  `patches\main.ts.patch` + `startup.json`**（ASAR 相关的三份补丁已撤销，理由见「覆盖层（overlay-next）」）
+- `overlay-next\` - next 覆盖层。**2026-10-30 起含 `src\startup-config(.spec).ts` +
+  `patches\main.ts.patch`（启动配置 / `DSH_HOME` / 页面缩放）+ `patches\main-lifecycle.spec.ts.patch`
+  + `startup.json`**（ASAR 相关的三份补丁已撤销、`window-state.ts` 已被上游 #1514 接管，
+  理由见「覆盖层（overlay-next）」）；`patches\index.ts.patch` 是 `-ListenAllNetworkPatch`
+  的源码侧，只应用不导出
 
 ### 子模块 / 上游
 

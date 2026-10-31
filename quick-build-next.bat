@@ -22,16 +22,24 @@ echo   quick-build-next.bat -HarnessVersion 0.2.1-rc.2   (dsh runtime version)
 echo   quick-build-next.bat -PnpmVersion 11.28.5         (needs overlay\pnpm\pnpm@^<ver^>.patch)
 echo   quick-build-next.bat -Preview                     (inject only, print diff, no build)
 echo   quick-build-next.bat -SkipPull
+echo   quick-build-next.bat -GitHubProxy https://gh-proxy.com/
+echo     ^(prefix every GitHub HTTPS URL: clone, fetch, submodule update, ls-remote
+echo      and the Electron dist download. Plain -GhProxy works too. Drop the
+echo      argument to go direct again -- nothing is written into any repo^)
 echo   quick-build-next.bat -FixedTokenPatch -ListenAllNetworkPatch
 echo     ^(these are PATCH SWITCHES, not values: they only add the code that READS
-echo      DSH_WEB_TOKEN / DSH_NEXT_WEB_HOST. The actual values go into startup.json
-echo      beside the exe -- change them there later without rebuilding:
+echo      DSH_WEB_TOKEN / DSH_WEB_HOST / DSH_WEB_PORT. The actual values go
+echo      into startup.json beside the exe -- change them there later without
+echo      rebuilding:
 echo        { "version": 1, "env": {
-echo            "DSH_NEXT_WEB_HOST": "0.0.0.0",
+echo            "DSH_WEB_HOST": "0.0.0.0",
+echo            "DSH_WEB_PORT": "3080",
 echo            "DSH_WEB_TOKEN": "MyFixedToken_2026",
 echo            "DSH_WEB_TRUSTED_HOSTS": "[\"139.9.73.189\"]" } }
 echo      ^(DSH_WEB_TRUSTED_HOSTS is a JSON array string, same format as upstream
-echo       DSH_NEXT_TRUSTED_HOSTS; a plain "1.2.3.4,5.6.7.8" is accepted too^)
+echo       DSH_NEXT_TRUSTED_HOSTS; a plain "1.2.3.4,5.6.7.8" is accepted too.
+echo       DSH_WEB_PORT: 1-65535, omitted = the port from Settings, 0 = let the OS
+echo       pick one. Either switch adds the code that reads it.^)
 echo      Neither switch = upstream behaviour: loopback only + random token per launch.^)
 echo.
 rem echo Press Ctrl+C to cancel, or

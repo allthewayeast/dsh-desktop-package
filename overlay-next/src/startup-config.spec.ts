@@ -74,7 +74,8 @@ describe('applyDesktopStartupConfig', () => {
     writeFileSync(path, JSON.stringify({
       version: 1,
       env: {
-        DSH_NEXT_WEB_HOST: '0.0.0.0',
+        DSH_WEB_HOST: '0.0.0.0',
+        DSH_WEB_PORT: '3080',
         DSH_WEB_TOKEN: 'FixedToken_1234567890',
         DSH_WEB_TRUSTED_HOSTS: '["192.168.1.9","139.9.73.189"]',
       },
@@ -83,7 +84,8 @@ describe('applyDesktopStartupConfig', () => {
     const result = applyDesktopStartupConfig({ configPath: path, environment: {} })
 
     expect(result.envUpdates).toEqual([
-      ['DSH_NEXT_WEB_HOST', '0.0.0.0'],
+      ['DSH_WEB_HOST', '0.0.0.0'],
+      ['DSH_WEB_PORT', '3080'],
       ['DSH_WEB_TOKEN', 'FixedToken_1234567890'],
       ['DSH_WEB_TRUSTED_HOSTS', '["192.168.1.9","139.9.73.189"]'],
     ])

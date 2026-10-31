@@ -119,20 +119,21 @@ const BOOTSTRAP_PREFIXES = [
 /**
  * `DSH_*` names a user-owned startup config may set. The file lives next to the
  * executable the user launched, so the Home override, the telemetry opt-out, and
- * the Web-access values (listening address / launch token / extra trusted entries)
- * are safe; every other `DSH_*` name keeps changing how the process starts and
- * stays refused.
+ * the Web-access values (listening address / listening port / launch token /
+ * extra trusted entries) are safe; every other `DSH_*` name keeps changing how
+ * the process starts and stays refused.
  */
 const DSH_ALLOWED_NAMES = new Set([
   'DSH_HOME',
   'DSH_TELEMETRY_DISABLED',
-  // Controlled Web entry: the code that reads these three is added by
+  // Controlled Web entry: the code that reads these four is added by
   // `build-next.ps1 -FixedTokenPatch / -ListenAllNetworkPatch`; the values themselves are
   // written by hand into startup.json (rebuild not needed to change them).
-  // These three decide where the Web carrier listens and which launch token it accepts;
+  // These four decide where the Web carrier listens and which launch token it accepts;
   // they cannot redirect code, instructions, or the runtime tree, so they sit at the same
   // risk level as DSH_HOME — not with the bootstrap names below.
-  'DSH_NEXT_WEB_HOST',
+  'DSH_WEB_HOST',
+  'DSH_WEB_PORT',
   'DSH_WEB_TOKEN',
   'DSH_WEB_TRUSTED_HOSTS',
 ])

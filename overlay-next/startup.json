@@ -1,21 +1,19 @@
 {
   "version": 1,
   "env": {
-    "DSH_HOME": "E:\\AppData\\YMZ\\.dsh-desktop-next",
+    "DSH_HOME": "E:\\AppData\\YMZ\\.dsh-desktop",
+    "DSH_WEB_HOST": "0.0.0.0",
+    "DSH_WEB_PORT": "1024",
+    "DSH_WEB_TOKEN": "5R4FDBbGutvRAnIiEf9-Di5RKAfxlsRe9TtVA7h5JjQ",
+    "DSH_WEB_TRUSTED_HOSTS": "127.0.0.1,192.168.71.168",
     "DSH_TELEMETRY_DISABLED": "1",
     "PATH": "E:\\App\\CodeGraph\\bin;%PATH%",
     "PNPM_CONFIG_REGISTRY": "https://registry.npmmirror.com"
   },
   "electron": {
     "switches": [
-      {
-        "name": "disable-direct-write",
-        "value": null
-      },
-      {
-        "name": "disable-features",
-        "value": "RendererCodeIntegrity"
-      }
+      { "name": "disable-direct-write", "value": null },
+      { "name": "disable-features", "value": "RendererCodeIntegrity" }
     ]
   }
 }

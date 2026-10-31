@@ -1,8 +1,8 @@
 diff --git a/dsh-desktop-next/src/host/index.ts b/dsh-desktop-next/src/host/index.ts
-index 46c287d0bb..b24f30b997 100644
+index 05e5418321..ec23b7afc7 100644
 --- a/dsh-desktop-next/src/host/index.ts
 +++ b/dsh-desktop-next/src/host/index.ts
-@@ -28,6 +28,23 @@ import { formatFatalDiagnostic } from './fatal-diagnostic.ts'
+@@ -27,6 +27,35 @@ import { formatFatalDiagnostic } from './fatal-diagnostic.ts'
  import * as desktopOffice from './office.ts'
  import { resolveOfficeConfig } from './office.ts'
  
@@ -23,19 +23,36 @@ index 46c287d0bb..b24f30b997 100644
 +  return value.split(/[,;\s]+/).map(entry => entry.trim()).filter(entry => entry !== '')
 +}
 +
++// 【本地覆盖层 web-access】监听端口的解析。0 保留上游语义「让系统挑一个」，
++// 所以「未设置」和「显式 0」必须区分：前者回落到设置里的偏好值，后者强制自动分配。
++// 端口只能在 1–65535 里挑一个可用的，写错就在这里报出来，不要带着 NaN 往下传到 Config schema。
++function parseWebPortEnv(raw: string | undefined): number {
++  const value = raw?.trim() ?? ''
++  if (value === '') return 0
++  if (!/^\d{1,5}$/u.test(value) || Number(value) > 65_535) {
++    throw new Error('Invalid DSH_WEB_PORT: expected an integer from 0 through 65535')
++  }
++  return Number(value)
++}
++
  export async function main(): Promise<void> {
    // The Host lists and reads user workspaces; see asar-archive-policy.ts.
    disableAsarArchiveView(import.meta.url)
-@@ -61,9 +78,22 @@ export async function main(): Promise<void> {
+@@ -60,10 +89,31 @@ export async function main(): Promise<void> {
    delete process.env[SYSTEM_PROXY_ENV]
    const profile = loadNextProfile(projectDir, home)
    const runtimePatch = join(projectDir, 'desktop-next.runtime.patch.json')
-+  // 【本地覆盖层 web-access】监听地址与「额外受信入口」改由启动环境给出，默认仍是回环。
-+  //   DSH_NEXT_WEB_HOST     —— 0.0.0.0 / :: 或具体网卡 IP 字面量（上游 Config schema 会校验）
++  // 【本地覆盖层 web-access】监听地址、端口与「额外受信入口」改由启动环境给出，默认仍是回环 + 偏好值。
++  //   DSH_WEB_HOST          —— 0.0.0.0 / :: 或具体网卡 IP 字面量（上游 Config schema 会校验）
++  //   DSH_WEB_PORT          —— 1–65535；0 = 让系统挑（上游默认）；不写则沿用设置里的端口偏好
 +  //   DSH_WEB_TRUSTED_HOSTS —— 额外 authority，与 DSH_NEXT_TRUSTED_HOSTS 同格式：JSON 数组字符串
 +  //                            （也接受逗号分隔）；通配绑定时 /api 围栏只认逐个登记的入口
 +  // 值来自 exe 同级的 startup.json（由 startup-config.ts 放行），也可用同名环境变量覆盖。
-+  const webHost = process.env.DSH_NEXT_WEB_HOST?.trim() || '127.0.0.1'
++  // 三个名字同属 DSH_WEB_ 族：DSH_NEXT_ 是上游「主进程注入、host 读完即删」的内部通道，
++  // 与用户手写的启动配置不是一个东西，不要混用。
++  const webHost = process.env.DSH_WEB_HOST?.trim() || '127.0.0.1'
++  const webPortEnv = process.env.DSH_WEB_PORT?.trim()
++  const webPort = webPortEnv === undefined || webPortEnv === '' ? preferences.port : parseWebPortEnv(webPortEnv)
 +  const extraTrustedHosts = parseTrustedHostsEnv(process.env.DSH_WEB_TRUSTED_HOSTS)
 +  // 非通配、非回环的绑定地址由围栏按「监听地址本身」自动信任；通配绑定则必须逐条登记。
 +  // 默认路径（127.0.0.1）不往 trustedHosts 里加任何东西 —— 与上游配置逐字一致。
@@ -46,12 +63,25 @@ index 46c287d0bb..b24f30b997 100644
    atomicJson(runtimePatch, [
 -    { id: 'desktop-next-webserver', config: { host: '127.0.0.1', port: preferences.port } },
 -    { id: 'connection', config: { trustedHosts } },
-+    { id: 'desktop-next-webserver', config: { host: webHost, port: preferences.port } },
++    { id: 'desktop-next-webserver', config: { host: webHost, port: webPort } },
 +    { id: 'connection', config: { trustedHosts: remainingTrustedHosts } },
    ])
++  // 设置页显示的仍是偏好值，端口被 startup.json 顶掉时这一行是唯一的现场证据。
++  hostLog({ source: 'host', event: 'web.listen.plan', fields: { host: webHost, port: webPort,
++    portSource: webPortEnv === undefined || webPortEnv === '' ? 'preferences' : 'DSH_WEB_PORT' } })
    // runProfile installs the outbound proxy policy from this environment before any plugin mounts.
    const { environment, resolution: proxy } = withSystemProxy(loadLayeredEnv('dsh-desktop-next'), systemProxy, trustedHosts as string[])
-@@ -141,7 +171,7 @@ export async function main(): Promise<void> {
+   // One line on every start, direct included: a connectivity report cannot be answered without it.
+@@ -79,7 +129,7 @@ export async function main(): Promise<void> {
+     resolvedProfile: { profile, installAnchor: NEXT_PACKAGE,
+       readPatches: profilePatches => readNextProfilePatches(projectDir, home,
+         [join(runtimeDir, 'host.cordis.patch.yml'), join(projectDir, 'desktop-next.cordis.patch.json'), runtimePatch], profilePatches) },
+-    patchFiles: [join(runtimeDir, 'host.cordis.patch.yml'), join(projectDir, 'desktop-next.cordis.patch.json'), runtimePatch], args: ['--no-open', '--port', String(preferences.port)],
++    patchFiles: [join(runtimeDir, 'host.cordis.patch.yml'), join(projectDir, 'desktop-next.cordis.patch.json'), runtimePatch], args: ['--no-open', '--port', String(webPort)],
+     packageManager: bundledPnpmInvocation(runtimeDir),
+   })
+   // Memory evidence for the Desktop's incident snapshots. Pushed rather than requested, so a Host too
+@@ -143,7 +193,7 @@ export async function main(): Promise<void> {
      try { await ctx.plugin(desktopOffice, office); mounted() } catch (error) { mounted(error); throw error }
    }
    hostLog({ source: 'host', event: 'process.ready' })

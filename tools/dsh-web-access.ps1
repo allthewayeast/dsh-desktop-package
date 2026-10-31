@@ -469,14 +469,19 @@ function Get-DshWebAccessStartupGuide {
     [switch]$ListenAllNetwork
   )
   $lines = New-Object System.Collections.Generic.List[string]
-  if ($FixedToken) {
-    $lines.Add('"DSH_WEB_TOKEN": "<至少 16 位，字符集 A-Za-z0-9_- >"')
-  }
   if ($ListenAllNetwork) {
-    $lines.Add('"DSH_NEXT_WEB_HOST": "0.0.0.0"')
+    $lines.Add('"DSH_WEB_HOST": "0.0.0.0"')
     # 与上游 DSH_NEXT_TRUSTED_HOSTS 同格式：JSON 数组（在 env 里要当字符串写，所以引号需转义）。
     # 引擎侧同时接受逗号分隔，嫌转义麻烦可以整行换成 "1.2.3.4,5.6.7.8"。
     $lines.Add('"DSH_WEB_TRUSTED_HOSTS": "[\"<其它机器的 IP>\"]"')
+  }
+  # 端口：两个开关任一给了就认这个变量（源码侧补丁是共用的）。
+  # 不写 = 沿用设置里的 port；写 0 = 让系统挑一个（每次启动都会变，远程访问别用）。
+  if ($FixedToken -or $ListenAllNetwork) {
+    $lines.Add('"DSH_WEB_PORT": "<1-65535，例如 3080>"')
+  }
+  if ($FixedToken) {
+    $lines.Add('"DSH_WEB_TOKEN": "<至少 16 位，字符集 A-Za-z0-9_- >"')
   }
   return $lines.ToArray()
 }

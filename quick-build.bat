@@ -15,7 +15,17 @@ echo     tray icons, pnpm.mjs patch
 echo   - Build and package dsh-plugin-desktop to dist\win-unpacked
 echo   - NOT create any ZIP package
 echo.
+echo Optional: extra build.ps1 arguments can be appended, e.g.
+echo   quick-build.bat -GitHubProxy https://gh-proxy.com/
+echo     ^(route GitHub clone / fetch / submodule / Electron download through a
+echo      mirror; -GhProxy works too, drop it to go direct again^)
+echo   quick-build.bat -Overlay -FixedTokenPatch
+echo     ^(a PATCH SWITCH, not a value: adds the code that READS DSH_WEB_TOKEN;
+echo      the token itself goes into startup.json beside the exe^)
+echo Do NOT repeat -Target / -SkipSubmodule here: duplicate named parameters
+echo are a hard error under pwsh -File.
+echo.
 rem echo Press Ctrl+C to cancel, or
 rem pause
 echo.
-pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0build.ps1" -Target package-dir -SkipSubmodule
+pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0build.ps1" -Target package-dir -SkipSubmodule %*

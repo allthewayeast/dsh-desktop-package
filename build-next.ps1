@@ -19,13 +19,14 @@
     5. 不做图标处理（按需求）。
     6. 运行时跟随上游（不再钉 0.1.7-rc.2），deepseek-harness 子模块对齐上游 HEAD 的 gitlink。
 
-  overlay-next 负责三件事：启动配置、主窗口几何持久化、页面缩放（Ctrl/Cmd `+` `-` `0`）。
+  overlay-next 负责两件事：启动配置、页面缩放（Ctrl/Cmd `+` `-` `0`）。
+    主窗口几何持久化曾经也在这里，但上游 #1514（feat(desktop): restore the main window's
+    bounds and maximized state in Next and Beta）已经自带 main-window-state.ts，功能等价，
+    所以本覆盖层的 window-state.ts 与其单测一并删除 —— 两套实现同时存在只会互相覆盖状态。
     overlay-next\src\startup-config.ts        新文件：启动配置解析（网络/环境变量开关）
     overlay-next\src\startup-config.spec.ts   新文件：配套单测
-    overlay-next\src\window-state.ts          新文件：主窗口位置/大小持久化
-    overlay-next\src\window-state.spec.ts     新文件：配套单测
     overlay-next\patches\main.ts.patch        接入 applyDesktopStartupConfig、DSH_HOME 回退、
-                                              窗口几何恢复/保存、主进程页面缩放快捷键
+                                              主进程页面缩放快捷键
     overlay-next\startup.json                 运行时数据，构建后拷到 exe 同级
   "让 DSH_HOME 生效"不是附加功能：startup.json 里配置的就是 DSH_HOME，而 next 原本只认
   DSH_DESKTOP_NEXT_HOME，不补这段启动配置就落不到 home 上。
@@ -93,18 +94,22 @@
       { "version": 1, "env": { "DSH_WEB_TOKEN": "<至少 16 位，A-Za-z0-9_- >" } }
   也可以直接用同名环境变量（优先级高于文件）。换 token 重启即可，不必重编。
 
-.PARAMETER ListenAllInterfacesPatch
+.PARAMETER ListenAllNetworkPatch
   【补丁开关，不是值】把「可以绑定 0.0.0.0（本机所有网卡）」这个能力编进产物，共两处：
     · 运行时产物（tools\dsh-web-access.ps1 的 listen 组）：放行通配地址、通配绑定时的 URL
       回落成回环、删掉 `dsh web --host` 的 CLI 守卫；
     · 源码补丁（overlay-next\patches\index.ts.patch）：Host 把 webserver 的 host 从写死的
-      127.0.0.1 改成读 DSH_NEXT_WEB_HOST。
+      127.0.0.1 改成读 DSH_WEB_HOST、port 改成读 DSH_WEB_PORT。
   **不给这个开关就不打补丁**，产物仍只监听 127.0.0.1（上游行为）。
 
   打了之后监听地址从哪来？同样写进 startup.json：
-      { "version": 1, "env": { "DSH_NEXT_WEB_HOST": "0.0.0.0" } }
+      { "version": 1, "env": { "DSH_WEB_HOST": "0.0.0.0" } }
   通配绑定时 /api 围栏**不会**自动信任别的机器，每个要用的入口都得登记：
       "DSH_WEB_TRUSTED_HOSTS": "[\"192.168.1.9\",\"139.9.73.189\"]"
+
+  端口另有一个 DSH_WEB_PORT（1–65535，0 = 让系统挑；不写就沿用设置页的 port）。
+  它来自上面这份**共用**的源码补丁，所以给 -FixedTokenPatch 也能用：
+      "DSH_WEB_PORT": "3080"
   格式与上游 DSH_NEXT_TRUSTED_HOSTS 一致：JSON 数组字符串（env 只能存字符串，所以要转义引号）；
   也接受逗号分隔的 "192.168.1.9,139.9.73.189"，两种都认。格式写错会启动报错，不会静默放过。
   （172.16/192.168 这类局域网地址由桌面自己采样，公网/NAT 地址必须显式给。）
@@ -113,19 +118,33 @@
   钉在 127.0.0.1，单网卡绑定后回环不再监听，窗口立刻连不上。要「只有某个地址能访问」，
   用 0.0.0.0 + DSH_WEB_TRUSTED_HOSTS 收窄围栏。
 
-  别名为 -ListenAllInterfacesPatch / -WildcardListenPatch（语义更准确：监听所有**网卡**，
-  不是「所有网段」）。
+  别名为 -ListenAllInterfacesPatch / -WildcardListenPatch（说得更准：监听所有**网卡**，
+  不是「所有网段」——0.0.0.0 跟 subnet 是两回事）。
 
   注意：外部浏览器要能打开，还必须在 DSH NEXT 设置里勾选「允许在浏览器中打开」
   （browserAccess；它是 Desktop 自己的门，与 token 无关）。
+
+.PARAMETER GitHubProxy
+  GitHub 加速前缀，例如 https://gh-proxy.com/（别名 -GhProxy）。**未指定时直连**。
+  给了之后 GitHub 的 HTTPS 地址会变成「前缀 + 原地址」：
+      https://github.com/anywhere-labs/dsh-desktop
+        → https://gh-proxy.com/https://github.com/anywhere-labs/dsh-desktop
+  实现方式是 git 的 `url.<前缀>…insteadOf`，所以**一次配置全覆盖**：clone、fetch、
+  submodule update（含嵌套子模块）、ls-remote 都自动走前缀，仓库地址本身不改
+  （去掉参数就完全回到直连，工作区不留改动）。Electron 发行包下载也套同一前缀并排到镜像列表最前。
+  只匹配 https://github.com/ —— SSH 形式（git@github.com:…）不会被重写，要加速得先把
+  remote 换成 HTTPS。值必须以 http:// 或 https:// 开头，末尾斜杠会自动补齐。
+  代理服务本身可能失效或限速，失败时先用不带本参数的命令重试，确认是代理问题再换服务。
 
 .EXAMPLE
   pwsh -File .\build-next.ps1
   pwsh -File .\build-next.ps1 -Target package-dir -SkipSubmodule -ElectronVersion 44.4.5
   pwsh -File .\build-next.ps1 -HarnessVersion 0.2.1-rc.2 -PnpmVersion 11.28.5
   pwsh -File .\build-next.ps1 -Preview -ElectronVersion 44.9.2 -PnpmVersion 11.28.5
-  pwsh -File .\build-next.ps1 -FixedTokenPatch -ListenAllInterfacesPatch
+  pwsh -File .\build-next.ps1 -FixedTokenPatch -ListenAllNetworkPatch
   # ↑ 只决定「打不打补丁」；IP / Token 另写到 exe 同级的 startup.json（见上）
+  pwsh -File .\build-next.ps1 -GitHubProxy https://gh-proxy.com/
+  # ↑ 拉源码 / 子模块 / Electron 包都走加速前缀
 #>
 [CmdletBinding()]
 param(
@@ -159,8 +178,20 @@ param(
   # 只决定「要不要把这段代码能力编进产物」；IP / Token 写在 exe 同级的 startup.json 里，
   # 与编译无关，换值不必重编。两个开关都不给 = 产物与上游完全一致。
   [switch]$FixedTokenPatch,
+  # 别名不能与参数名本身相同（PowerShell 会以「同名参数别名冲突」拒绝 Get-Help / 绑定），
+  # 所以别名里只留语义等价的两个写法，主名仍是 -ListenAllNetworkPatch。
   [Alias('ListenAllInterfacesPatch', 'WildcardListenPatch')]
-  [switch]$ListenAllInterfacesPatch
+  [switch]$ListenAllNetworkPatch,
+
+  # --- GitHub 加速前缀（'' = 直连）---
+  # 给 GitHub 的 HTTPS 地址套一个前缀，例如 'https://gh-proxy.com/'：
+  #   https://github.com/anywhere-labs/dsh-desktop
+  #     → https://gh-proxy.com/https://github.com/anywhere-labs/dsh-desktop
+  # 靠 git 的 url.<前缀>…insteadOf 实现，所以 clone / fetch / submodule update /
+  # ls-remote 全部自动生效（含嵌套子模块）；Electron 发行包下载也套同一前缀。
+  # 只匹配 https://github.com/ —— SSH 形式（git@github.com:…）不会被重写。
+  [Alias('GhProxy')]
+  [string]$GitHubProxy = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -173,6 +204,20 @@ $script:Src = Join-Path $script:Root 'dsh-desktop'
 $script:SrcRepository = 'https://github.com/anywhere-labs/dsh-desktop'
 $script:SrcBranch = 'master'
 
+# ---------------- GitHub 加速前缀（-GitHubProxy）----------------
+# 靠 git 的 url.<前缀>…insteadOf 重写，不改 $script:SrcRepository 本身 ——
+# 仓库地址保持原样，去掉参数就完全回到直连，工作区里不留「改过的 remote」。
+#   'https://gh-proxy.com/' → https://github.com/x → https://gh-proxy.com/https://github.com/x
+# 生效两条腿：进程环境变量 GIT_CONFIG_COUNT（git ≥2.31，连 git 自己 fork 的子进程、
+# yarn 内部调的 git 都走前缀）+ 各调用点的显式 -c（老版本 git 的兜底）。
+$script:GitHubProxyModule = Join-Path $script:Root 'tools\github-proxy.ps1'
+if (-not (Test-Path -LiteralPath $script:GitHubProxyModule)) {
+  throw "缺少 GitHub 加速模块：$script:GitHubProxyModule"
+}
+. $script:GitHubProxyModule
+$script:GitHubProxyPrefix = Initialize-GitHubProxy $GitHubProxy
+$script:GitHubProxyGitArgs = @(Get-GitHubProxyGitArgs $script:GitHubProxyPrefix)
+
 # 通道工作区（next 自己的目录名）
 $script:WsName = 'dsh-desktop-next'
 $script:WsDir = Join-Path $script:Src $script:WsName
@@ -182,23 +227,24 @@ $script:WsDir = Join-Path $script:Src $script:WsName
 #
 #   -FixedTokenPatch        [token]  让启动 token 可以从外部定住
 #                                    改 dsh-client-connection 产物：config.launchToken ?? $env:DSH_WEB_TOKEN
-#   -ListenAllInterfacesPatch  [listen] 允许绑定 0.0.0.0（本机所有网卡）
+#   -ListenAllNetworkPatch  [listen] 允许绑定 0.0.0.0（本机所有网卡）
 #                                    改 dsh-host-webserver / dsh-web-app 产物（放行通配 + URL 回落环 + 删 CLI 守卫），
-#                                    外加 overlay-next\patches\index.ts.patch（Host 把 host 读成 DSH_NEXT_WEB_HOST）
+#                                    外加 overlay-next\patches\index.ts.patch（Host 把 host 读成 DSH_WEB_HOST、
+#                                    port 读成 DSH_WEB_PORT）
 #
-# 值写在哪：exe 同级的 startup.json（或真实环境变量），**编译期不写死**，换 IP/Token 不必重编。
+# 值写在哪：exe 同级的 startup.json（或真实环境变量），**编译期不写死**，换 IP/端口/Token 不必重编。
 # 详见 BUILD_GUIDE.md 的「远端访问」一节。
 #
 # ⚠️ 两个开关都不给时，一层补丁都不打，产物保持上游行为（只监听回环 + 每次启动随机 token）。
 #    唯一的例外是 startup-config 本身（overlay-next\src\startup-config.ts）：它是覆盖层的既有能力
-#    （读 exe 同级的 startup.json），始终生效；它只是「允许」这三个 DSH_* 键，不代表补丁打了。
+#    （读 exe 同级的 startup.json），始终生效；它只是「允许」这四个 DSH_* 键，不代表补丁打了。
 $script:WebAccessModule = Join-Path $script:Root 'tools\dsh-web-access.ps1'
 if (-not (Test-Path -LiteralPath $script:WebAccessModule)) {
   throw "缺少补丁模块：$script:WebAccessModule"
 }
 . $script:WebAccessModule
 $script:TokenPatchActive = [bool]$FixedTokenPatch
-$script:ListenPatchActive = [bool]$ListenAllInterfacesPatch
+$script:ListenPatchActive = [bool]$ListenAllNetworkPatch
 # 任意一组要打就跑运行时补丁；具体打哪组由 -Groups 决定。
 $script:WebAccessActive = $script:TokenPatchActive -or $script:ListenPatchActive
 $script:WebAccessGroups = @()
@@ -267,23 +313,20 @@ $script:ExcludedWorkspaces = @()
 $script:OverlayDir = Join-Path $script:Root 'overlay-next'
 # 新建文件（上游无此文件）：overlay-next\src\<basename> -> <工作区相对路径>
 $script:OverlayFiles = @{
-  'dsh-desktop-next/src/startup-config.ts'      = 'startup-config.ts'
-  'dsh-desktop-next/tests/startup-config.spec.ts' = 'startup-config.spec.ts'
-  # 主窗口位置/大小持久化：上游没有这个模块，main.ts 补丁里 import './window-state.ts'。
-  # ⚠️ 它**只能**以「新建文件」交付：dsh-desktop\ 是被本仓库 gitignore 的独立仓库，
+  # ⚠️ 只以「新建文件」交付：dsh-desktop\ 是被本仓库 gitignore 的独立仓库，
   #    写在那边的文件既不进本仓库、换机器/重新克隆后也不存在 —— 那样补丁会剩下一句
   #    指向空处的 import（TS2307），构建直接失败。2026-10-21 复盘时就是这样差点漏推。
-  'dsh-desktop-next/src/window-state.ts'         = 'window-state.ts'
-  'dsh-desktop-next/tests/window-state.spec.ts'  = 'window-state.spec.ts'
+  'dsh-desktop-next/src/startup-config.ts'      = 'startup-config.ts'
+  'dsh-desktop-next/tests/startup-config.spec.ts' = 'startup-config.spec.ts'
 }
 # 已跟踪文件的修改：overlay-next\patches\<basename>.patch
 $script:OverlayPatches = @(
   'dsh-desktop-next/src/main.ts'
-  # 主窗口几何回归用例：main.ts 的窗口状态接线需要假 Electron 提供窗口几何 API
-  # （isMaximized/maximize/getNormalBounds/screen），否则每个主窗口用例都会中断。
+  # 页面缩放回归用例：main.ts 的缩放接线需要假 Electron 提供 getZoomLevel/setZoomLevel，
+  # 否则 Ctrl/Cmd `+`/`-` 的用例会在第一次断言时中断。窗口几何那部分上游 #1514 已自带。
   'dsh-desktop-next/tests/main-lifecycle.spec.ts'
   # 可控 Web 入口（监听地址 / Token）的第一半：Host 把 webserver 的 host 从写死的
-  # 127.0.0.1 改成读 DSH_NEXT_WEB_HOST，并把绑定地址/额外入口登记进 connection.trustedHosts。
+  # 127.0.0.1 改成读 DSH_WEB_HOST，并把绑定地址/额外入口登记进 connection.trustedHosts。
   # ⚠️ 补丁文件名由 basename 决定，所以是 index.ts.patch（指 src\host\index.ts）。
   # 另一半是 tools\dsh-web-access.ps1 改的 @deepseek-ai 运行时产物，两半缺一不可。
   'dsh-desktop-next/src/host/index.ts'
@@ -296,12 +339,14 @@ $script:OverlayPatchesApplyOnly = @(
   'dsh-desktop-next/src/host/index.ts'
 )
 
-# 「监听所有网卡」补丁的**源码侧**那一半：只有给了 -ListenAllInterfacesPatch 才应用。
-#   host\index.ts 让 webserver 的 host 读 DSH_NEXT_WEB_HOST、并把绑定地址登记进 trustedHosts。
-#   另一半是 tools\dsh-web-access.ps1 的 listen 组（dsh-host-webserver / dsh-web-app 产物）——
-#   两半缺一不可：只改源码不改产物，通配地址仍会被上游守卫拒掉。
+# 可控 Web 入口补丁的**源码侧**那一半：任一 Web 访问开关（-FixedTokenPatch / -ListenAllNetworkPatch）
+# 给了就应用。
+#   host\index.ts 让 webserver 的 host 读 DSH_WEB_HOST、port 读 DSH_WEB_PORT，并把绑定
+#   地址登记进 trustedHosts —— 缺了它，startup.json 里写了这两个变量也没人看。
+#   另一半是 tools\dsh-web-access.ps1 的运行时补丁（token / listen 两组）——
+#   listen 那组必须与源码侧同时存在：只改源码不改产物，通配地址仍会被上游守卫拒掉。
 #   （固定 Token 补丁只有产物那一半，不涉及工作区源码。）
-$script:OverlayPatchesRequireListenAllNetwork = @(
+$script:OverlayPatchesRequireWebAccess = @(
   'dsh-desktop-next/src/host/index.ts'
 )
 # 二进制资源：把本仓库 build\ 里的托盘图标覆盖到 next 的 assets\。
@@ -345,20 +390,21 @@ $script:RequiredPayloadEntries = @(
 )
 # 覆盖层专属断言：只有我们的补丁会引入这些字符串。
 #   lib/main.js 必须含 startup-config 的集成点（否则 exe 同级的 startup.json 不会被读）；
-#   同一条目里的 DSH_WEB_TOKEN 来自 startup-config 的白名单字面量，与补丁无关、恒存在。
+#   同一条目里的 DSH_WEB_TOKEN / DSH_WEB_PORT 来自 startup-config 的白名单字面量，与补丁无关、恒存在。
 $script:RequiredMarkers = @{
-  'lib/main.js'                                                  = @('applyDesktopStartupConfig', 'DSH_WEB_TOKEN')
+  'lib/main.js'                                                  = @('applyDesktopStartupConfig', 'DSH_WEB_TOKEN', 'DSH_WEB_PORT')
 }
 
 # 补丁专属断言：**只在该补丁被要求时才检查**。默认构建两个补丁都不打，产物里当然没有
 # 这些标记 —— 按组判断，避免「没要的东西却报缺失」把人拦在产物核对那一步。
 #   token  组：client-connection 产物里必须含 DSH_WEB_TOKEN（否则 startup.json 写了也只是随机值）
-#   listen 组：lib/host.js 必须含监听地址读取点（否则 DSH_NEXT_WEB_HOST 写了没人看）
+#   web    组：lib/host.js 必须含监听地址/端口读取点（否则 DSH_WEB_HOST、DSH_WEB_PORT
+#             写了没人看）。这两个变量来自同一份源码补丁，任一 Web 访问开关都会打上。
 $script:RequiredMarkersWhenTokenPatch = @{
   'node_modules/@deepseek-ai/dsh-client-connection/lib/index.js'  = 'DSH_WEB_TOKEN'
 }
-$script:RequiredMarkersWhenListenPatch = @{
-  'lib/host.js'                                                  = 'DSH_NEXT_WEB_HOST'
+$script:RequiredMarkersWhenWebAccess = @{
+  'lib/host.js'                                                  = @('DSH_WEB_HOST', 'DSH_WEB_PORT')
 }
 
 # ---------------- 日志 ----------------
@@ -417,15 +463,16 @@ function Get-JsonObject {
 #>
 function Resolve-WebAccessPlan {
   if (-not $script:WebAccessActive) {
-    Write-Info '可控 Web 入口：两个补丁都不打（未给 -FixedTokenPatch / -ListenAllInterfacesPatch）'
+    Write-Info '可控 Web 入口：两个补丁都不打（未给 -FixedTokenPatch / -ListenAllNetworkPatch）'
     Write-Info '  → 产物保持上游行为：只监听 127.0.0.1、启动 token 每次随机'
     return
   }
   $parts = New-Object System.Collections.Generic.List[string]
   if ($script:TokenPatchActive) { $parts.Add('- 固定 Token 补丁：代码会读 DSH_WEB_TOKEN') }
-  if ($script:ListenPatchActive) { $parts.Add('- 监听所有网卡补丁：代码会读 DSH_NEXT_WEB_HOST（0.0.0.0）') }
+  if ($script:ListenPatchActive) { $parts.Add('- 监听所有网卡补丁：代码会读 DSH_WEB_HOST（0.0.0.0）') }
+  $parts.Add('- Web 入口源码补丁（任一开关都会打）：代码会读 DSH_WEB_PORT')
   Write-Info ("可控 Web 入口（本次会打这些补丁）：`n  " + ($parts -join "`n  "))
-  Write-Info '  注意：补丁只管「代码认这些变量」，具体 IP / Token 要你自己写进 exe 同级的 startup.json'
+  Write-Info '  注意：补丁只管「代码认这些变量」，具体 IP / 端口 / Token 要你自己写进 exe 同级的 startup.json'
 }
 
 <#
@@ -452,7 +499,9 @@ function Update-SourceRepository {
   Push-Location $script:Src
   try {
     Write-Info "拉取 $script:SrcBranch 并重置本地分支 ..."
-    & git fetch origin 2>&1 | ForEach-Object { Write-Log $_ }
+    # 加速前缀（-GitHubProxy）通过 -c insteadOf 生效；没给时 @gp 是空数组，命令与原来一致。
+    $gp = $script:GitHubProxyGitArgs
+    & git @gp fetch origin 2>&1 | ForEach-Object { Write-Log $_ }
     if ($LASTEXITCODE -ne 0) { throw "git fetch 失败 (exit $LASTEXITCODE)" }
     # --force 丢弃上次构建注入的覆盖层改动，保证每次都从干净快照开始
     & git checkout --force -B $script:SrcBranch "origin/$script:SrcBranch" 2>&1 | ForEach-Object { Write-Log $_ }
@@ -484,8 +533,15 @@ function Ensure-Submodule {
 
   if (-not (Test-Path -LiteralPath (Join-Path $sub '.git'))) {
     Write-Info '初始化 deepseek-harness 子模块 ...'
-    & git -C $script:Src submodule update --init --recursive deepseek-harness 2>&1 | ForEach-Object { Write-Log $_ }
+    $gp = $script:GitHubProxyGitArgs
+    & git @gp -C $script:Src submodule update --init --recursive deepseek-harness 2>&1 | ForEach-Object { Write-Log $_ }
     if ($LASTEXITCODE -ne 0) { throw "submodule update 失败 (exit $LASTEXITCODE)" }
+    # 兜底：子模块 remote 若被写成带前缀的地址，还原（正常情况 git 存的是原始地址，
+    # 只是 `remote get-url` 输出会显示改写后的结果 —— 日志里看到前缀是正常的）。
+    if ($script:GitHubProxyPrefix) {
+      $fixed = @(Reset-GitHubProxyRemotes -RepoPath $script:Src -Prefix $script:GitHubProxyPrefix)
+      if ($fixed.Count -gt 0) { Write-WarnLine "已把 $($fixed.Count) 条子模块地址上残留的加速前缀还原" }
+    }
   }
   if (-not $expected) {
     Write-WarnLine '未读到上游记录的 deepseek-harness gitlink（上游结构变化？），跳过子模块核对。'
@@ -590,10 +646,10 @@ function Apply-Overlay {
     foreach ($rel in $script:OverlayPatches) {
       $patch = Join-Path (Join-Path $script:OverlayDir 'patches') ("$([IO.Path]::GetFileName($rel)).patch")
 
-      # 监听所有网卡补丁的源码侧：没给 -ListenAllInterfacesPatch 就不应用。
+      # 可控 Web 入口补丁的源码侧：两个 Web 访问开关都没给就不应用。
       # 顺手撤掉上一轮可能残留的改动 —— 正常流程里 Update-SourceRepository 的
       # `git checkout --force` 会清干净，但 -SkipPull 复用旧工作区时它不会跑。
-      if ($script:OverlayPatchesRequireListenAllNetwork -contains $rel -and -not $script:ListenPatchActive) {
+      if ($script:OverlayPatchesRequireWebAccess -contains $rel -and -not $script:WebAccessActive) {
         if (Test-Path -LiteralPath $patch) {
           $prevNative = $PSNativeCommandUseErrorActionPreference
           $PSNativeCommandUseErrorActionPreference = $false
@@ -602,7 +658,7 @@ function Apply-Overlay {
             if ($LASTEXITCODE -eq 0) {
               & git apply --reverse $patch 2>$null
               if ($LASTEXITCODE -eq 0) {
-                Write-WarnLine "覆盖层：未给 -ListenAllInterfacesPatch，已撤销 $rel 上残留的补丁"
+                Write-WarnLine "覆盖层：未给 Web 访问开关，已撤销 $rel 上残留的补丁"
               } else {
                 Write-WarnLine "覆盖层：撤销 $rel 的残留补丁失败（工作区可能有别的改动），请手工确认"
               }
@@ -611,7 +667,7 @@ function Apply-Overlay {
             $PSNativeCommandUseErrorActionPreference = $prevNative
           }
         }
-        Write-Info "覆盖层：未给 -ListenAllInterfacesPatch，跳过 $rel（监听所有网卡的 Host 补丁）"
+        Write-Info "覆盖层：未给 -FixedTokenPatch/-ListenAllNetworkPatch，跳过 $rel（Web 入口的 Host 补丁）"
         continue
       }
 
@@ -753,7 +809,9 @@ function Resolve-HarnessCommitFromTag {
       }
     }
     # 注释标签会同时列出 <标签> 与 <标签>^{} 两行，^{} 指向 commit，优先取它。
-    $remote = @(& git ls-remote --tags $script:HarnessRepository "refs/tags/$tag" "refs/tags/$tag^{}" 2>$null)
+    # 远端查询同样吃 -GitHubProxy 的前缀（insteadOf 对命令行 URL 与 remote 都生效）。
+    $gp = $script:GitHubProxyGitArgs
+    $remote = @(& git @gp ls-remote --tags $script:HarnessRepository "refs/tags/$tag" "refs/tags/$tag^{}" 2>$null)
     if ($LASTEXITCODE -ne 0 -or $remote.Count -eq 0) { return $null }
     $peeled = @($remote | Where-Object { $_ -match '\^\{\}\s*$' })
     $line = if ($peeled.Count -gt 0) { [string]$peeled[0] } else { [string]$remote[0] }
@@ -1349,8 +1407,11 @@ function Test-PackagingPosture {
     Write-Info '打包姿态：asar 已启用（上游自带 asarUnpack 清单）'
   }
 
-  # ② npmRebuild：本机没有完整原生编译环境，必须保持 false。
-  if ($build.npmRebuild -ne $false) {
+  # ② npmRebuild：Beta 用 `npmRebuild=false` 跳过 electron-builder 的依赖重编译；Next 则把这个
+  # 标志从参数里直接剔掉（scripts\package.ts 的 withoutRebuildFlag），改由自己的 beforeBuild
+  # hook 拒绝重编译 —— 所以 build 段里已经**没有**这个字段了（2026-10-30 实测）。
+  # StrictMode 下直接读会抛「找不到属性」，先判在不在；只有显式写成 true 才需要告警。
+  if ($build.PSObject.Properties.Name -contains 'npmRebuild' -and $build.npmRebuild -ne $false) {
     Write-WarnLine "打包姿态：build.npmRebuild = $($build.npmRebuild)（期望 false）—— 缺少原生编译环境时打包会失败。"
   }
 
@@ -1631,6 +1692,15 @@ function Ensure-ElectronDist {
     @{ Name = 'npmmirror'; Mirror = 'https://npmmirror.com/mirrors/electron/'; Dir = '{0}' },
     @{ Name = 'github'; Mirror = 'https://github.com/electron/electron/releases/download/'; Dir = 'v{0}' }
   )
+  # -GitHubProxy 给了前缀就把 GitHub 的 release 地址也套上，并排到最前 ——
+  # 主动要代理通常正是因为直连 GitHub 拉不动这个大包（100MB+）。
+  if ($script:GitHubProxyPrefix) {
+    $mirrors = @(
+      @{ Name = 'github(proxy)'
+         Mirror = (Add-GitHubProxyToUrl $script:GitHubProxyPrefix 'https://github.com/electron/electron/releases/download/')
+         Dir = 'v{0}' }
+    ) + $mirrors
+  }
 
   $mirror = $null
   foreach ($m in $mirrors) {
@@ -1742,7 +1812,8 @@ function Get-ArchiveHelper {
   $distDir = Join-Path $script:WsDir 'dist'
   New-Item -ItemType Directory -Force -Path $distDir | Out-Null
   $entry = Join-Path $distDir '.asar-probe.cjs'
-  if (Test-Path -LiteralPath $entry) { return $entry }
+  # 每次都重写：以前是「存在即复用」，结果改了探针代码却读到上一次构建留下的旧文件
+  # （构建在 [16] 失败时 Remove-ArchiveHelper 不会执行，残留必然发生）。
   $code = @'
 // Read one payload entry, or list the archive entry table. Lives inside the
 // workspace so `require('@electron/asar')` resolves to the installed copy.
@@ -1758,18 +1829,37 @@ const [, , mode, archive, arg] = process.argv
 if (mode === 'list') {
   process.stdout.write(asar.listPackage(archive, { isPack: false }).join('\n'))
 } else if (mode === 'read') {
-  try {
-    process.stdout.write(asar.extractFile(archive, arg).toString('utf8'))
-  } catch (error) {
-    process.stderr.write(String(error && error.message ? error.message : error))
+  // 条目名的分隔符随打包宿主平台走（Windows 归档里是 `\`），而调用方一律用 `/`。
+  // @electron/asar 并不总是自动归一化，于是原文查找报 "was not found" —— 产物明明是好的，
+  // 却被判成「补丁代码缺失」（2026-10-30 实际踩到）。所以依次试原文 / 反斜杠 / 正斜杠，
+  // 都不行再按归一化路径去条目表里找真实名字（最慢但最准的一档）。
+  const normalize = p => p.replace(/\\/g, '/').replace(/^\/+/, '')
+  const candidates = [arg, arg.replace(/\//g, '\\'), arg.replace(/\\/g, '/')]
+  let text
+  let lastError
+  for (const candidate of candidates) {
+    try { text = asar.extractFile(archive, candidate).toString('utf8'); break }
+    catch (error) { lastError = error }
+  }
+  if (text === undefined) {
+    try {
+      const target = normalize(arg)
+      const entries = asar.listPackage(archive, { isPack: false })
+      const hit = entries.find(p => normalize(p) === target)
+      if (hit !== undefined) text = asar.extractFile(archive, hit).toString('utf8')
+    } catch (error) { lastError = error }
+  }
+  if (text === undefined) {
+    process.stderr.write(String(lastError && lastError.message ? lastError.message : lastError))
     process.exit(2)
   }
+  process.stdout.write(text)
 } else {
   process.stderr.write('usage: asar-probe.cjs list|read <archive> [entry]')
   process.exit(2)
 }
 '@
-  Set-Content -LiteralPath $entry -Value $code -Encoding utf8
+  Set-Content -LiteralPath $entry -Value $code -Encoding utf8 -Force
   return $entry
 }
 
@@ -1896,19 +1986,24 @@ function Assert-OverlayArtifacts {
         $markerChecks.Add([pscustomobject]@{ Entry = $entry; Marker = $marker; Requires = 'token' })
       }
     }
-    foreach ($entry in $script:RequiredMarkersWhenListenPatch.Keys) {
-      foreach ($marker in @($script:RequiredMarkersWhenListenPatch[$entry])) {
-        $markerChecks.Add([pscustomobject]@{ Entry = $entry; Marker = $marker; Requires = 'listen' })
+    foreach ($entry in $script:RequiredMarkersWhenWebAccess.Keys) {
+      foreach ($marker in @($script:RequiredMarkersWhenWebAccess[$entry])) {
+        $markerChecks.Add([pscustomobject]@{ Entry = $entry; Marker = $marker; Requires = 'web' })
       }
     }
     foreach ($chk in $markerChecks) {
       $required = switch ($chk.Requires) {
         'token'  { $script:TokenPatchActive }
         'listen' { $script:ListenPatchActive }
+        'web'    { $script:WebAccessActive }
         default  { $true }
       }
       if (-not $required) {
-        $which = if ($chk.Requires -eq 'token') { '-FixedTokenPatch' } else { '-ListenAllInterfacesPatch' }
+        $which = switch ($chk.Requires) {
+          'token'  { '-FixedTokenPatch' }
+          'listen' { '-ListenAllNetworkPatch' }
+          default  { '-FixedTokenPatch / -ListenAllNetworkPatch' }
+        }
         $rows.Add([pscustomobject]@{ 项目 = "补丁代码 ($($chk.Entry))"; 结果 = '跳过'; 说明 = "未给 $which，该补丁未打" })
         continue
       }
@@ -2012,6 +2107,11 @@ preview : $($Preview.IsPresent)
   }
   Write-Info "日志: $script:LogPath"
 
+  if ($script:GitHubProxyPrefix) {
+    Write-Info "GitHub 加速前缀：$($script:GitHubProxyPrefix)"
+    Write-Info '  → fetch / submodule update / ls-remote 与 Electron 发行包下载都会套上它'
+  }
+
   # 补丁开关的处理放在这里：让人在装依赖之前就看到「这次会多出哪些代码能力」。
   Resolve-WebAccessPlan
 
@@ -2090,12 +2190,12 @@ preview : $($Preview.IsPresent)
 
   # 运行时补丁必须在「编译/打包」之前：payload 里的 node_modules 是打包时从这棵树拷的，
   # 打完包再改就只改到磁盘上的产物、下次 install 还会还原。
-  # ⚠️ 默认**不打**：只有给了 -FixedTokenPatch / -ListenAllInterfacesPatch 才应用。
+  # ⚠️ 默认**不打**：只有给了 -FixedTokenPatch / -ListenAllNetworkPatch 才应用。
   #    不给开关时产物保持上游行为（回环 + 每次随机 token），运行时补丁不该出现在产物里。
   if ($script:WebAccessActive) {
     Invoke-Step "应用运行时补丁（$($script:WebAccessGroups -join ' / ')）" { Invoke-WebAccessPatch }
   } else {
-    Write-Info '未给 -FixedTokenPatch/-ListenAllInterfacesPatch：跳过运行时补丁（产物保持上游的回环 + 随机 token 行为）'
+    Write-Info '未给 -FixedTokenPatch/-ListenAllNetworkPatch：跳过运行时补丁（产物保持上游的回环 + 随机 token 行为）'
   }
 
   if (-not $env:ELECTRON_MIRROR) { $env:ELECTRON_MIRROR = 'https://npmmirror.com/mirrors/electron/' }
@@ -2126,11 +2226,18 @@ preview : $($Preview.IsPresent)
   Write-Host ('=' * 72) -ForegroundColor Green
   $exeDir = Get-PackagedDir
   if ($exeDir) { Write-Host "产物：$exeDir" }
+  if ($script:GitHubProxyPrefix) {
+    Write-Host ''
+    Write-Host ("GitHub 加速前缀：{0}" -f $script:GitHubProxyPrefix) -ForegroundColor White
+    Write-Host '  已作用于本次的 clone / fetch / submodule update / ls-remote 与 Electron 发行包下载。'
+    Write-Host '  产物里**没有**这个前缀 —— 它只是构建期的网络加速，不影响运行时行为。'
+    Write-Log ("[github-proxy] prefix=$($script:GitHubProxyPrefix)")
+  }
   if ($script:WebAccessActive) {
     Write-Host ''
     Write-Host '可控 Web 入口（已打的补丁）：' -ForegroundColor White
     if ($script:TokenPatchActive) { Write-Host '  · 固定启动 Token —— 产物会读 DSH_WEB_TOKEN' }
-    if ($script:ListenPatchActive) { Write-Host '  · 监听所有网卡 —— 产物会读 DSH_NEXT_WEB_HOST' }
+    if ($script:ListenPatchActive) { Write-Host '  · 监听所有网卡 —— 产物会读 DSH_WEB_HOST' }
     Write-Host ''
     Write-Host '  ↓ 值**不在编译里**，写进 exe 同级的 startup.json（改完重启生效，不必重编）：' -ForegroundColor White
     Write-Host '    {'
@@ -2147,7 +2254,8 @@ preview : $($Preview.IsPresent)
     Write-Host '  临时试一次可用同名环境变量（它能压过文件里的值）。'
     Write-Host '  DSH_WEB_TRUSTED_HOSTS 是 JSON 数组字符串（与上游 DSH_NEXT_TRUSTED_HOSTS 同格式，'
     Write-Host '  只从本机访问可整行删掉）；嫌引号转义麻烦就写 "1.2.3.4,5.6.7.8"，两种都认。'
-    Write-Host '  外部浏览器还需在 DSH NEXT 设置里勾选「允许在浏览器中打开」，端口取设置里的 port。'
+    Write-Host '  外部浏览器还需在 DSH NEXT 设置里勾选「允许在浏览器中打开」；'
+    Write-Host '  端口默认取设置里的 port，写了 DSH_WEB_PORT 就以它为准（设置页显示的是偏好值，以实际监听为准）。'
     Write-Log ("[web-access] patches=$($script:WebAccessGroups -join ',')")
   }
   Write-Info "日志已写入 $script:LogPath"

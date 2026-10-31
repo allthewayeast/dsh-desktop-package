@@ -1,24 +1,17 @@
 diff --git a/dsh-desktop-next/src/main.ts b/dsh-desktop-next/src/main.ts
-index 180b0fa482..86cc27eef6 100644
+index e13c1e567d..1f2ebe7c4c 100644
 --- a/dsh-desktop-next/src/main.ts
 +++ b/dsh-desktop-next/src/main.ts
-@@ -7,13 +7,14 @@ import { writeFile } from 'node:fs/promises'
+@@ -7,7 +7,7 @@ import { access, writeFile } from 'node:fs/promises'
  import { createRequire } from 'node:module'
  import { freemem, totalmem } from 'node:os'
  import { dirname, isAbsolute, join, resolve } from 'node:path'
--import { app, BrowserWindow, clipboard, crashReporter, dialog, ipcMain, Menu, nativeTheme, net, Notification, protocol, safeStorage, session, shell, type IpcMainInvokeEvent, type MenuItemConstructorOptions, type OpenDialogOptions } from 'electron'
+-import { app, BrowserWindow, clipboard, crashReporter, dialog, ipcMain, Menu, nativeTheme, net, Notification, protocol, safeStorage, screen, session, shell, type IpcMainInvokeEvent, type MenuItemConstructorOptions, type OpenDialogOptions } from 'electron'
 +import { app, BrowserWindow, clipboard, crashReporter, dialog, ipcMain, Menu, nativeTheme, net, Notification, protocol, safeStorage, screen, session, shell, type Input, type IpcMainInvokeEvent, type MenuItemConstructorOptions, type OpenDialogOptions, type WebContents } from 'electron'
  import { appRequestHeaders, forwardWebRequest, serveWebDocument } from './web-document.ts'
  import { installAppDownloads } from './app-downloads.ts'
  import { claimDesktopSingleInstance } from './single-instance.ts'
- import { NEXT_PACKAGE, parseFeatures, profileName } from './profiles.ts'
- import { APP_URL, IPC, SHELL_URL } from './ipc.ts'
- import { WINDOWS_TITLEBAR_HEIGHT } from './windows-layout.ts'
-+import { fitWindowRect, pickWorkArea, readNextWindowState, writeNextWindowState, type WindowRect } from './window-state.ts'
- import { preferredDesktopLocale, resolveDesktopLocale } from './menu-locale.ts'
- import { NativeLocaleStore } from './native-locale.ts'
- import { NextDesktopRuntime } from './desktop-runtime.ts'
-@@ -29,6 +30,10 @@ import { desktopTerminalStateDirectory, openDesktopTerminal } from './desktop-te
+@@ -30,6 +30,10 @@ import { desktopTerminalStateDirectory, openDesktopTerminal } from './desktop-te
  import { createPackageRunner } from './extensions.ts'
  import { bundledPnpmEntry } from './bundled-pnpm.ts'
  import { applyDesktopPackageManagerPolicy } from './pnpm-policy.ts'
@@ -29,7 +22,7 @@ index 180b0fa482..86cc27eef6 100644
  import { auxiliaryWindowChromeOptions, auxiliaryWindowHasCustomFrame } from '../../dsh-plugin-desktop/src/auxiliary-window-options.ts'
  import { cleanupDisposableTree } from '../../dsh-plugin-desktop/src/disposable-tree.ts'
  import { installEditingContextMenu } from '../../dsh-plugin-desktop/src/context-menu.ts'
-@@ -61,9 +66,31 @@ const startupElevationState = startupElevation.relaunched ? {} : startupElevatio
+@@ -63,9 +67,31 @@ const startupElevationState = startupElevation.relaunched ? {} : startupElevatio
  // Inherit the package policy across the Host and every runtime child process.
  applyDesktopPackageManagerPolicy(process.env)
  
@@ -62,75 +55,10 @@ index 180b0fa482..86cc27eef6 100644
  // The in-app choice keeps its former Next-owned anchor, whatever the variable says.
  const locationRoot = dataDirectoryLocationRoot(app.isPackaged, () => app.getPath('appData'), root)
  const locationFile = dataDirectoryLocationFile(locationRoot)
-@@ -290,9 +317,116 @@ function show(window: BrowserWindow): void {
-  * Electron derives their hover and press tint from the native theme rather than from this fill.
+@@ -302,6 +328,47 @@ function show(window: BrowserWindow): void {
   */
  const WINDOWS_CAPTION_FILL = '#00000000'
-+/** First-launch size; later launches restore the rectangle saved on close. */
-+const MAIN_WINDOW_DEFAULT = { width: 1280, height: 840 } as const
-+const MAIN_WINDOW_MINIMUM = { width: 800, height: 580 } as const
-+/** Moves and resizes arrive in bursts; one write per gesture is enough. */
-+const WINDOW_STATE_SAVE_DELAY_MS = 400
-+
-+/**
-+ * Resolve where the main window should reappear.
-+ *
-+ * A saved rectangle is only honored while a connected display still overlaps
-+ * it: unplugging a monitor or changing the layout must not park the window off
-+ * screen, which is exactly what made the previous launch look "centered again"
-+ * with a default size.
-+ * @returns the rectangle to restore and the maximized flag, or no rectangle when
-+ *   nothing usable was saved.
-+ */
-+function mainWindowRestore(): { bounds?: WindowRect; maximized: boolean } {
-+  // The second-instance path can call openMain before the app is ready, and
-+  // `screen` only answers after that point.
-+  if (!app.isReady()) return { maximized: false }
-+  const saved = readNextWindowState(app.getPath('userData'))
-+  if (saved === undefined) return { maximized: false }
-+  const workArea = pickWorkArea(saved.bounds, screen.getAllDisplays().map(display => display.workArea))
-+    ?? screen.getPrimaryDisplay().workArea
-+  return { bounds: fitWindowRect(saved.bounds, workArea, MAIN_WINDOW_MINIMUM), maximized: saved.maximized }
-+}
-+
-+/** Flushes the pending geometry write, e.g. when quitting from the tray. */
-+let flushMainWindowGeometry: (() => void) | undefined
-+
-+/**
-+ * Keep the main window's normal rectangle in userData across launches.
-+ * @param window - the primary window, tracked until it is destroyed.
-+ */
-+function trackMainWindowGeometry(window: BrowserWindow): void {
-+  let timer: NodeJS.Timeout | undefined
-+  let maximized = window.isMaximized()
-+  const save = (): void => {
-+    if (timer !== undefined) { clearTimeout(timer); timer = undefined }
-+    if (window.isDestroyed()) return
-+    try {
-+      writeNextWindowState(app.getPath('userData'), { bounds: window.getNormalBounds(), maximized })
-+    } catch (error) {
-+      runtime.diagnostics.append(`window state: ${String(error)}`, 'warn')
-+    }
-+  }
-+  const schedule = (): void => {
-+    if (timer !== undefined) clearTimeout(timer)
-+    timer = setTimeout(save, WINDOW_STATE_SAVE_DELAY_MS)
-+    timer.unref()
-+  }
-+  window.on('resize', schedule)
-+  window.on('move', schedule)
-+  // Fullscreen and minimize both fire `resize`; only these two events own the
-+  // maximized preference, so restoring it never depends on transient geometry.
-+  window.on('maximize', () => { maximized = true; schedule() })
-+  window.on('unmaximize', () => { maximized = false; schedule() })
-+  window.on('close', save)
-+  window.on('closed', () => {
-+    if (timer !== undefined) clearTimeout(timer)
-+    if (flushMainWindowGeometry === save) flushMainWindowGeometry = undefined
-+  })
-+  flushMainWindowGeometry = save
-+}
-+
+ 
 +/**
 + * Page-zoom bounds for the Ctrl/Cmd `+`/`-` shortcuts. Same range as the Stable shell
 + * (`dsh-plugin-desktop`), so a chord means the same thing in both channels.
@@ -171,36 +99,15 @@ index 180b0fa482..86cc27eef6 100644
 +  if (action === 'reset') { contents.setZoomLevel(0); return }
 +  contents.setZoomLevel(clampedZoomLevel(contents.getZoomLevel() + (action === 'in' ? 1 : -1)))
 +}
- 
- function createWindow(preload: string, primary = false): BrowserWindow {
--  const window = new BrowserWindow({ width: 1280, height: 840, minWidth: 800, minHeight: 580,
-+  const restore: { bounds?: WindowRect; maximized: boolean } = primary ? mainWindowRestore() : { maximized: false }
-+  const window = new BrowserWindow({ ...(restore.bounds ?? MAIN_WINDOW_DEFAULT),
-+    minWidth: MAIN_WINDOW_MINIMUM.width, minHeight: MAIN_WINDOW_MINIMUM.height,
-     show: false, title: 'DSH NEXT',
-     ...(process.platform !== 'darwin' ? { icon: unpackedPath(join(root, 'build', process.platform === 'win32' ? 'app-icon.ico' : 'app-icon.png')) } : {}),
-     ...(!primary ? auxiliaryWindowChromeOptions() : {}),
-@@ -335,8 +469,13 @@ function createWindow(preload: string, primary = false): BrowserWindow {
-   window.once('ready-to-show', () => show(window))
-   applyWindowMaterial(window, runtime.preferences)
++
+ const MAIN_WINDOW_WIDTH = 1280
+ const MAIN_WINDOW_HEIGHT = 840
+ const MAIN_WINDOW_MIN_WIDTH = 800
+@@ -400,6 +467,7 @@ function createWindow(preload: string, primary = false): BrowserWindow {
    if (primary) {
-+    // Maximize before the first paint: showing a normal-size window and then
-+    // maximizing it flashes an intermediate frame of the restored rectangle.
-+    if (restore.maximized) window.maximize()
-+    trackMainWindowGeometry(window)
      window.webContents.on('before-input-event', (event, input) => {
        if (input.type === 'keyDown' && input.key === ',' && (input.control || input.meta) && !input.alt) { event.preventDefault(); openControls() }
 +      applyZoomShortcut(event, window.webContents, input)
      })
      window.on('close', event => {
-       if (!quitting && runtime.preferences.closeToTray && native.available) { event.preventDefault(); window.hide() }
-@@ -1272,6 +1411,9 @@ app.on('before-quit', event => {
-   rendererRecovery?.stop()
-   // Pending evidence lands now; a Host that dies of OOM while stopping is written at once.
-   runtime.memory.stop()
-+  // Windows are hidden below without emitting `close`, so flush the pending
-+  // geometry write here instead of losing the last move.
-+  flushMainWindowGeometry?.()
-   runtime.diagnostics.record({ source: 'electron', event: 'shutdown.start' })
-   runtime.diagnostics.flush()
-   // Bound the whole shutdown, including cleanup before Host termination starts.
+       persistMainWindowState(window)
