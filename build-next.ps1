@@ -1775,6 +1775,45 @@ function Invoke-NextScript {
   }
 }
 
+# next 的 `package:dir` **只构建 next 自己**；根仓库的 `package:dir:next` 在多一步
+# `yarn workspace dsh-community-market build` 之后才调它。少了这一步会得到一个很误导的失败：
+# electron-builder 全程正常，直到最后的 afterAllArtifactBuild 冒烟才炸，报
+#   Cannot find module '…\resources\app.asar\node_modules\dsh-community-market\lib\index.js'
+# → 'Packaged Host left plugins inactive: 1 entry did not activate'
+# 看着像版本/依赖问题，其实是 next 的运行时依赖没构建过（该包没有 lib 目录）。
+function Build-NextRuntimeDependencies {
+  $pkgDir = Join-Path $script:Src 'dsh-community-market'
+  if (-not (Test-Path -LiteralPath (Join-Path $pkgDir 'package.json'))) {
+    Write-WarnLine "未找到 dsh-community-market 工作区，跳过（上游结构已变？）：$pkgDir"
+    return
+  }
+  $entry = Join-Path $pkgDir 'lib\index.js'
+  if (-not (Test-Path -LiteralPath $entry)) {
+    Write-WarnLine 'dsh-community-market 尚未构建（缺 lib\index.js），本次补上。'
+  } else {
+    # 只有源码比产物新才重建，避免每次打包都白跑一次 tsc。
+    $entryTime = (Get-Item -LiteralPath $entry).LastWriteTimeUtc
+    $srcDir = Join-Path $pkgDir 'src'
+    $newer = $null
+    if (Test-Path -LiteralPath $srcDir) {
+      $newer = Get-ChildItem -LiteralPath $srcDir -Recurse -File |
+        Where-Object { $_.LastWriteTimeUtc -gt $entryTime } | Select-Object -First 1
+    }
+    if (-not $newer) { Write-Info 'dsh-community-market 产物已是最新，跳过构建。'; return }
+    Write-WarnLine "dsh-community-market 源码比产物新（$($newer.Name)），重新构建。"
+  }
+  Push-Location $script:Src
+  try {
+    Invoke-Yarn @('workspace', 'dsh-community-market', 'build')
+  } finally {
+    Pop-Location
+  }
+  if (-not (Test-Path -LiteralPath $entry)) {
+    throw "dsh-community-market 构建后仍缺 lib\index.js：$entry"
+  }
+  Write-Ok "dsh-community-market 已构建：$entry"
+}
+
 # ---------------- 产物核对 ----------------
 
 function Get-PackagedDir {
@@ -2208,6 +2247,7 @@ preview : $($Preview.IsPresent)
     'test' { Invoke-Step "单元测试 ($script:WsName)" { Invoke-NextScript 'test' } }
     'check' { Invoke-Step "门禁检查 ($script:WsName)" { Invoke-NextScript 'check' } }
     'package-dir' {
+      Invoke-Step '构建 next 运行时依赖（dsh-community-market）' { Build-NextRuntimeDependencies }
       Invoke-Step "执行 yarn package:dir ($script:WsName)" { Invoke-NextScript 'package:dir' }
       Invoke-Step '部署覆盖层运行时资源（startup.json → exe 同级）' { Publish-OverlayRuntimeAssets }
       Invoke-Step '核对产物' { Assert-OverlayArtifacts }

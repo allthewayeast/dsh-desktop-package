@@ -1,5 +1,5 @@
 diff --git a/dsh-desktop-next/tests/main-lifecycle.spec.ts b/dsh-desktop-next/tests/main-lifecycle.spec.ts
-index bb42cbeb23..5a612e0e54 100644
+index 43c3eae280..e3a052aa8f 100644
 --- a/dsh-desktop-next/tests/main-lifecycle.spec.ts
 +++ b/dsh-desktop-next/tests/main-lifecycle.spec.ts
 @@ -97,10 +97,13 @@ vi.mock('electron', async () => {
@@ -17,7 +17,7 @@ index bb42cbeb23..5a612e0e54 100644
      size: { width: number, height: number }
      minSize: { width: number, height: number }
      position: { x: number, y: number }
-@@ -825,6 +828,28 @@ it('retains the Host when hiding to tray, restores the window, keeps failed-Host
+@@ -886,6 +889,28 @@ it('retains the Host when hiding to tray, restores the window, keeps failed-Host
      expect(takeSettings(sender)).toBe('general')
      window.webContents.emit('before-input-event', { preventDefault() {} }, { type: 'keyDown', key: ',', meta: true })
      expect(takeSettings(sender)).toBe('general')

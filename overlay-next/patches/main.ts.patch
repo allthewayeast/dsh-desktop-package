@@ -1,5 +1,5 @@
 diff --git a/dsh-desktop-next/src/main.ts b/dsh-desktop-next/src/main.ts
-index e13c1e567d..1f2ebe7c4c 100644
+index 3c3e2e6b81..58394829fe 100644
 --- a/dsh-desktop-next/src/main.ts
 +++ b/dsh-desktop-next/src/main.ts
 @@ -7,7 +7,7 @@ import { access, writeFile } from 'node:fs/promises'
@@ -11,7 +11,7 @@ index e13c1e567d..1f2ebe7c4c 100644
  import { appRequestHeaders, forwardWebRequest, serveWebDocument } from './web-document.ts'
  import { installAppDownloads } from './app-downloads.ts'
  import { claimDesktopSingleInstance } from './single-instance.ts'
-@@ -30,6 +30,10 @@ import { desktopTerminalStateDirectory, openDesktopTerminal } from './desktop-te
+@@ -31,6 +31,10 @@ import { dshCommandArguments, dshCommandInvocation } from './dsh-command.ts'
  import { createPackageRunner } from './extensions.ts'
  import { bundledPnpmEntry } from './bundled-pnpm.ts'
  import { applyDesktopPackageManagerPolicy } from './pnpm-policy.ts'
@@ -22,7 +22,7 @@ index e13c1e567d..1f2ebe7c4c 100644
  import { auxiliaryWindowChromeOptions, auxiliaryWindowHasCustomFrame } from '../../dsh-plugin-desktop/src/auxiliary-window-options.ts'
  import { cleanupDisposableTree } from '../../dsh-plugin-desktop/src/disposable-tree.ts'
  import { installEditingContextMenu } from '../../dsh-plugin-desktop/src/context-menu.ts'
-@@ -63,9 +67,31 @@ const startupElevationState = startupElevation.relaunched ? {} : startupElevatio
+@@ -74,11 +78,33 @@ const startupElevationState = startupElevation.relaunched ? {} : startupElevatio
  // Inherit the package policy across the Host and every runtime child process.
  applyDesktopPackageManagerPolicy(process.env)
  
@@ -41,6 +41,8 @@ index e13c1e567d..1f2ebe7c4c 100644
 +}
 +
  const root = dirname(NEXT_PACKAGE)
+ // Workspace and data directory choices stay out of the installation (#1564).
+ const program = programDirectory(process.platform, process.execPath)
  // Read once: an in-app relaunch inherits this process's environment, not later user variables.
 -const environmentHome = process.env[DATA_DIRECTORY_VARIABLE] || undefined
 +// An explicit home comes from the Next-specific override first, then from the generic
@@ -55,7 +57,7 @@ index e13c1e567d..1f2ebe7c4c 100644
  // The in-app choice keeps its former Next-owned anchor, whatever the variable says.
  const locationRoot = dataDirectoryLocationRoot(app.isPackaged, () => app.getPath('appData'), root)
  const locationFile = dataDirectoryLocationFile(locationRoot)
-@@ -302,6 +328,47 @@ function show(window: BrowserWindow): void {
+@@ -323,6 +349,47 @@ function show(window: BrowserWindow): void {
   */
  const WINDOWS_CAPTION_FILL = '#00000000'
  
@@ -103,7 +105,7 @@ index e13c1e567d..1f2ebe7c4c 100644
  const MAIN_WINDOW_WIDTH = 1280
  const MAIN_WINDOW_HEIGHT = 840
  const MAIN_WINDOW_MIN_WIDTH = 800
-@@ -400,6 +467,7 @@ function createWindow(preload: string, primary = false): BrowserWindow {
+@@ -421,6 +488,7 @@ function createWindow(preload: string, primary = false): BrowserWindow {
    if (primary) {
      window.webContents.on('before-input-event', (event, input) => {
        if (input.type === 'keyDown' && input.key === ',' && (input.control || input.meta) && !input.alt) { event.preventDefault(); openControls() }
