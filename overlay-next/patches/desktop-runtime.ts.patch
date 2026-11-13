@@ -1,0 +1,44 @@
+diff --git a/dsh-desktop-next/src/desktop-runtime.ts b/dsh-desktop-next/src/desktop-runtime.ts
+index 8ae21a416a..853c8030cb 100644
+--- a/dsh-desktop-next/src/desktop-runtime.ts
++++ b/dsh-desktop-next/src/desktop-runtime.ts
+@@ -313,7 +313,9 @@ export class NextDesktopRuntime {
+     const lanUrls = this.preferences.networkExposure === 'lan' && edge?.state === 'ready' && edge.actualPort
+       ? edge.addresses.map(address => {
+         const url = new URL(localUrl)
+-        url.protocol = 'https:'; url.hostname = address; url.port = String(edge.actualPort)
++        // 【本地覆盖层】局域网边是明文 HTTP，浏览器直接访问 http://<lan-ip>:<port>/，
++        // 不需要安装自签 CA。
++        url.protocol = 'http:'; url.hostname = address; url.port = String(edge.actualPort)
+         return url.href
+       }) : []
+     return { localUrl, lanUrls }
+@@ -391,7 +393,14 @@ export class NextDesktopRuntime {
+     const effective = this.safeMode ? { ...SAFE_MODE_PREFERENCES } : this.preferences
+     const addresses = options.addresses()
+     const token = randomBytes(32).toString('base64url')
+-    const lan = new DesktopLanHttpsRuntime({ addresses, requestedPort: effective.lanPort,
++    // 【本地覆盖层 · 局域网与回环同端口】Host 的监听地址由 startup.json 的 DSH_WEB_HOST
++    // 决定（src/host/index.ts:100 的解析规则，这里逐字照抄：未设置 = 127.0.0.1）。
++    // 通配绑定（0.0.0.0 / ::）意味着那个端口本来就对局域网开放 —— 局域网边既不该再绑
++    // 同一个端口（Windows 会静默成功并抢连接），也不该另开一个端口（那就是"两个端口"）。
++    // 非通配时（默认），局域网边按 LAN 地址逐个绑到**回环的这个端口号**上。
++    const hostBind = process.env.DSH_WEB_HOST?.trim() || '127.0.0.1'
++    const wildcardHost = hostBind === '0.0.0.0' || hostBind === '::'
++    const lan = new DesktopLanHttpsRuntime({ addresses, wildcardHost,
+       prepareCertificate: async () => ({ certificate: await options.certificate(addresses) }) })
+     this.lan = lan
+     let stopped = false
+@@ -428,6 +437,12 @@ export class NextDesktopRuntime {
+             // The optional LAN edge must not turn a ready loopback Host into recovery mode.
+             if (edge.state === 'failed') this.diagnostics.append(`LAN HTTPS: ${edge.errorCode}`, 'warn')
+           }
++          // 【本地覆盖层 · 同端口】Host 通配绑定时，端口对局域网本来就是开的，
++          // 「仅回环」这个网络暴露设置拦不住局域网客户端（真正起作用的只有浏览器访问开关）。
++          // 这条记录把现场说清楚，免得以后误以为 loopback 就一定连不进来。
++          if (wildcardHost) {
++            this.diagnostics.append(`LAN: Host listens on all interfaces (${hostBind}), so the network-exposure setting cannot restrict LAN clients`, 'warn')
++          }
+           if (!this.safeMode) {
+             try { this.recovery.checkpoint(this.selected) } catch (error) { this.diagnostics.append(`Recovery checkpoint: ${String(error)}`, 'warn') }
+           }

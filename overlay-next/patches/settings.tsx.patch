@@ -1,0 +1,31 @@
+diff --git a/dsh-desktop-next/src/client/settings.tsx b/dsh-desktop-next/src/client/settings.tsx
+index 44696b0829..39f52524e5 100644
+--- a/dsh-desktop-next/src/client/settings.tsx
++++ b/dsh-desktop-next/src/client/settings.tsx
+@@ -23,6 +23,15 @@ export function desktopTranslate(language: string): (key: string) => string {
+     if (key === 'deleteProfileWarning') return language.startsWith('zh') ? '此 Profile 将移入恢复备份目录。共享的会话和设置会保留。' : 'Move this Profile to recovery backups. Shared sessions and settings are retained.'
+     if (key === 'presentationIntro') return language.startsWith('zh') ? '设置当前平台支持的窗口外观。' : 'Choose the window appearance supported on this platform.'
+     if (key === 'browserCompatibilityNotice') return language.startsWith('zh') ? '开关即时生效；关闭访问会断开已有的浏览器连接。' : 'Changes take effect immediately. Disabling access disconnects existing browser connections.'
++    // 【本地覆盖层】局域网边是明文 HTTP：共享语言表里那几句讲的是「安装并信任证书」，
++    // 在 Next 这个渠道已经不符合事实，按 key 覆盖掉（不动 dsh-plugin-desktop 的共享表，
++    // 免得把 stable/beta 那两套仍在走 TLS 的文案一起改坏）。
++    if (key === 'lanAccess') return language.startsWith('zh') ? '局域网访问' : 'Local-network access'
++    if (key === 'lanStatus') return language.startsWith('zh') ? '局域网状态' : 'Local-network status'
++    if (key === 'lanHttpsUrls') return language.startsWith('zh') ? '局域网地址' : 'Local-network addresses'
++    if (key === 'lanTrustNotice') return language.startsWith('zh')
++      ? '局域网内以明文 HTTP 访问，不校验证书，也不需要安装证书；同网段的其他人可能看到登录令牌，请只在可信网络中使用。'
++      : 'Devices on the same network reach this desktop over plain HTTP with no certificate to install. Anyone on that network may see the login token, so use this only on a trusted network.'
+     return Object.hasOwn(copy, key) ? copy[key as DesktopSettingsLocaleKey] : key
+   }
+ }
+@@ -60,7 +69,9 @@ function NextBrowserActions({ adapter, state, language }: { adapter: NextSetting
+     setBusy(true); setFailure('')
+     try { await adapter.command({ type: 'export-ca' }) } catch (error) { setFailure(error instanceof Error ? error.message : String(error)) } finally { setBusy(false) }
+   }
+-  if (!state.browserUrl || state.lan?.state !== 'ready') return null
++  // 【本地覆盖层】局域网边不再有 CA（明文 HTTP）：没有证书可导出，按钮直接不出现，
++  // 否则点下去只会得到 'LAN certificate is unavailable'。
++  if (!state.browserUrl || state.lan?.state !== 'ready' || state.lan.caFingerprint === null) return null
+   return <>
+     {failure && <p role="alert" className="dshDesktopSettingsError">{failure}</p>}
+     <div className="dshDesktopSettingsDialogActions">

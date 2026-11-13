@@ -1,8 +1,8 @@
 diff --git a/dsh-desktop-next/src/host/index.ts b/dsh-desktop-next/src/host/index.ts
-index 05e5418321..ec23b7afc7 100644
+index cd258f10ba..6cca422a08 100644
 --- a/dsh-desktop-next/src/host/index.ts
 +++ b/dsh-desktop-next/src/host/index.ts
-@@ -27,6 +27,35 @@ import { formatFatalDiagnostic } from './fatal-diagnostic.ts'
+@@ -28,6 +28,35 @@ import { formatFatalDiagnostic } from './fatal-diagnostic.ts'
  import * as desktopOffice from './office.ts'
  import { resolveOfficeConfig } from './office.ts'
  
@@ -39,8 +39,8 @@ index 05e5418321..ec23b7afc7 100644
    // The Host lists and reads user workspaces; see asar-archive-policy.ts.
    disableAsarArchiveView(import.meta.url)
 @@ -60,10 +89,31 @@ export async function main(): Promise<void> {
-   delete process.env[SYSTEM_PROXY_ENV]
-   const profile = loadNextProfile(projectDir, home)
+   const packageManager = bundledPnpmInvocation(runtimeDir)
+   const profile = loadNextProfile(projectDir, home, NEXT_PACKAGE, packageManager)
    const runtimePatch = join(projectDir, 'desktop-next.runtime.patch.json')
 +  // 【本地覆盖层 web-access】监听地址、端口与「额外受信入口」改由启动环境给出，默认仍是回环 + 偏好值。
 +  //   DSH_WEB_HOST          —— 0.0.0.0 / :: 或具体网卡 IP 字面量（上游 Config schema 会校验）
@@ -78,10 +78,10 @@ index 05e5418321..ec23b7afc7 100644
          [join(runtimeDir, 'host.cordis.patch.yml'), join(projectDir, 'desktop-next.cordis.patch.json'), runtimePatch], profilePatches) },
 -    patchFiles: [join(runtimeDir, 'host.cordis.patch.yml'), join(projectDir, 'desktop-next.cordis.patch.json'), runtimePatch], args: ['--no-open', '--port', String(preferences.port)],
 +    patchFiles: [join(runtimeDir, 'host.cordis.patch.yml'), join(projectDir, 'desktop-next.cordis.patch.json'), runtimePatch], args: ['--no-open', '--port', String(webPort)],
-     packageManager: bundledPnpmInvocation(runtimeDir),
+     packageManager,
    })
-   // Memory evidence for the Desktop's incident snapshots. Pushed rather than requested, so a Host too
-@@ -143,7 +193,7 @@ export async function main(): Promise<void> {
+   // Native file drags borrow only the workspace files this Host authorizes, where the followed DSH release drags
+@@ -150,7 +200,7 @@ export async function main(): Promise<void> {
      try { await ctx.plugin(desktopOffice, office); mounted() } catch (error) { mounted(error); throw error }
    }
    hostLog({ source: 'host', event: 'process.ready' })

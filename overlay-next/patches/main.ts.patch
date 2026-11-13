@@ -1,5 +1,5 @@
 diff --git a/dsh-desktop-next/src/main.ts b/dsh-desktop-next/src/main.ts
-index 3c3e2e6b81..58394829fe 100644
+index 035b0f5c11..7c6a92ab6f 100644
 --- a/dsh-desktop-next/src/main.ts
 +++ b/dsh-desktop-next/src/main.ts
 @@ -7,7 +7,7 @@ import { access, writeFile } from 'node:fs/promises'
@@ -10,8 +10,8 @@ index 3c3e2e6b81..58394829fe 100644
 +import { app, BrowserWindow, clipboard, crashReporter, dialog, ipcMain, Menu, nativeTheme, net, Notification, protocol, safeStorage, screen, session, shell, type Input, type IpcMainInvokeEvent, type MenuItemConstructorOptions, type OpenDialogOptions, type WebContents } from 'electron'
  import { appRequestHeaders, forwardWebRequest, serveWebDocument } from './web-document.ts'
  import { installAppDownloads } from './app-downloads.ts'
- import { claimDesktopSingleInstance } from './single-instance.ts'
-@@ -31,6 +31,10 @@ import { dshCommandArguments, dshCommandInvocation } from './dsh-command.ts'
+ import { installDesktopFileDrag, installFileActions, liveshareOwnerLogin } from './upstream-family.ts'
+@@ -32,6 +32,10 @@ import { dshCommandArguments, dshCommandInvocation } from './dsh-command.ts'
  import { createPackageRunner } from './extensions.ts'
  import { bundledPnpmEntry } from './bundled-pnpm.ts'
  import { applyDesktopPackageManagerPolicy } from './pnpm-policy.ts'
@@ -22,7 +22,7 @@ index 3c3e2e6b81..58394829fe 100644
  import { auxiliaryWindowChromeOptions, auxiliaryWindowHasCustomFrame } from '../../dsh-plugin-desktop/src/auxiliary-window-options.ts'
  import { cleanupDisposableTree } from '../../dsh-plugin-desktop/src/disposable-tree.ts'
  import { installEditingContextMenu } from '../../dsh-plugin-desktop/src/context-menu.ts'
-@@ -74,11 +78,33 @@ const startupElevationState = startupElevation.relaunched ? {} : startupElevatio
+@@ -76,11 +80,33 @@ const startupElevationState = startupElevation.relaunched ? {} : startupElevatio
  // Inherit the package policy across the Host and every runtime child process.
  applyDesktopPackageManagerPolicy(process.env)
  
@@ -57,7 +57,7 @@ index 3c3e2e6b81..58394829fe 100644
  // The in-app choice keeps its former Next-owned anchor, whatever the variable says.
  const locationRoot = dataDirectoryLocationRoot(app.isPackaged, () => app.getPath('appData'), root)
  const locationFile = dataDirectoryLocationFile(locationRoot)
-@@ -323,6 +349,47 @@ function show(window: BrowserWindow): void {
+@@ -328,6 +354,47 @@ function show(window: BrowserWindow): void {
   */
  const WINDOWS_CAPTION_FILL = '#00000000'
  
@@ -105,7 +105,7 @@ index 3c3e2e6b81..58394829fe 100644
  const MAIN_WINDOW_WIDTH = 1280
  const MAIN_WINDOW_HEIGHT = 840
  const MAIN_WINDOW_MIN_WIDTH = 800
-@@ -421,6 +488,7 @@ function createWindow(preload: string, primary = false): BrowserWindow {
+@@ -426,6 +493,7 @@ function createWindow(preload: string, primary = false): BrowserWindow {
    if (primary) {
      window.webContents.on('before-input-event', (event, input) => {
        if (input.type === 'keyDown' && input.key === ',' && (input.control || input.meta) && !input.alt) { event.preventDefault(); openControls() }
@@ -113,3 +113,21 @@ index 3c3e2e6b81..58394829fe 100644
      })
      window.on('close', event => {
        persistMainWindowState(window)
+@@ -659,7 +727,7 @@ async function announceRepair(backup: string): Promise<void> {
+ }
+ function confirmLanAccess(): Promise<boolean> {
+   return confirmed(
+-    t('允许局域网 HTTPS 访问？', 'Allow LAN access over HTTPS?'),
++    t('允许局域网访问？', 'Allow LAN access?'),
+     t('同一网络中的设备可以连接。请仅向可信设备分享登录链接，并在设备上核对和信任 CA 证书。', 'Devices on your local network can connect. Share login links only with trusted devices, and verify and trust the CA certificate on each device.'),
+   )
+ }
+@@ -850,7 +918,7 @@ async function performCommand(input: Record<string, unknown>, type: string, sour
+       const preferences = parsePreferences(input.preferences)
+       if (portsChanged(runtime.preferences, preferences)) {
+         if (!await confirmed(t('应用访问设置并重启 Host？', 'Apply access settings and restart the Host?'), preferences.browserAccess && preferences.networkExposure === 'lan'
+-          ? t('开启后，同一网络中的设备可通过 HTTPS 访问。登录链接可授予访问权限，请仅与可信设备共享。正在运行的任务会被中断。', 'Devices on your network can connect over HTTPS. Login links grant access; share only with trusted devices. Running tasks will be interrupted.')
++          ? t('开启后，同一网络中的设备可用浏览器直接访问 http:// 地址，不需要安装任何证书。登录链接可授予访问权限，请仅与可信设备共享。正在运行的任务会被中断。', 'Devices on your network can reach this desktop over plain HTTP, with no certificate to install. Login links grant access; share only with trusted devices. Running tasks will be interrupted.')
+           : undefined)) return
+         rendererRecovery?.stop()
+         await runtime.restart(() => runtime.writePreferences(preferences))

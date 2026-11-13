@@ -1,0 +1,336 @@
+diff --git a/dsh-desktop-next/src/lan-https-ingress.ts b/dsh-desktop-next/src/lan-https-ingress.ts
+index bc703d8627..273ca3de2c 100644
+--- a/dsh-desktop-next/src/lan-https-ingress.ts
++++ b/dsh-desktop-next/src/lan-https-ingress.ts
+@@ -1,36 +1,66 @@
+-/** Hot-swappable HTTPS/WSS edge for the loopback-only upstream WebServer. */
++/**
++ * Hot-swappable LAN edge (plain HTTP/WS) for the loopback-only upstream WebServer.
++ *
++ * 【本地覆盖层 · 局域网走 http】上游这条边是 TLS 终止（HTTPS/WSS）：自签 CA、每台设备
++ * 还得先信任证书才能访问。这里改成明文 HTTP/WS —— 不再创建 https server、不再给
++ * set-cookie 追加 `; Secure`（浏览器会直接丢弃 Secure cookie，登录态就断）、也不再需要
++ * key/cert。类名与文件名沿用上游的 "https" 命名，避免牵动 desktop-contract、客户端
++ * 适配器与一整套测试的类型改动；行为已经是 http。
++ *
++ * 【本地覆盖层 · 局域网与回环同端口】上游给局域网边单独一个端口（0 = 系统随机），于是
++ * 同一个应用对外有两个端口号：回环一个、局域网一个，而且随机那个重启就变。这里改成
++ * **按 LAN 地址逐个绑定到回环的那一个端口号**（192.168.1.5:2048 + 127.0.0.1:2048 在
++ * Windows/macOS/Linux 上都合法，见 tests 之外的实测），于是
++ *   http://127.0.0.1:2048  与  http://192.168.1.5:2048
++ * 是同一份应用的两个入口。绝对不能改回「绑 0.0.0.0:<targetPort>」：Windows 允许在
++ * 已有 127.0.0.1:port 的情况下再绑 0.0.0.0:port **而不报错**，两个 socket 会抢同一条
++ * 入站连接，代理还会自环。
++ *
++ * 另一种情形是 Host 自己已经通配绑定（startup.json 的 DSH_WEB_HOST=0.0.0.0 或 ::）：
++ * 那个端口本来就对局域网开放，这条边**不绑任何 socket**（同上，二次绑定会静默成功并
++ * 抢流量），只负责把地址播出去，端口号仍然等于回环端口。
++ */
+ 
+-import { request as requestHttp, type IncomingHttpHeaders, type IncomingMessage, type OutgoingHttpHeaders, type ServerResponse } from 'node:http'
+-import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https'
++import { createServer as createEdgeServer, request as requestHttp, type IncomingHttpHeaders, type IncomingMessage, type OutgoingHttpHeaders, type Server as EdgeServer, type ServerResponse } from 'node:http'
+ import { isIPv4, Socket } from 'node:net'
+ import type { Duplex } from 'node:stream'
+ import { MAX_HEADER_BYTES } from './browser-sessions.ts'
+ import { NATIVE_ACCESS_HEADER as DESKTOP_RENDERER_ACCESS_HEADER } from './desktop-contract.ts'
+ 
+-const EDGE_HOST = '0.0.0.0'
+ const TARGET_HOST = '127.0.0.1'
+ const FORBIDDEN_REQUEST_HEADER = DESKTOP_RENDERER_ACCESS_HEADER.toLowerCase()
+ 
+ export type LanHttpsIngressState = 'inactive' | 'starting' | 'ready' | 'failed'
+ 
+ export interface LanHttpsIngressOptions {
+-  /** Loopback HTTP port owned by the upstream DSH WebServer. */
++  /** Loopback HTTP port owned by the upstream DSH WebServer. The LAN edge serves this same number. */
+   readonly targetPort: number
+-  /** Public HTTPS port, or zero to let the operating system choose one. */
+-  readonly requestedPort: number
+-  readonly key: string | Buffer
+-  readonly cert: string | Buffer
+-  /** Stable identity of the CA shown by the Desktop trust flow. */
+-  readonly caFingerprint: string
++  /**
++   * 【本地覆盖层 · 同端口】上游用它给局域网边挑一个**独立**端口（0 = 让系统挑）。
++   * 同端口方案下这个值不再参与计算，字段保留只为调用方兼容 —— 与 key/cert 一样是
++   * "还在类型上、已经不影响行为"的历史参数。
++   */
++  readonly requestedPort?: number
++  /** 上游 TLS 私钥与证书；明文 HTTP 边不再读取，保留为可选字段只为调用方兼容。 */
++  readonly key?: string | Buffer
++  readonly cert?: string | Buffer
++  /** 上游自签 CA 指纹；明文 HTTP 边没有 CA，快照里恒为 null。 */
++  readonly caFingerprint?: string
+   /** Startup-sampled LAN IPv4 literals accepted in the external Host header. */
+   readonly allowedAddresses: readonly string[]
++  /**
++   * 【本地覆盖层 · 同端口】Host 是否已经自己绑在通配地址（0.0.0.0 / ::）上。
++   * true → 该端口对局域网本来就是通的，这条边不开 socket，只把地址播出去。
++   */
++  readonly wildcardHost?: boolean
+ }
+ 
+ export interface LanHttpsIngressSnapshot {
+   readonly state: LanHttpsIngressState
+   readonly actualPort: number | null
+   readonly addresses: readonly string[]
+-  readonly caFingerprint: string
++  /** 恒为 null：明文 HTTP 边没有 CA，客户端也不需要下载/信任任何证书。 */
++  readonly caFingerprint: string | null
+   readonly errorCode: string | null
+ }
+ 
+@@ -57,13 +87,6 @@ function normalizeAddresses(values: readonly string[]): readonly string[] {
+   return Object.freeze([...new Set(values.map(canonicalIpv4))].sort((left, right) => left.localeCompare(right)))
+ }
+ 
+-function copyTlsValue(value: string | Buffer, label: string): string | Buffer {
+-  if ((typeof value === 'string' && value.length === 0) || (Buffer.isBuffer(value) && value.length === 0)) {
+-    throw new TypeError(`dsh-desktop-next: LAN HTTPS ${label} must not be empty`)
+-  }
+-  return Buffer.isBuffer(value) ? Buffer.from(value) : value
+-}
+-
+ function errorCode(cause: unknown): string {
+   const code = (cause as NodeJS.ErrnoException | null)?.code
+   if (typeof code === 'string' && code.length > 0) return code
+@@ -136,17 +159,14 @@ function rejectUpgrade(socket: Duplex, statusCode: 403 | 502, reason: 'Forbidden
+   ].join('\r\n'))
+ }
+ 
+-function secureCookie(cookie: string): string {
+-  return /(?:^|;)\s*secure\s*(?:;|$)/iu.test(cookie) ? cookie : `${cookie}; Secure`
+-}
+-
+ function responseHeaders(headers: IncomingHttpHeaders): OutgoingHttpHeaders {
++  // 【本地覆盖层】明文 HTTP 边不再给 set-cookie 追加 `; Secure`：浏览器在 http 下会直接
++  // 丢弃带 Secure 的 cookie，登录态和 CSRF cookie 都会失效。上游的 secureCookie() 只在
++  // 这条边做 TLS 终止（浏览器看到的是 https）时才成立。
+   const copied: OutgoingHttpHeaders = {}
+   for (const [name, value] of Object.entries(headers)) {
+     if (value !== undefined) copied[name] = value
+   }
+-  const cookies = headers['set-cookie']
+-  if (cookies !== undefined) copied['set-cookie'] = cookies.map(secureCookie)
+   return copied
+ }
+ 
+@@ -167,40 +187,68 @@ function frozenSnapshot(
+   state: LanHttpsIngressState,
+   actualPort: number | null,
+   addresses: readonly string[],
+-  caFingerprint: string,
+   failure: string | null,
+ ): LanHttpsIngressSnapshot {
+-  return Object.freeze({ state, actualPort, addresses, caFingerprint, errorCode: failure })
++  return Object.freeze({ state, actualPort, addresses, caFingerprint: null, errorCode: failure })
++}
++
++/** 【本地覆盖层 · 同端口】把一个 listener 绑到「某个网卡地址 + 指定端口」上。 */
++function listenOn(server: EdgeServer, port: number, host: string): Promise<void> {
++  return new Promise<void>((resolve, rejectListen) => {
++    const failed = (cause: Error): void => {
++      server.off('listening', listening)
++      rejectListen(cause)
++    }
++    const listening = (): void => {
++      server.off('error', failed)
++      resolve()
++    }
++    server.once('error', failed)
++    server.once('listening', listening)
++    server.listen(port, host)
++  })
++}
++
++function closeQuietly(server: EdgeServer): void {
++  try {
++    server.close(() => {})
++  } catch {
++    // 绑定失败过的 server 关起来是 no-op，不该把失败原因盖掉。
++  }
++  try {
++    server.closeAllConnections()
++  } catch {
++    // 同上：还没有连接可断。
++  }
+ }
+ 
+ /**
+- * HTTPS/WSS ingress that can be enabled and disabled without rebuilding the DSH
+- * Host generation. The HTTP target is deliberately fixed to loopback.
++ * LAN edge (plain HTTP/WS) that can be enabled and disabled without rebuilding the
++ * DSH Host generation. The target stays deliberately fixed to loopback.
++ *
++ * 【本地覆盖层】上游这里是 HTTPS/WSS 终止；现在只做明文转发，TLS 相关的字段与方法
++ * 全部不再使用（见文件头注释）。
+  */
+ export class LanHttpsIngress {
+   private readonly targetPort: number
+-  private readonly requestedPort: number
+-  private readonly key: string | Buffer
+-  private readonly cert: string | Buffer
+-  private readonly caFingerprint: string
++  private readonly wildcardHost: boolean
+   private readonly addresses: readonly string[]
+   private readonly allowedAddresses: ReadonlySet<string>
+   private readonly sockets = new Set<Duplex>()
+-  private server: HttpsServer | null = null
++  /** 【本地覆盖层 · 同端口】每个 LAN 地址一个 listener，端口号都等于 targetPort。 */
++  private readonly servers = new Map<string, EdgeServer>()
+   private current: LanHttpsIngressSnapshot
+   private serial: Promise<void> = Promise.resolve()
+ 
+   constructor(options: LanHttpsIngressOptions) {
+-    this.targetPort = exactPort(options.targetPort, false, 'LAN HTTPS target port')
+-    this.requestedPort = exactPort(options.requestedPort, true, 'LAN HTTPS requested port')
+-    this.key = copyTlsValue(options.key, 'private key')
+-    this.cert = copyTlsValue(options.cert, 'certificate')
+-    const fingerprint = options.caFingerprint.trim()
+-    if (fingerprint.length === 0) throw new TypeError('dsh-desktop-next: LAN HTTPS CA fingerprint must not be empty')
+-    this.caFingerprint = fingerprint
++    this.targetPort = exactPort(options.targetPort, false, 'LAN edge target port')
++    // 上游的 requestedPort 在同端口方案下不再生效（见文件头）：不读它，也就不可能
++    // 出现「局域网又是另一个端口」。
++    void options.requestedPort
++    this.wildcardHost = options.wildcardHost === true
+     this.addresses = normalizeAddresses(options.allowedAddresses)
+     this.allowedAddresses = new Set(this.addresses)
+-    this.current = frozenSnapshot('inactive', null, this.addresses, this.caFingerprint, null)
++    this.current = frozenSnapshot('inactive', null, this.addresses, null)
+   }
+ 
+   snapshot(): LanHttpsIngressSnapshot {
+@@ -284,70 +332,75 @@ export class LanHttpsIngress {
+     upstream.connect(this.targetPort, TARGET_HOST)
+   }
+ 
++  private createEdgeServer(): EdgeServer {
++    // 【本地覆盖层】明文 HTTP/WS：不再传 key/cert、不再要求 TLSv1.2；浏览器直接访问
++    // http://<lan-ip>:<port>/，不需要安装任何自签证书。
++    const server = createEdgeServer({ maxHeaderSize: MAX_HEADER_BYTES }, (request, response) => {
++      this.proxyHttp(request, response)
++    })
++    server.on('connection', socket => this.track(socket))
++    server.on('upgrade', (request, socket, head) => this.proxyUpgrade(request, socket, head))
++    server.on('clientError', (_error, socket) => socket.destroy())
++    return server
++  }
++
+   private async startInternal(): Promise<void> {
+     if (this.current.state === 'ready' || this.current.state === 'starting') return
+-    this.current = frozenSnapshot('starting', null, this.addresses, this.caFingerprint, null)
+-
+-    let server: HttpsServer
+-    try {
+-      server = createHttpsServer({ key: this.key, cert: this.cert, minVersion: 'TLSv1.2', maxHeaderSize: MAX_HEADER_BYTES }, (request, response) => {
+-        this.proxyHttp(request, response)
+-      })
+-      this.server = server
+-      server.on('connection', socket => this.track(socket))
+-      server.on('upgrade', (request, socket, head) => this.proxyUpgrade(request, socket, head))
+-      server.on('clientError', (_error, socket) => socket.destroy())
+-      server.on('tlsClientError', () => {})
+-      await new Promise<void>((resolve, rejectListen) => {
+-        const failed = (cause: Error): void => {
+-          server.off('listening', listening)
+-          rejectListen(cause)
+-        }
+-        const listening = (): void => {
+-          server.off('error', failed)
+-          resolve()
+-        }
+-        server.once('error', failed)
+-        server.once('listening', listening)
+-        server.listen(this.requestedPort, EDGE_HOST)
+-      })
+-      const bound = server.address()
+-      if (bound === null || typeof bound === 'string') throw new Error('LAN HTTPS ingress did not expose a TCP address')
+-      this.current = frozenSnapshot('ready', bound.port, this.addresses, this.caFingerprint, null)
+-    } catch (cause) {
+-      if (this.server !== null) {
+-        try {
+-          this.server.close()
+-        } catch {
+-          // A synchronous TLS or bind failure can leave an already-closed server.
+-        }
++    // 【本地覆盖层 · 同端口】Host 自己就绑在通配地址上：这个端口在局域网里已经通了，
++    // 边一个 socket 都不开（同一端口再绑一次会在 Windows 上"成功"并抢连接），
++    // 只把状态和端口交回去，让外壳照常播 http://<lan-ip>:<targetPort>。
++    if (this.wildcardHost) {
++      this.current = frozenSnapshot('ready', this.targetPort, this.addresses, null)
++      return
++    }
++    this.current = frozenSnapshot('starting', null, this.addresses, null)
++    // 逐地址绑定：一个网卡起不来（地址被拔掉、被别的进程占了）不能让整条边失败，
++    // 只把这个地址从广播列表里去掉。
++    const served: string[] = []
++    let failure: string | null = null
++    for (const address of this.addresses) {
++      const server = this.createEdgeServer()
++      try {
++        await listenOn(server, this.targetPort, address)
++      } catch (cause) {
++        failure ??= errorCode(cause)
++        closeQuietly(server)
++        continue
+       }
+-      this.server = null
+-      for (const socket of this.sockets) socket.destroy()
+-      this.sockets.clear()
+-      this.current = frozenSnapshot('failed', null, this.addresses, this.caFingerprint, errorCode(cause))
++      this.servers.set(address, server)
++      served.push(address)
+     }
++    if (served.length === 0) {
++      await this.closeServers()
++      this.current = frozenSnapshot('failed', null, this.addresses, failure ?? 'edge-unavailable')
++      return
++    }
++    // actualPort 恒等于回环端口 —— 这一句就是「两个入口同端口」的全部实现。
++    this.current = frozenSnapshot('ready', this.targetPort, Object.freeze(served), null)
+   }
+ 
+   private async stopInternal(): Promise<void> {
+-    const server = this.server
+-    this.server = null
+-    if (server !== null) {
+-      const closed = new Promise<void>(resolve => {
+-        try {
+-          server.close(() => resolve())
+-        } catch {
+-          resolve()
+-        }
+-      })
+-      for (const socket of this.sockets) socket.destroy()
+-      server.closeAllConnections()
+-      await closed
+-    } else {
+-      for (const socket of this.sockets) socket.destroy()
+-    }
++    await this.closeServers()
++    this.current = frozenSnapshot('inactive', null, this.addresses, null)
++  }
++
++  private async closeServers(): Promise<void> {
++    const servers = [...this.servers.values()]
++    this.servers.clear()
++    for (const socket of this.sockets) socket.destroy()
+     this.sockets.clear()
+-    this.current = frozenSnapshot('inactive', null, this.addresses, this.caFingerprint, null)
++    await Promise.all(servers.map(server => new Promise<void>((resolve) => {
++      try {
++        server.close(() => resolve())
++      } catch {
++        resolve()
++      }
++      try {
++        server.closeAllConnections()
++      } catch {
++        // 没 listen 成功过的 server 没有连接可断。
++      }
++    })))
+   }
+ }
+ 

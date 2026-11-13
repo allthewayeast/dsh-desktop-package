@@ -474,6 +474,81 @@ stable 的 `DesktopWebServer` 不支持绑定非回环地址（`desktopWebServer
 `DSH_WEB_TRUSTED_HOSTS` 收窄到只需要的入口。固定 token 等于长期凭证，**别提交进本仓库**
 （所以更推荐改部署出去的那一份，而不是写进 `overlay-next\startup.json` 模板）。
 
+#### 局域网访问：自 2026-11-10 起走**明文 http**（覆盖层改的）
+
+设置页里那个「局域网访问」开关，上游的实现是**自签 CA + TLS 反向代理**：在 `0.0.0.0:<lanPort>`
+起一个 `https` 服务器，转发到回环的 Host，并给每个 `set-cookie` 追加 `; Secure`；客户端首次访问要
+先信任自签 CA（设置页还提供 `/.well-known/dsh-desktop-ca.crt` 下载）。设备一多，这个「每家装一次证书」
+的成本就比收益大，所以本仓库把它整体降级成**明文 http**：
+
+| 层 | 文件 | 改了什么 |
+|---|---|---|
+| 边本体 | `dsh-desktop-next/src/lan-https-ingress.ts` | `createHttpsServer` → `node:http` 的 `createEdgeServer`；删掉 key/cert 校验与 `tlsClientError`；`responseHeaders` 只原样复制 `set-cookie`，**不再追加 `; Secure`**（明文下浏览器会丢弃 Secure cookie，登录态就断了） |
+| 运行时 | `dsh-desktop-next/src/lan-https-runtime.ts` | 不再准备/持有证书，`prepareCertificate` 完全不读；`snapshot().caFingerprint` 恒为 `null`；失败码默认 `edge-unavailable`（原 `certificate-unavailable`） |
+| 链接 | `dsh-desktop-next/src/desktop-runtime.ts` | `browserLinks()` 的 `url.protocol = 'http:'`（原 `https:`），其它（地址、`actualPort`、`?token=`）不变 |
+| 设置页 | `dsh-desktop-next/src/client/settings-adapter.ts` | `lanCaUrls: []` —— 没有证书可下，CA 指纹/下载那一段整块消失 |
+| 文案/入口 | `dsh-desktop-next/src/client/settings.tsx` | `lanAccess` / `lanStatus` / `lanHttpsUrls` / `lanTrustNotice` 四个 key 在 Next 侧覆盖成明文说法；「导出 CA 证书」按钮在没有 CA 时不渲染（否则点了必报 `LAN certificate is unavailable`） |
+| 引导页 | `dsh-desktop-next/src/native-ui/onboarding.tsx` | 「局域网」选项的说明与「允许在浏览器中打开」那句，从「安装并信任证书 / 通过 HTTPS」改成明文 HTTP |
+
+> 文案为什么在 `settings.tsx` 里按 key 覆盖，而不是改 `dsh-plugin-desktop/src/client/desktop-settings-locales.ts`
+> 的共享语言表：那份表同时喂 stable / beta，那两条通道**仍然是 TLS**，改了会把它们一起说错。
+> `settings.tsx` 的 `desktopTranslate()` 本来就是「先按 key 覆盖、再回落共享表」的结构，覆盖点天然在那里。
+
+行为上：设置页勾「允许在局域网访问」（`networkExposure=lan` + `browserAccess`）后，同一网段的设备
+直接开 `http://<本机局域网 IP>:<端口>/?token=<token>` 即可，**不需要装任何证书**；这里的端口号
+**与回环端口是同一个**（见下一节）。文件名沿用上游的 `lan-https-*.ts`，只为不动 import 面 ——
+内容已与 https 无关。
+
+> ⚠️ **代价必须知道**：明文意味着同网段可嗅探，`?token=` 与会话 cookie 都能被同网段的人抓走。
+> 只在可信内网用；跨网段/公共 Wi-Fi 要么别开，要么自己在前置一层 TLS 代理。这也是唯一让
+> 「不装证书」成立的代价 —— 上游那套 `; Secure` 正是为此存在的。
+
+> ⚠️ **两条车道别同时开**：`DSH_WEB_HOST=0.0.0.0`（见上文）是让 **Host 自己**绑通配直连；
+> 本节的局域网边是「代理 → 回环 Host」。两者**端口现在相同**（见下一节），通配时局域网边
+> 会自动退化成「不绑 socket、只播地址」，所以不会再出现「一个服务暴露在两个端口上」；
+> 但两者同时"存在"时，真正决定谁能进来的是 `browserAccess` 开关，而不是网络暴露设置。
+
+#### 局域网与回环是**同一个端口**（2026-11-11 覆盖层改的）
+
+上游给局域网边**另开**一个端口（`preferences.lanPort`，默认 `0` = 系统随机），于是同一个应用对外有
+两个端口号：回环一个、局域网一个，而且随机那个每次重启都变。现在改成同端口：
+
+| 情形 | 局域网边做什么 | 对外地址 |
+|---|---|---|
+| Host 只绑回环（默认，`DSH_WEB_HOST` 未设） | 在每个采样到的 LAN IPv4 上**逐个** `listen(<lan-ip>, <回环端口>)`，转发到 `127.0.0.1:<回环端口>` | `http://127.0.0.1:2048` 与 `http://192.168.1.5:2048` —— 同一个端口号 |
+| Host 自己通配绑定（`DSH_WEB_HOST=0.0.0.0` / `::`） | **一个 socket 都不开**，只把地址播出去 | 同上（Host 本来就在那个端口上听所有网卡） |
+
+- `snapshot().actualPort` 恒等于回环端口（`lan-https-ingress.ts` 的 `startInternal()` 直接返回 `targetPort`），
+  所以 `browserLinks()` 拼出来的 LAN 地址与 `localUrl` 端口一致。
+- 某个 LAN 地址绑不上（网卡拔了 / 端口被别的进程占了）只把这个地址从广播列表里去掉，不整条边失败；
+  一个都绑不上才是 `failed`（`errorCode` 取第一个失败码）。
+- **绝不要改回「边绑 `0.0.0.0:<回环端口>`」**：Windows 允许在已有 `127.0.0.1:P` 的情况下再绑
+  `0.0.0.0:P` **而不报错**，两个 socket 会抢同一条入站连接，代理还会自环。同理，通配情形下一个
+  socket 都不开 —— 同端口二次绑在 Windows 上是"静默成功"的，靠 `EADDRINUSE` 判断不出来。
+- `preferences.lanPort` 自此**不再生效**（字段和设置页「改端口要确认」的判断都还在，只是不进计算），
+  与 `key` / `cert` / `caFingerprint` 一样成了"还在类型上、已经不影响行为"的历史参数。
+- 通配判定读的是 `process.env.DSH_WEB_HOST?.trim() || '127.0.0.1'`，与 `src/host/index.ts:100`
+  的 Host 规则**逐字一致**。改一处必须改两处，否则会出现「边以为要绑、Host 其实已经通配」的双 socket。
+
+> ⚠️ **通配绑定时网络暴露设置失去意义**：`browserAccess` 那道闸不区分回环与局域网
+> （`desktop-browser-access.ts:94` 只看 `ordinaryBrowserEnabled` + 渲染进程标记），所以
+> 「仅回环」在 `DSH_WEB_HOST=0.0.0.0` 下拦不住同网段的人 —— 真正生效的只有「允许在浏览器中打开」。
+> 外壳启动时会在日志里打一行 `LAN: Host listens on all interfaces (0.0.0.0), so the network-exposure setting cannot restrict LAN clients`。
+
+> **重基线提示**：`lan-https-ingress.ts` / `lan-https-runtime.ts` / `desktop-runtime.ts` /
+> `settings-adapter.ts` 这四份补丁已加入 `build-next.ps1` 的 `$script:OverlayPatches`（自动导出）。
+> 上游动到这三个文件里同一区域时，构建会以「覆盖层补丁无法应用」停下 —— 按 1.1 节的流程重导即可。
+> 另外上游有 **5 个 spec 与 http 边冲突**（本仓库不跑 next 的 vitest，但你自己跑 `corepack yarn test`
+> 会红）：`tests/lan-https-ingress.spec.ts`（做 TLS 握手/`connectTls`）、`tests/lan-https-runtime.spec.ts`
+> （断言 `prepareCertificate` 调用次数与 `caCertificate`）、`tests/browser-links.spec.ts`（断言
+> `https://…:5678`）、`tests/desktop-runtime-lan.spec.ts`（断言证书失败 → `errorCode: 'certificate-unavailable'`）、
+> `tests/settings-adapter.spec.ts`（断言 `lanCaUrls` 是 `https://…/.well-known/dsh-desktop-ca.crt`）。
+> `tests/lan-https-certificate.spec.ts` 不受影响：`createLanHttpsCertificate` 本身没改，`main.ts` 的
+> `export-ca` 仍用它。
+> **同端口方案又多一条冲突**（2026-11-11）：上面几个 spec 里"局域网边另开一个端口"的断言
+> （`requestedPort` / 随机端口 / `actualPort !== 回环端口`）与现在的"`actualPort` 恒等于回环端口"不符。
+> 这些 spec 本仓库不跑（`package-dir` 不执行 vitest），要维护它们得按新语义改断言。
+
 ### Electron 版本支持表（node-addon-require-builtin）
 
 `-ElectronVersion` **不是想给什么就给什么**。dsh 宿主在 Electron 里 `require` Node 内置模块，靠的是预编译

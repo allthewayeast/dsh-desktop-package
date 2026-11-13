@@ -1,0 +1,135 @@
+diff --git a/dsh-desktop-next/src/lan-https-runtime.ts b/dsh-desktop-next/src/lan-https-runtime.ts
+index 8eed2f7510..9b1ae3757c 100644
+--- a/dsh-desktop-next/src/lan-https-runtime.ts
++++ b/dsh-desktop-next/src/lan-https-runtime.ts
+@@ -22,16 +22,24 @@ export interface DesktopLanHttpsRuntimeSnapshot {
+ export interface DesktopLanHttpsRuntimeOptions {
+   /** Startup-sampled LAN IPv4 literals, retained even when certificate setup failed. */
+   readonly addresses: readonly string[]
+-  /** Leaf key/chain and installation-local CA, when secure persistence succeeded. */
++  /** 【本地覆盖层·局域网走 http】明文边不读这个 TLS 材料，字段保留只为调用方兼容。 */
+   readonly certificate?: DesktopLanHttpsCertificate
+-  /** Called only when LAN access is first requested, never for loopback boot. */
++  /** 【本地覆盖层·局域网走 http】不再调用：明文边不需要证书，也不会写自签 CA。 */
+   readonly prepareCertificate?: () => Promise<
+     { readonly certificate: DesktopLanHttpsCertificate } | { readonly failureCode: string }
+   >
+   /** Stable certificate bootstrap failure shown only if LAN is requested. */
+   readonly failureCode?: string
+-  /** Public HTTPS port; zero asks the operating system for a free port. */
++  /**
++   * 【本地覆盖层 · 同端口】上游给局域网边一个独立端口；现在边恒用回环那个端口号，
++   * 字段保留只为调用方兼容，值不再参与计算。
++   */
+   readonly requestedPort?: number
++  /**
++   * 【本地覆盖层 · 同端口】Host 是否已经自己绑在通配地址（0.0.0.0 / ::，来自
++   * startup.json 的 DSH_WEB_HOST）。true → 端口本来就对局域网开放，边不绑 socket。
++   */
++  readonly wildcardHost?: boolean
+ }
+ 
+ function frozenSnapshot(
+@@ -61,59 +69,60 @@ function projectIngress(snapshot: LanHttpsIngressSnapshot): DesktopLanHttpsRunti
+ 
+ /**
+  * Keeps TLS material outside Cordis config while letting the Desktop shell
+- * attach the HTTPS edge after the upstream loopback port is known.
++ * attach the LAN edge after the upstream loopback port is known.
++ *
++ * 【本地覆盖层 · 局域网走 http】这条边不再做 TLS 终止，所以证书准备（自签 CA +
++ * safeStorage 私钥）整条链路都不再触发：无 CA 可导出，快照里的 caFingerprint 恒为 null，
++ * 设置页也就不会再显示「下载/信任证书」那一段。类名沿用上游的 LAN HTTPS 命名。
++ *
++ * 【本地覆盖层 · 局域网与回环同端口】快照里的 actualPort 恒等于 attach() 给的回环端口，
++ * 所以外壳播出去的 http://<lan-ip>:<port> 与 http://127.0.0.1:<port> 用的是同一个端口号。
+  */
+ export class DesktopLanHttpsRuntime {
+   private readonly addresses: readonly string[]
+-  private certificate: DesktopLanHttpsCertificate | undefined
+   private failureCode: string
+-  private readonly prepareCertificate: DesktopLanHttpsRuntimeOptions['prepareCertificate']
+   private serial: Promise<void> = Promise.resolve()
+   private enabled = false
+-  private readonly requestedPort: number
++  private readonly wildcardHost: boolean
+   private ingress: LanHttpsIngress | undefined
+   private targetPort: number | undefined
+   private current: DesktopLanHttpsRuntimeSnapshot
+ 
+   constructor(options: DesktopLanHttpsRuntimeOptions) {
++    // 只用 addresses / wildcardHost。certificate、prepareCertificate 与 requestedPort
++    // 仍留在 DesktopLanHttpsRuntimeOptions 上，让 desktop-runtime 的调用点保持原样；
++    // 这里刻意不读它们（端口对齐后局域网不再有自己的端口，也不需要证书）。
++    void options.certificate
++    void options.prepareCertificate
++    void options.requestedPort
+     this.addresses = Object.freeze([...options.addresses])
+-    this.certificate = options.certificate
+-    this.prepareCertificate = options.prepareCertificate
+-    this.failureCode = options.failureCode ?? 'certificate-unavailable'
+-    this.requestedPort = options.requestedPort ?? 0
+-    this.current = frozenSnapshot(
+-      'inactive',
+-      this.addresses,
+-      options.certificate?.caFingerprint ?? null,
+-      null,
+-    )
++    this.failureCode = options.failureCode ?? 'edge-unavailable'
++    this.wildcardHost = options.wildcardHost === true
++    this.current = frozenSnapshot('inactive', this.addresses, null, null)
+   }
+ 
++  /** 明文 HTTP 边没有 CA；保留这个 getter，让 main.ts 的「导出 CA」给出清晰失败。 */
+   get caCertificate(): string | null {
+-    return this.certificate?.caCertificate ?? null
++    return null
+   }
+ 
+   /** Attach exactly once to the actual loopback WebServer port. */
+   attach(targetPort: number): void {
+     if (this.targetPort !== undefined) {
+       if (this.targetPort === targetPort) return
+-      throw new Error('dsh-desktop-next: LAN HTTPS runtime is already attached to another port')
++      throw new Error('dsh-desktop-next: LAN edge runtime is already attached to another port')
+     }
+     this.targetPort = targetPort
+     this.attachIngress()
+   }
+ 
+   private attachIngress(): void {
+-    const certificate = this.certificate
+     const targetPort = this.targetPort
+-    if (certificate === undefined || targetPort === undefined || this.ingress !== undefined) return
++    if (targetPort === undefined || this.ingress !== undefined) return
+     this.ingress = new LanHttpsIngress({
+       targetPort,
+-      requestedPort: this.requestedPort,
+-      key: certificate.key,
+-      cert: certificate.cert,
+-      caFingerprint: certificate.caFingerprint,
+-      allowedAddresses: certificate.addresses,
++      allowedAddresses: this.addresses,
++      wildcardHost: this.wildcardHost,
+     })
+     this.current = projectIngress(this.ingress.snapshot())
+   }
+@@ -130,17 +139,7 @@ export class DesktopLanHttpsRuntime {
+     }
+     this.enabled = enabled
+     const transition = this.serial.then(async () => {
+-      if (enabled && this.enabled && this.certificate === undefined && this.prepareCertificate !== undefined) {
+-        this.current = frozenSnapshot('starting', this.addresses, null, null)
+-        try {
+-          const result = await this.prepareCertificate()
+-          if ('certificate' in result) this.certificate = result.certificate
+-          else this.failureCode = result.failureCode
+-        } catch {
+-          this.failureCode = 'certificate-unavailable'
+-        }
+-        this.attachIngress()
+-      }
++      // 明文 HTTP：没有「先准备证书再 attach」这一步，attach() 时 ingress 就已经创建好。
+       return this.applyEnabled(enabled && this.enabled)
+     })
+     this.serial = transition.then(() => undefined, () => undefined)

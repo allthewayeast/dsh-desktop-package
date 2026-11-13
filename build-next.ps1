@@ -330,6 +330,30 @@ $script:OverlayPatches = @(
   # ⚠️ 补丁文件名由 basename 决定，所以是 index.ts.patch（指 src\host\index.ts）。
   # 另一半是 tools\dsh-web-access.ps1 改的 @deepseek-ai 运行时产物，两半缺一不可。
   'dsh-desktop-next/src/host/index.ts'
+  # 局域网访问改走**明文 http**（2026-11-10）：上游把设置页的「局域网访问」做成
+  # 0.0.0.0:<lanPort> 的 TLS 反向代理（自签 CA、给所有 cookie 追加 `; Secure`、
+  # 还提供 CA 下载）。三个文件是同一件事的三层，缺一层就半途而废：
+  #   lan-https-ingress.ts —— 边本体：createHttpsServer → node:http 的 createServer，
+  #                            去掉 TLS 校验与 `; Secure`（明文下浏览器会丢弃 Secure cookie）
+  #   lan-https-runtime.ts —— 不再准备/持有证书，snapshot 的 caFingerprint 恒为 null
+  #   desktop-runtime.ts   —— browserLinks 生成 http:// 而不是 https://
+  # 文件名沿用上游的 lan-https-*.ts，避免改动 import 面；内容已与 https 无关。
+  # 2026-11-11 追加：局域网边与回环**同一个端口号**（上游给局域网边另开一个 lanPort，
+  # 默认 0 = 系统随机，于是两个入口两个端口）。非通配时按 LAN 地址逐个绑回环端口；
+  # Host 已按 DSH_WEB_HOST=0.0.0.0/:: 通配绑定时，边一个 socket 都不开，只播地址。
+  # 通配判定在 desktop-runtime.ts 里读 process.env.DSH_WEB_HOST，与 host\index.ts 同规则。
+  'dsh-desktop-next/src/lan-https-ingress.ts'
+  'dsh-desktop-next/src/lan-https-runtime.ts'
+  'dsh-desktop-next/src/desktop-runtime.ts'
+  # 设置页的 CA 指纹/下载区：明文下没有证书可下，lanCaUrls 置空即整段隐藏。
+  'dsh-desktop-next/src/client/settings-adapter.ts'
+  # 文案与入口里仅剩的两处「证书」痕迹（改的都是 next 自己的文件，不动 dsh-plugin-desktop
+  # 的共享语言表 —— stable/beta 那两套还在走 TLS，改了会把它们一起说错）：
+  #   settings.tsx  —— lanAccess/lanStatus/lanHttpsUrls/lanTrustNotice 四个 key 在 Next 侧覆盖成
+  #                    明文说法；「导出 CA 证书」按钮在没有 CA 时不渲染（否则点击必报错）
+  #   onboarding.tsx —— 引导页「局域网」选项的说明与合作方式都按明文改写
+  'dsh-desktop-next/src/client/settings.tsx'
+  'dsh-desktop-next/src/native-ui/onboarding.tsx'
 )
 
 # 只应用、不自动导出的补丁目标（Export-Overlay 会跳过）：

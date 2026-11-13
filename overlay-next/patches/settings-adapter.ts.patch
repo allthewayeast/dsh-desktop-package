@@ -1,0 +1,15 @@
+diff --git a/dsh-desktop-next/src/client/settings-adapter.ts b/dsh-desktop-next/src/client/settings-adapter.ts
+index be58dc9f69..7f00683310 100644
+--- a/dsh-desktop-next/src/client/settings-adapter.ts
++++ b/dsh-desktop-next/src/client/settings-adapter.ts
+@@ -21,7 +21,9 @@ export function projectSettings(state: DesktopState, links: DesktopBrowserLinks
+     aa: { requested: state.features.remoteControl, effective: enabled && state.features.remoteControl },
+     market: { requested: market, effective: enabled ? market : 'disabled', legacyDefaulted: false },
+     web: { localUrl: links.localUrl ?? '', lanUrls, lanState: lan?.state ?? 'inactive', lanError: lan?.errorCode ?? null, lanCaFingerprint: lan?.caFingerprint ?? null,
+-      lanCaUrls: lanUrls.map(value => new URL('/.well-known/dsh-desktop-ca.crt', value).href) },
++      // 【本地覆盖层】局域网边是明文 HTTP，没有 CA 可下载：留空，设置页就不显示
++      // 「信任/下载证书」那一段（上游这里会拼一层 /.well-known/dsh-desktop-ca.crt）。
++      lanCaUrls: [] },
+   }
+ }
+ 
