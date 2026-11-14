@@ -1,10 +1,10 @@
 diff --git a/dsh-desktop-next/src/host/index.ts b/dsh-desktop-next/src/host/index.ts
-index cd258f10ba..6cca422a08 100644
+index 0d41ce4486..3b9d2cbe13 100644
 --- a/dsh-desktop-next/src/host/index.ts
 +++ b/dsh-desktop-next/src/host/index.ts
-@@ -28,6 +28,35 @@ import { formatFatalDiagnostic } from './fatal-diagnostic.ts'
- import * as desktopOffice from './office.ts'
+@@ -29,6 +29,35 @@ import * as desktopOffice from './office.ts'
  import { resolveOfficeConfig } from './office.ts'
+ import { readStartupEntries } from './startup-entries.ts'
  
 +// 【本地覆盖层 web-access】额外受信入口的解析。
 +// 格式与上游 DSH_NEXT_TRUSTED_HOSTS 一致：JSON 数组字符串（desktop-runtime 用 JSON.stringify
@@ -38,9 +38,9 @@ index cd258f10ba..6cca422a08 100644
  export async function main(): Promise<void> {
    // The Host lists and reads user workspaces; see asar-archive-policy.ts.
    disableAsarArchiveView(import.meta.url)
-@@ -60,10 +89,31 @@ export async function main(): Promise<void> {
-   const packageManager = bundledPnpmInvocation(runtimeDir)
+@@ -64,14 +93,35 @@ export async function main(): Promise<void> {
    const profile = loadNextProfile(projectDir, home, NEXT_PACKAGE, packageManager)
+   const office = resolveOfficeConfig(runtimeDir, primaryRuntime, home)
    const runtimePatch = join(projectDir, 'desktop-next.runtime.patch.json')
 +  // 【本地覆盖层 web-access】监听地址、端口与「额外受信入口」改由启动环境给出，默认仍是回环 + 偏好值。
 +  //   DSH_WEB_HOST          —— 0.0.0.0 / :: 或具体网卡 IP 字面量（上游 Config schema 会校验）
@@ -65,6 +65,10 @@ index cd258f10ba..6cca422a08 100644
 -    { id: 'connection', config: { trustedHosts } },
 +    { id: 'desktop-next-webserver', config: { host: webHost, port: webPort } },
 +    { id: 'connection', config: { trustedHosts: remainingTrustedHosts } },
+     ...(OFFICE_IN_WEB_PROFILE && office ? [
+       { id: 'workspace-dependencies', disabled: false, config: office },
+       { id: 'skill-office', config: { pythonEnvironment: 'workspace-dependencies' } },
+     ] : []),
    ])
 +  // 设置页显示的仍是偏好值，端口被 startup.json 顶掉时这一行是唯一的现场证据。
 +  hostLog({ source: 'host', event: 'web.listen.plan', fields: { host: webHost, port: webPort,
@@ -72,7 +76,7 @@ index cd258f10ba..6cca422a08 100644
    // runProfile installs the outbound proxy policy from this environment before any plugin mounts.
    const { environment, resolution: proxy } = withSystemProxy(loadLayeredEnv('dsh-desktop-next'), systemProxy, trustedHosts as string[])
    // One line on every start, direct included: a connectivity report cannot be answered without it.
-@@ -79,7 +129,7 @@ export async function main(): Promise<void> {
+@@ -87,7 +137,7 @@ export async function main(): Promise<void> {
      resolvedProfile: { profile, installAnchor: NEXT_PACKAGE,
        readPatches: profilePatches => readNextProfilePatches(projectDir, home,
          [join(runtimeDir, 'host.cordis.patch.yml'), join(projectDir, 'desktop-next.cordis.patch.json'), runtimePatch], profilePatches) },
@@ -81,8 +85,8 @@ index cd258f10ba..6cca422a08 100644
      packageManager,
    })
    // Native file drags borrow only the workspace files this Host authorizes, where the followed DSH release drags
-@@ -150,7 +200,7 @@ export async function main(): Promise<void> {
-     try { await ctx.plugin(desktopOffice, office); mounted() } catch (error) { mounted(error); throw error }
+@@ -173,7 +223,7 @@ export async function main(): Promise<void> {
+     throw new Error(`Desktop core services unavailable: ${missingCore.join(', ')}. Check plugin compatibility and startup errors in the recovery report.`)
    }
    hostLog({ source: 'host', event: 'process.ready' })
 -  await send({ type: 'ready', url: ctx.connection.authenticatedUrl(`http://127.0.0.1:${ctx.webServer.port}`),
