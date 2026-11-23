@@ -1,8 +1,8 @@
 diff --git a/dsh-desktop-next/src/native-ui/onboarding.tsx b/dsh-desktop-next/src/native-ui/onboarding.tsx
-index 7e64da0c89..0ca0d5d9df 100644
+index d7f1d3981d..0aab2dbe17 100644
 --- a/dsh-desktop-next/src/native-ui/onboarding.tsx
 +++ b/dsh-desktop-next/src/native-ui/onboarding.tsx
-@@ -100,7 +100,7 @@ export function Onboarding({ state, locale, bridge }: { state: Pick<DesktopState
+@@ -118,7 +118,7 @@ export function Onboarding({ state, locale, bridge }: { state: Pick<DesktopState
    ] as const
    const exposures = [
      { value: 'loopback', title: t('仅这台电脑', 'This computer only'), detail: t('只有这台电脑上的浏览器可以访问。', 'Only browsers on this computer can connect.') },
@@ -11,7 +11,7 @@ index 7e64da0c89..0ca0d5d9df 100644
    ] as const
  
    return <><DesktopFrame /><div className="next-onboarding dshNativeContent" lang={locale} data-platform={platform} data-material={material}>
-@@ -136,7 +136,7 @@ export function Onboarding({ state, locale, bridge }: { state: Pick<DesktopState
+@@ -165,7 +165,7 @@ export function Onboarding({ state, locale, bridge }: { state: Pick<DesktopState
            </div>}
            {page === 4 && <div className="next-onboarding-option next-onboarding-reveal">
              <div className="next-onboarding-toggle"><label htmlFor="onboarding-browser-access">{t('允许在浏览器中打开', 'Allow opening this Profile in a browser')}</label><Switch id="onboarding-browser-access" checked={browserAccess} disabled={disabled} onCheckedChange={checked => { setBrowserAccess(checked); if (!checked) setNetworkExposure('loopback') }} /></div>

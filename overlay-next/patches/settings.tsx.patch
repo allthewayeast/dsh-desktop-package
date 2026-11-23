@@ -1,8 +1,8 @@
 diff --git a/dsh-desktop-next/src/client/settings.tsx b/dsh-desktop-next/src/client/settings.tsx
-index 44696b0829..39f52524e5 100644
+index 250300fec2..e8cf80d0d7 100644
 --- a/dsh-desktop-next/src/client/settings.tsx
 +++ b/dsh-desktop-next/src/client/settings.tsx
-@@ -23,6 +23,15 @@ export function desktopTranslate(language: string): (key: string) => string {
+@@ -25,6 +25,15 @@ export function desktopTranslate(language: string): (key: string) => string {
      if (key === 'deleteProfileWarning') return language.startsWith('zh') ? '此 Profile 将移入恢复备份目录。共享的会话和设置会保留。' : 'Move this Profile to recovery backups. Shared sessions and settings are retained.'
      if (key === 'presentationIntro') return language.startsWith('zh') ? '设置当前平台支持的窗口外观。' : 'Choose the window appearance supported on this platform.'
      if (key === 'browserCompatibilityNotice') return language.startsWith('zh') ? '开关即时生效；关闭访问会断开已有的浏览器连接。' : 'Changes take effect immediately. Disabling access disconnects existing browser connections.'
@@ -15,10 +15,10 @@ index 44696b0829..39f52524e5 100644
 +    if (key === 'lanTrustNotice') return language.startsWith('zh')
 +      ? '局域网内以明文 HTTP 访问，不校验证书，也不需要安装证书；同网段的其他人可能看到登录令牌，请只在可信网络中使用。'
 +      : 'Devices on the same network reach this desktop over plain HTTP with no certificate to install. Anyone on that network may see the login token, so use this only on a trusted network.'
-     return Object.hasOwn(copy, key) ? copy[key as DesktopSettingsLocaleKey] : key
-   }
- }
-@@ -60,7 +69,9 @@ function NextBrowserActions({ adapter, state, language }: { adapter: NextSetting
+     if (key === 'tabs') return language.startsWith('zh') ? '桌面设置分类' : 'Desktop settings categories'
+     if (key === 'tabGeneral') return language.startsWith('zh') ? '通用' : 'General'
+     if (key === 'tabProfiles') return language.startsWith('zh') ? 'Profile 与数据' : 'Profiles & data'
+@@ -69,7 +78,9 @@ function NextBrowserActions({ adapter, state, language }: { adapter: NextSetting
      setBusy(true); setFailure('')
      try { await adapter.command({ type: 'export-ca' }) } catch (error) { setFailure(error instanceof Error ? error.message : String(error)) } finally { setBusy(false) }
    }

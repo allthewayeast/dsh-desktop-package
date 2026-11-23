@@ -1,10 +1,10 @@
 diff --git a/dsh-desktop-next/tests/main-lifecycle.spec.ts b/dsh-desktop-next/tests/main-lifecycle.spec.ts
-index 76444bdbef..cbdeb28afd 100644
+index 670fc0afa0..f0e5072bde 100644
 --- a/dsh-desktop-next/tests/main-lifecycle.spec.ts
 +++ b/dsh-desktop-next/tests/main-lifecycle.spec.ts
-@@ -100,10 +100,13 @@ vi.mock('electron', async () => {
-   })
+@@ -107,10 +107,13 @@ vi.mock('electron', async () => {
    class BrowserWindow extends EventEmitter {
+     static getAllWindows() { return fixture.windows.filter(window => !window.destroyed) }
      visible = false
 +    /** Page zoom level the shell reads and writes for the Ctrl/Cmd `+`/`-` gestures. */
 +    zoomLevel = 0
@@ -17,7 +17,7 @@ index 76444bdbef..cbdeb28afd 100644
      size: { width: number, height: number }
      minSize: { width: number, height: number }
      position: { x: number, y: number }
-@@ -1007,6 +1010,28 @@ it('retains the Host when hiding to tray, restores the window, keeps failed-Host
+@@ -1153,6 +1156,28 @@ it('retains the Host when hiding to tray, restores the window, keeps failed-Host
      expect(takeSettings(sender)).toBe('general')
      window.webContents.emit('before-input-event', { preventDefault() {} }, { type: 'keyDown', key: ',', meta: true })
      expect(takeSettings(sender)).toBe('general')

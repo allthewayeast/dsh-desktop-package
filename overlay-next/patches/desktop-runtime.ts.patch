@@ -1,8 +1,8 @@
 diff --git a/dsh-desktop-next/src/desktop-runtime.ts b/dsh-desktop-next/src/desktop-runtime.ts
-index 8ae21a416a..853c8030cb 100644
+index 91ce8a42c8..8a271e2e80 100644
 --- a/dsh-desktop-next/src/desktop-runtime.ts
 +++ b/dsh-desktop-next/src/desktop-runtime.ts
-@@ -313,7 +313,9 @@ export class NextDesktopRuntime {
+@@ -377,7 +377,9 @@ export class NextDesktopRuntime {
      const lanUrls = this.preferences.networkExposure === 'lan' && edge?.state === 'ready' && edge.actualPort
        ? edge.addresses.map(address => {
          const url = new URL(localUrl)
@@ -13,7 +13,7 @@ index 8ae21a416a..853c8030cb 100644
          return url.href
        }) : []
      return { localUrl, lanUrls }
-@@ -391,7 +393,14 @@ export class NextDesktopRuntime {
+@@ -548,7 +550,14 @@ export class NextDesktopRuntime {
      const effective = this.safeMode ? { ...SAFE_MODE_PREFERENCES } : this.preferences
      const addresses = options.addresses()
      const token = randomBytes(32).toString('base64url')
@@ -29,7 +29,7 @@ index 8ae21a416a..853c8030cb 100644
        prepareCertificate: async () => ({ certificate: await options.certificate(addresses) }) })
      this.lan = lan
      let stopped = false
-@@ -428,6 +437,12 @@ export class NextDesktopRuntime {
+@@ -583,6 +592,12 @@ export class NextDesktopRuntime {
              // The optional LAN edge must not turn a ready loopback Host into recovery mode.
              if (edge.state === 'failed') this.diagnostics.append(`LAN HTTPS: ${edge.errorCode}`, 'warn')
            }

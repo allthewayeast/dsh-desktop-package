@@ -87,7 +87,8 @@
 
 .PARAMETER FixedTokenPatch
   【补丁开关，不是值】把「启动 token 可由外部定住」这个能力编进产物：
-  给 dsh-client-connection 的产物加一条 config.launchToken ?? $env:DSH_WEB_TOKEN 的来源链。
+  给启动 token 所在的产物（旧结构 dsh-client-connection / 新结构 dsh-host-authentication-token）
+  加一条 config.launchToken ?? $env:DSH_WEB_TOKEN 的来源链。
   **不给这个开关就不打补丁**，token 仍是每次启动随机（上游行为）。
 
   打了之后 token 从哪来？**不在编译参数里**，写进 exe 同级的 startup.json：
@@ -226,7 +227,8 @@ $script:WsDir = Join-Path $script:Src $script:WsName
 # 两个开关各管一件事，都只决定「代码能力编不编进产物」，**不承载任何值**：
 #
 #   -FixedTokenPatch        [token]  让启动 token 可以从外部定住
-#                                    改 dsh-client-connection 产物：config.launchToken ?? $env:DSH_WEB_TOKEN
+#                                    改启动 token 所在产物（旧 client-connection / 新 host-authentication-token）：
+#                                    config.launchToken ?? $env:DSH_WEB_TOKEN
 #   -ListenAllNetworkPatch  [listen] 允许绑定 0.0.0.0（本机所有网卡）
 #                                    改 dsh-host-webserver / dsh-web-app 产物（放行通配 + URL 回落环 + 删 CLI 守卫），
 #                                    外加 overlay-next\patches\index.ts.patch（Host 把 host 读成 DSH_WEB_HOST、
@@ -421,11 +423,14 @@ $script:RequiredMarkers = @{
 
 # 补丁专属断言：**只在该补丁被要求时才检查**。默认构建两个补丁都不打，产物里当然没有
 # 这些标记 —— 按组判断，避免「没要的东西却报缺失」把人拦在产物核对那一步。
-#   token  组：client-connection 产物里必须含 DSH_WEB_TOKEN（否则 startup.json 写了也只是随机值）
+#   token  组：启动 token 所在产物里必须含 DSH_WEB_TOKEN（否则 startup.json 写了也只是随机值）。
+#              上游 0.2.3+ 把 BrowserAuth / processLaunchToken 拆到独立插件
+#              dsh-host-authentication-token，旧版仍在 dsh-client-connection；
+#              tools\dsh-web-access.ps1 按代码形状二选一打，这里核对新版路径。
 #   web    组：lib/host.js 必须含监听地址/端口读取点（否则 DSH_WEB_HOST、DSH_WEB_PORT
 #             写了没人看）。这两个变量来自同一份源码补丁，任一 Web 访问开关都会打上。
 $script:RequiredMarkersWhenTokenPatch = @{
-  'node_modules/@deepseek-ai/dsh-client-connection/lib/index.js'  = 'DSH_WEB_TOKEN'
+  'node_modules/@deepseek-ai/dsh-host-authentication-token/lib/index.js'  = 'DSH_WEB_TOKEN'
 }
 $script:RequiredMarkersWhenWebAccess = @{
   'lib/host.js'                                                  = @('DSH_WEB_HOST', 'DSH_WEB_PORT')
@@ -507,7 +512,7 @@ function Resolve-WebAccessPlan {
 function Invoke-WebAccessPatch {
   $roots = @(Find-DshWebAccessRoots -SearchRoot $script:Src)
   if ($roots.Count -eq 0) {
-    throw "没找到可打补丁的 @deepseek-ai 包根（期望 <工作区>\node_modules\@deepseek-ai 下有 dsh-client-connection / dsh-host-webserver / dsh-web-app）。依赖装了吗？"
+    throw "没找到可打补丁的 @deepseek-ai 包根（期望 <工作区>\node_modules\@deepseek-ai 下有 host-webserver / web-app，以及 client-connection 或 host-authentication-token 之一）。依赖装了吗？"
   }
   foreach ($root in $roots) {
     $result = Invoke-DshWebAccessPatch -PackagesRoot $root -Groups $script:WebAccessGroups

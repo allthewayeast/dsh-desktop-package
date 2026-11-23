@@ -1,5 +1,5 @@
 diff --git a/dsh-desktop-next/src/client/settings-adapter.ts b/dsh-desktop-next/src/client/settings-adapter.ts
-index be58dc9f69..7f00683310 100644
+index 7e6d9cdf24..b063e9d667 100644
 --- a/dsh-desktop-next/src/client/settings-adapter.ts
 +++ b/dsh-desktop-next/src/client/settings-adapter.ts
 @@ -21,7 +21,9 @@ export function projectSettings(state: DesktopState, links: DesktopBrowserLinks

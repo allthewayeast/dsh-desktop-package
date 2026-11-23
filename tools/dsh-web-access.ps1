@@ -18,8 +18,11 @@
 
   改动对象是 @deepseek-ai 的**构建产物**（lib/*.js），不是源码：
 
-    dsh-client-connection/lib/index.js   [token]
-        启动 token 的来源链变成  config.launchToken ?? $env:DSH_WEB_TOKEN ?? ""（空串=保持随机）
+    [token] 启动 token 的来源链变成  config.launchToken ?? $env:DSH_WEB_TOKEN ?? ""（空串=保持随机）
+      旧结构（dsh 0.2.2 及以前）：dsh-client-connection/lib/index.js
+      新结构（dsh 0.2.3+，上游把 token 逻辑拆成独立插件）：dsh-host-authentication-token/lib/index.js
+      两套改动表并存，按包根里哪个文件真的含 BrowserAuth 选一套，另一套连读都不读。
+      stable 通道仍是旧结构，next / beta 已是新结构 —— 共用本模块时不能只认一边。
     dsh-host-webserver/lib/index.js      [listen]
         ① host transform 放行通配地址（0.0.0.0 / ::）
         ② bindUrlHost 在通配绑定时给出回环 URL（否则打印/自动打开得到连不上的 http://0.0.0.0:…）
@@ -45,33 +48,35 @@ Set-StrictMode -Version Latest
 
 $script:DshWebAccessBackupSuffix = '.dsh-web-access.bak'
 
-# 三份产物（相对 @deepseek-ai 包根）。任一缺失就认为该根不是目标。
+# token 组有两个互斥的变体（旧/新结构），其余两个是 listen 组的必需产物。
 $script:DshWebAccessFiles = @(
-  'dsh-client-connection/lib/index.js'
-  'dsh-host-webserver/lib/index.js'
-  'dsh-web-app/lib/startup.js'
+  'dsh-client-connection/lib/index.js'          # token · 旧结构
+  'dsh-host-authentication-token/lib/index.js'  # token · 新结构
+  'dsh-host-webserver/lib/index.js'             # listen
+  'dsh-web-app/lib/startup.js'                  # listen
 )
 
 <#
   改动按能力分两组，由调用方的开关选择（-FixedTokenPatch / -ListenAllNetworkPatch）：
 
-    token  —— 固定启动 Token：只动 dsh-client-connection 的 token 来源链
+    token  —— 固定启动 Token：只动 token 来源链（旧结构 client-connection / 新结构 host-authentication-token）
     listen —— 监听所有网卡：放行 0.0.0.0 绑定 + 通配 URL 改回回环 + 删 CLI 守卫
 
-  分组与文件是天然对应的（token 只在 client-connection，监听地址只在 webserver/web-app），
-  所以这里只维护「文件 → 组」一张表，改动表里不必重复标注。
+  分组与文件是对应的（listen 只在 webserver/web-app）；token 的两个文件是**同一能力的
+  两个版本变体**，Invoke-DshWebAccessPatch 会按代码形状二选一，不会同时打两套。
 #>
 $script:DshWebAccessGroups = @{
-  'dsh-client-connection/lib/index.js' = 'token'
-  'dsh-host-webserver/lib/index.js'    = 'listen'
-  'dsh-web-app/lib/startup.js'         = 'listen'
+  'dsh-client-connection/lib/index.js'         = 'token'
+  'dsh-host-authentication-token/lib/index.js' = 'token'
+  'dsh-host-webserver/lib/index.js'            = 'listen'
+  'dsh-web-app/lib/startup.js'                 = 'listen'
 }
 
 <# 已知的组名（拼错就报错，别静默什么都不打）。 #>
 $script:DshWebAccessGroupNames = @('token', 'listen')
 
 <#
-  8 处改动。字段含义：
+  12 处改动 = 旧结构 token 5 + 新结构 token 4 + listen 3。字段含义：
     File        相对 @deepseek-ai 包根的目标文件
     Label       人读的改动说明（日志 / 报错都用它）
     Pattern     .NET 正则；凡不承载语义的空白一律写成 [\t ]* / \r?\n，以便跨版本存活
@@ -129,6 +134,48 @@ $script:DshWebAccessEdits = @(
     Applied     = { param($text) $text.Contains('cookieMaxAgeDays, launchToken)') }
   }
 
+  # ---------------- dsh-host-authentication-token：新结构（dsh 0.2.3+）的 token 来源链 ----------------
+  # 上游把 BrowserAuth / processLaunchToken / Config 从 client-connection 拆成独立插件。
+  # 锚点风格与旧结构一致（按代码形状、不依赖行号），语义也一致：
+  #   config.launchToken > process.env.DSH_WEB_TOKEN > 随机（空串=保持上游行为）
+  # Config 里其它字段都带 default，所以新键也用 default("")，避免无 default 字段在校验时变成必填。
+  [pscustomobject]@{
+    File        = 'dsh-host-authentication-token/lib/index.js'
+    Label       = 'host-authentication-token Config：增加可选的 launchToken 键'
+    Pattern     = 'const Config = z\.object\(\{ cookieMaxAgeDays: z\.natural\(\)\.min\(1\)\.default\(30\) \}\);'
+    Replacement = 'const Config = z.object({ cookieMaxAgeDays: z.natural().min(1).default(30), launchToken: z.string().default("") });'
+    Count       = 1
+    Multiline   = $false
+    Applied     = { param($text) $text.Contains('launchToken: z.string().default("")') }
+  }
+  [pscustomobject]@{
+    File        = 'dsh-host-authentication-token/lib/index.js'
+    Label       = 'host-authentication-token BrowserAuth 构造函数：接受固定 token'
+    Pattern     = 'constructor\(processOwner, secret, maxAgeDays\) \{(\r?\n)([ \t]*)this\.secret = secret;(\r?\n)([ \t]*)this\.launchToken = processLaunchToken\(processOwner\);'
+    Replacement = 'constructor(processOwner, secret, maxAgeDays, fixedToken) {${1}${2}this.secret = secret;${3}${4}this.launchToken = fixedToken === void 0 || fixedToken === "" ? processLaunchToken(processOwner) : fixedToken;'
+    Count       = 1
+    Multiline   = $false
+    Applied     = { param($text) $text.Contains('this.launchToken = fixedToken === void 0') }
+  }
+  [pscustomobject]@{
+    File        = 'dsh-host-authentication-token/lib/index.js'
+    Label       = 'host-authentication-token BrowserAuth.create：透传固定 token'
+    Pattern     = 'static async create\(processOwner, credentials, maxAgeDays\) \{(\r?\n)([ \t]*)return new BrowserAuth\(processOwner, await initializeSecret\(credentials\), maxAgeDays\);'
+    Replacement = 'static async create(processOwner, credentials, maxAgeDays, fixedToken) {${1}${2}return new BrowserAuth(processOwner, await initializeSecret(credentials), maxAgeDays, fixedToken);'
+    Count       = 1
+    Multiline   = $false
+    Applied     = { param($text) $text.Contains('maxAgeDays, fixedToken);') }
+  }
+  [pscustomobject]@{
+    File        = 'dsh-host-authentication-token/lib/index.js'
+    Label       = 'host-authentication-token apply()：解析 config > DSH_WEB_TOKEN > 空串，校验长度并传给 BrowserAuth.create'
+    Pattern     = '([ \t]*)const auth = await BrowserAuth\.create\(ctx\[Context\.root\], ctx\.credentials, config\.cookieMaxAgeDays\);(\r?\n)'
+    Replacement = '${1}const launchToken = config?.launchToken ?? process.env.DSH_WEB_TOKEN ?? "";${2}${1}if (launchToken !== "" && !/^[A-Za-z0-9_-]{16,}$/u.test(launchToken)) throw new Error("host-authentication-token: launchToken/DSH_WEB_TOKEN must be at least 16 characters from [A-Za-z0-9_-]");${2}${1}const auth = await BrowserAuth.create(ctx[Context.root], ctx.credentials, config.cookieMaxAgeDays, launchToken);${2}'
+    Count       = 1
+    Multiline   = $false
+    Applied     = { param($text) $text.Contains('const launchToken = config?.launchToken') }
+  }
+
   # ---------------- dsh-host-webserver：通配地址 ----------------
   [pscustomobject]@{
     File        = 'dsh-host-webserver/lib/index.js'
@@ -164,19 +211,26 @@ $script:DshWebAccessEdits = @(
 # ---------------- 目标发现 ----------------
 
 <#
-  判断一个目录是不是合格的 @deepseek-ai 包根（三份产物都在）。
+  判断一个目录是不是合格的 @deepseek-ai 包根。
+  listen 组两个产物必须都在；token 组新旧两个变体**至少一个**在（stable 只有旧的，
+  next / beta 只有新的）。两套都没有的根不是目标，避免把无关目录误当包根。
   @param Path 候选目录
   @returns 是否可用
 #>
 function Test-DshWebAccessRoot {
   param([Parameter(Mandatory)][string]$Path)
   if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+  $tokenSeen = $false
   foreach ($rel in $script:DshWebAccessFiles) {
-    if (-not (Test-Path -LiteralPath (Join-Path $Path ($rel -replace '/', [IO.Path]::DirectorySeparatorChar)) -PathType Leaf)) {
-      return $false
+    $exists = Test-Path -LiteralPath (Join-Path $Path ($rel -replace '/', [IO.Path]::DirectorySeparatorChar)) -PathType Leaf
+    $group = $script:DshWebAccessGroups[$rel]
+    if ($group -eq 'listen') {
+      if (-not $exists) { return $false }
+    } elseif ($group -eq 'token' -and $exists) {
+      $tokenSeen = $true
     }
   }
-  return $true
+  return $tokenSeen
 }
 
 <#
@@ -340,7 +394,7 @@ function Test-DshWebAccessSyntax {
 
 <#
   给一个 @deepseek-ai 包根打/检/还原 web 访问补丁。
-  @param PackagesRoot 包根（含 dsh-client-connection / dsh-host-webserver / dsh-web-app）
+  @param PackagesRoot 包根（含 token 变体之一 + dsh-host-webserver / dsh-web-app）
   @param Groups       只处理这些组：token（固定 Token）/ listen（监听所有网卡）；默认两组都处理
   @param Check        只报告能不能打，不写盘
   @param Revert       从 .dsh-web-access.bak 还原
@@ -358,11 +412,33 @@ function Invoke-DshWebAccessPatch {
       throw "dsh-web-access: 未知的补丁组 '$group'（可用：$($script:DshWebAccessGroupNames -join '、')）"
     }
   }
-  # 组与文件一一对应，所以先按组筛出这次要碰的文件；不相关的文件连读都不读。
+  # 先按组筛出这次要碰的文件；不相关的文件连读都不读。
   $targets = @($script:DshWebAccessFiles | Where-Object {
       $fileGroup = $script:DshWebAccessGroups[$_]
       ($null -eq $fileGroup) -or ($Groups -contains $fileGroup)
     })
+  # token 组是「旧/新结构二选一」：按文件里是否真的有 BrowserAuth 判断，而不是按文件
+  # 存在与否 —— next 的 client-connection 仍在，但 token 代码已被拆到新包，旧改动表必然失配。
+  # 两个变体都不适用时（上游又挪一次）就把 token 组整个跳过、只打 listen，由产物核对
+  # 暴露能力缺失，比在这里把整个构建卡死更稳妥。
+  if ($Groups -contains 'token') {
+    $legacy = 'dsh-client-connection/lib/index.js'
+    $modern = 'dsh-host-authentication-token/lib/index.js'
+    $hasBrowserAuth = {
+      param($rel)
+      $full = Join-Path $PackagesRoot ($rel -replace '/', [IO.Path]::DirectorySeparatorChar)
+      if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { return $false }
+      return ([System.IO.File]::ReadAllText($full)).Contains('class BrowserAuth')
+    }
+    if (& $hasBrowserAuth $modern) {
+      $drop = @($legacy)
+    } elseif (& $hasBrowserAuth $legacy) {
+      $drop = @($modern)
+    } else {
+      $drop = @($legacy, $modern)
+    }
+    $targets = @($targets | Where-Object { $drop -notcontains $_ })
+  }
   $result = [pscustomobject]@{
     Root     = $PackagesRoot
     Written  = @()
