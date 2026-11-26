@@ -1,17 +1,17 @@
 diff --git a/dsh-desktop-next/src/main.ts b/dsh-desktop-next/src/main.ts
-index 91ba7a1543..df2ce0feed 100644
+index 9549b5b1c8..1d1a62b62c 100644
 --- a/dsh-desktop-next/src/main.ts
 +++ b/dsh-desktop-next/src/main.ts
 @@ -7,7 +7,7 @@ import { access, writeFile } from 'node:fs/promises'
  import { createRequire } from 'node:module'
  import { freemem, totalmem } from 'node:os'
  import { dirname, isAbsolute, join, resolve } from 'node:path'
--import { app, BrowserWindow, clipboard, crashReporter, dialog, ipcMain, Menu, nativeTheme, net, Notification, protocol, safeStorage, screen, session, shell, type IpcMainInvokeEvent, type MenuItemConstructorOptions, type OpenDialogOptions } from 'electron'
-+import { app, BrowserWindow, clipboard, crashReporter, dialog, ipcMain, Menu, nativeTheme, net, Notification, protocol, safeStorage, screen, session, shell, type Input, type IpcMainInvokeEvent, type MenuItemConstructorOptions, type OpenDialogOptions, type WebContents } from 'electron'
+-import { app, BrowserWindow, clipboard, crashReporter, dialog, ipcMain, Menu, nativeImage, nativeTheme, net, Notification, powerMonitor, protocol, safeStorage, screen, session, shell, type IpcMainInvokeEvent, type MenuItemConstructorOptions, type OpenDialogOptions } from 'electron'
++import { app, BrowserWindow, clipboard, crashReporter, dialog, ipcMain, Menu, nativeImage, nativeTheme, net, Notification, powerMonitor, protocol, safeStorage, screen, session, shell, type Input, type IpcMainInvokeEvent, type MenuItemConstructorOptions, type OpenDialogOptions, type WebContents } from 'electron'
  import { appRequestHeaders, forwardWebRequest, serveWebDocument } from './web-document.ts'
  import { installAppDownloads } from './app-downloads.ts'
  import { installDesktopFileDrag, installFileActions, liveshareOwnerLogin } from './upstream-family.ts'
-@@ -36,6 +36,10 @@ import { dshCommandArguments, dshCommandInvocation } from './dsh-command.ts'
+@@ -37,6 +37,10 @@ import { displaylessLaunch, displaylessRestartArguments } from './displayless.ts
  import { createPackageRunner } from './extensions.ts'
  import { bundledPnpmEntry } from './bundled-pnpm.ts'
  import { applyDesktopPackageManagerPolicy } from './pnpm-policy.ts'
@@ -22,7 +22,7 @@ index 91ba7a1543..df2ce0feed 100644
  import { auxiliaryWindowChromeOptions, auxiliaryWindowHasCustomFrame } from '../../dsh-plugin-desktop/src/auxiliary-window-options.ts'
  import { cleanupDisposableTree } from '../../dsh-plugin-desktop/src/disposable-tree.ts'
  import { installEditingContextMenu } from '../../dsh-plugin-desktop/src/context-menu.ts'
-@@ -84,11 +88,33 @@ const startupElevationState = startupElevation.relaunched ? {} : startupElevatio
+@@ -86,11 +90,33 @@ const startupElevationState = startupElevation.relaunched ? {} : startupElevatio
  // Inherit the package policy across the Host and every runtime child process.
  applyDesktopPackageManagerPolicy(process.env)
  
@@ -57,7 +57,7 @@ index 91ba7a1543..df2ce0feed 100644
  // The in-app choice keeps its former Next-owned anchor, whatever the variable says.
  const locationRoot = dataDirectoryLocationRoot(app.isPackaged, () => app.getPath('appData'), root)
  const locationFile = dataDirectoryLocationFile(locationRoot)
-@@ -399,6 +425,47 @@ function show(window: BrowserWindow): void {
+@@ -462,6 +488,47 @@ function show(window: BrowserWindow): void {
   */
  const WINDOWS_CAPTION_FILL = '#00000000'
  
@@ -105,7 +105,7 @@ index 91ba7a1543..df2ce0feed 100644
  const MAIN_WINDOW_WIDTH = 1280
  const MAIN_WINDOW_HEIGHT = 840
  const MAIN_WINDOW_MIN_WIDTH = 800
-@@ -506,6 +573,7 @@ function createWindow(preload: string, primary = false): BrowserWindow {
+@@ -574,6 +641,7 @@ function createWindow(preload: string, primary = false): BrowserWindow {
    if (primary) {
      window.webContents.on('before-input-event', (event, input) => {
        if (input.type === 'keyDown' && input.key === ',' && (input.control || input.meta) && !input.alt) { event.preventDefault(); openControls() }
@@ -113,7 +113,7 @@ index 91ba7a1543..df2ce0feed 100644
      })
      window.on('close', event => {
        persistMainWindowState(window)
-@@ -759,7 +827,7 @@ async function announceRepair(backup: string): Promise<void> {
+@@ -828,7 +896,7 @@ async function announceRepair(backup: string): Promise<void> {
  }
  function confirmLanAccess(): Promise<boolean> {
    return confirmed(
@@ -122,7 +122,7 @@ index 91ba7a1543..df2ce0feed 100644
      t('同一网络中的设备可以连接。请仅向可信设备分享登录链接，并在设备上核对和信任 CA 证书。', 'Devices on your local network can connect. Share login links only with trusted devices, and verify and trust the CA certificate on each device.'),
    )
  }
-@@ -965,7 +1033,7 @@ async function performCommand(input: Record<string, unknown>, type: string, sour
+@@ -1036,7 +1104,7 @@ async function performCommand(input: Record<string, unknown>, type: string, sour
        const preferences = parsePreferences(input.preferences)
        if (portsChanged(runtime.preferences, preferences)) {
          if (!await confirmed(t('应用访问设置并重启 Host？', 'Apply access settings and restart the Host?'), preferences.browserAccess && preferences.networkExposure === 'lan'

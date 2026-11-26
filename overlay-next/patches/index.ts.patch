@@ -1,9 +1,9 @@
 diff --git a/dsh-desktop-next/src/host/index.ts b/dsh-desktop-next/src/host/index.ts
-index d9fd918b1b..6abf4f3dc8 100644
+index 5ab7ff0c0e..3de6f94f2d 100644
 --- a/dsh-desktop-next/src/host/index.ts
 +++ b/dsh-desktop-next/src/host/index.ts
-@@ -29,6 +29,35 @@ import { resolveOfficeConfig } from './office.ts'
- import { PluginSummary, recordSkippedBundles } from './plugin-summary.ts'
+@@ -30,6 +30,35 @@ import { PluginSummary, recordSkippedBundles } from './plugin-summary.ts'
+ import { installDesktopQuitInspection } from './quit-inspection.ts'
  import { readStartupEntries } from './startup-entries.ts'
  
 +// 【本地覆盖层 web-access】额外受信入口的解析。
@@ -38,7 +38,7 @@ index d9fd918b1b..6abf4f3dc8 100644
  export async function main(): Promise<void> {
    // The Host lists and reads user workspaces; see asar-archive-policy.ts.
    disableAsarArchiveView(import.meta.url)
-@@ -65,14 +94,35 @@ export async function main(): Promise<void> {
+@@ -66,14 +95,35 @@ export async function main(): Promise<void> {
    recordSkippedBundles(profile.skippedBundles, hostLog)
    const office = resolveOfficeConfig(runtimeDir, primaryRuntime, home)
    const runtimePatch = join(projectDir, 'desktop-next.runtime.patch.json')
@@ -76,7 +76,7 @@ index d9fd918b1b..6abf4f3dc8 100644
    // runProfile installs the outbound proxy policy from this environment before any plugin mounts.
    const { environment, resolution: proxy } = withSystemProxy(loadLayeredEnv('dsh-desktop-next'), systemProxy, trustedHosts as string[])
    // One line on every start, direct included: a connectivity report cannot be answered without it.
-@@ -88,7 +138,7 @@ export async function main(): Promise<void> {
+@@ -89,7 +139,7 @@ export async function main(): Promise<void> {
      resolvedProfile: { profile, installAnchor: NEXT_PACKAGE,
        readPatches: profilePatches => readNextProfilePatches(projectDir, home,
          [join(runtimeDir, 'host.cordis.patch.yml'), join(projectDir, 'desktop-next.cordis.patch.json'), runtimePatch], profilePatches) },
@@ -85,7 +85,7 @@ index d9fd918b1b..6abf4f3dc8 100644
      packageManager,
    })
    // Native file drags borrow only the workspace files this Host authorizes, where the followed DSH release drags
-@@ -173,7 +223,7 @@ export async function main(): Promise<void> {
+@@ -192,7 +242,7 @@ export async function main(): Promise<void> {
      throw new Error(`Desktop core services unavailable: ${missingCore.join(', ')}. Check plugin compatibility and startup errors in the recovery report.`)
    }
    hostLog({ source: 'host', event: 'process.ready' })
